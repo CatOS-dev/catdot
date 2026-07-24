@@ -12,8 +12,11 @@ while IFS=$'\t' read -r kind first second; do
       pacman -Si "$first" > /dev/null
       ;;
     resource)
-      test -d "$first"
-      pacman -Qo "$first" | grep -F "is owned by $second "
+      if test -e "$first"; then
+        LC_ALL=C pacman -Qo "$first" | grep -F "is owned by $second "
+      else
+        LC_ALL=C pacman -Fl "$second" | grep -F "${first#/}"
+      fi
       ;;
   esac
 done < <(python3 - "$profile" <<'PY'
@@ -40,6 +43,8 @@ for directory, package in zip(
 ):
     print("resource", directory, package, sep="\t")
 print("resource", f"/usr/share/Kvantum/{qt['settings']['kvantum_theme']}", "kvantum", sep="\t")
+print("resource", "/usr/lib/qt/plugins/styles/libkvantum.so", "kvantum-qt5", sep="\t")
+print("resource", "/usr/lib/qt6/plugins/styles/libkvantum.so", "kvantum", sep="\t")
 PY
 )
 

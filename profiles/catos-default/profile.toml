@@ -26,7 +26,7 @@ color_scheme = "prefer-dark"
 role = "qt-theme"
 path = "qt"
 backend = "qtct-kvantum"
-packages = ["qt5ct", "qt6ct", "kvantum"]
+packages = ["qt5ct", "qt6ct", "kvantum", "kvantum-qt5"]
 
 [components.qt.settings]
 qt5_style = "kvantum"
