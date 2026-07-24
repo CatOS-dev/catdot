@@ -8,6 +8,8 @@ install -Dm755 "$source_root/target/release/catdot" \
   "$destdir/usr/bin/catdot"
 install -Dm755 "$source_root/target/release/catdot-helper" \
   "$destdir/usr/lib/catdot/catdot-helper"
+install -Dm755 "$source_root/target/release/catdot-query-helper" \
+  "$destdir/usr/lib/catdot/catdot-query-helper"
 install -Dm644 "$source_root/packaging/org.catos.catdot.policy" \
   "$destdir/usr/share/polkit-1/actions/org.catos.catdot.policy"
 install -Dm644 "$source_root/LICENSE" \

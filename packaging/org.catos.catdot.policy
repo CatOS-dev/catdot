@@ -1,10 +1,24 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN" "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
+  <action id="org.catos.catdot.inspect-state">
+    <description>Inspect Catdot profile and package state</description>
+    <message>Authentication is required to inspect Catdot state outside an active local session.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/catdot/catdot-query-helper</annotate>
+  </action>
   <action id="org.catos.catdot.manage-packages">
     <description>Manage Catdot desktop profile packages</description>
     <message>Authentication is required to manage Catdot packages.</message>
-    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/catdot/catdot-helper</annotate>
   </action>
 </policyconfig>

@@ -23,6 +23,7 @@ sh packaging/install.sh "$source_tree" "$stage"
 
 test -x "$stage/usr/bin/catdot"
 test -x "$stage/usr/lib/catdot/catdot-helper"
+test -x "$stage/usr/lib/catdot/catdot-query-helper"
 test -f "$stage/usr/share/licenses/catdot/LICENSE"
 test -f "$stage/usr/share/doc/catdot/README.md"
 test -f "$stage/usr/share/catdot/profiles/catos-default/profile.toml"
