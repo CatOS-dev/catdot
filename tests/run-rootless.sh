@@ -5,12 +5,15 @@ for test in \
   zero-dependency-lifecycle.sh \
   strict-umask-multi-user.sh \
   real-libalpm-install.sh \
+  explicit-upgrade-ownership.sh \
+  prune-recovery.sh \
   finalize-retry.sh \
   adopt-pending-isolation.sh \
   multi-user-prune.sh \
   prune-maximal-safe-set.sh \
   install-conflict-plan.sh \
   doctor-system-state.sh \
+  query-helper-boundary.sh \
   default-profile-resources.sh
 do
   echo "==> $test"
