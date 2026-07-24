@@ -553,10 +553,8 @@ mod tests {
         PruneJournal::prepared(database, &prune_plan, expected.clone()).unwrap();
         recover_pending(database, |name| name != "dependency").unwrap();
 
-        let recovered: SystemPackageState = toml::from_str(
-            &fs::read_to_string(database.join("packages.toml")).unwrap(),
-        )
-        .unwrap();
+        let recovered: SystemPackageState =
+            toml::from_str(&fs::read_to_string(database.join("packages.toml")).unwrap()).unwrap();
         assert!(recovered.packages.is_empty());
         assert_eq!(
             fs::read_dir(database.join("transactions")).unwrap().count(),

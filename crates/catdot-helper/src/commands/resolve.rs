@@ -133,7 +133,10 @@ fn prepare(uid: u32, generation: u64, state_path: &Path, optional: bool) -> Resu
     let profiles = discover_profile_registry(Path::new(DEFAULT_PROFILE_ROOT))?.valid_profiles;
     let database = Path::new(DB);
     let existing_records = load_records(database)?;
-    let existing_record = existing_records.iter().find(|record| record.uid == uid).cloned();
+    let existing_record = existing_records
+        .iter()
+        .find(|record| record.uid == uid)
+        .cloned();
     if let Some(record) = existing_record.as_ref()
         && record.state_path != state_path
     {

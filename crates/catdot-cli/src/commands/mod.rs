@@ -1,7 +1,11 @@
 use anyhow::{Context, Result, bail};
 use catdot_core::*;
 use clap::{Parser, Subcommand};
-use std::{collections::BTreeSet, io::{self, Write}, process::Command};
+use std::{
+    collections::BTreeSet,
+    io::{self, Write},
+    process::Command,
+};
 
 mod runtime;
 
@@ -311,9 +315,8 @@ fn resolve_helper(
         .context("parse canonical package plan from helper")?;
     print_package_plan(&preview);
     let activation_changes = print_activation_plan(state);
-    let needs_work = package_changes(&preview.plan)
-        || activation_changes
-        || preview.system_update_required;
+    let needs_work =
+        package_changes(&preview.plan) || activation_changes || preview.system_update_required;
     if !needs_work {
         println!("Catdot is already up to date.");
         return Ok(None);
@@ -373,7 +376,9 @@ fn prune_helper(dry_run: bool, yes: bool) -> Result<()> {
     let plan = preview.plan;
     if plan.remove.is_empty() {
         if preview.system_update_required {
-            println!("No packages are currently removable; an interrupted transaction needs recovery.");
+            println!(
+                "No packages are currently removable; an interrupted transaction needs recovery."
+            );
             if dry_run {
                 return Ok(());
             }
@@ -430,8 +435,8 @@ fn print_current(state: &UserState, verbose: bool) {
         println!("Desired generation: {}", state.generation);
         println!("Active generation: {}", state.active_generation);
     }
-    let pending = state.components != state.active_components
-        || state.generation != state.active_generation;
+    let pending =
+        state.components != state.active_components || state.generation != state.active_generation;
     if !state.active_components.is_empty() {
         println!("Active components:");
         for (role, reference) in &state.active_components {
@@ -622,9 +627,7 @@ pub fn run() -> Result<i32> {
             yes,
             with_optional,
         } => {
-            let Some(preview) =
-                resolve_helper(&state, &path, with_optional, dry_run, yes)?
-            else {
+            let Some(preview) = resolve_helper(&state, &path, with_optional, dry_run, yes)? else {
                 return Ok(0);
             };
             if !dry_run {

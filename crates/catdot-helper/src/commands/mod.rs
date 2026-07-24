@@ -1,8 +1,11 @@
-use crate::{HelperMode, auth::{caller_uid, read_trusted_user_state, user_home}};
 use crate::backend::{
     hold_packages, open_handle, prepared_removal_plan, removable_with_alpm, remove_with_alpm,
 };
 use crate::system::{load_records, user_record_path, valid_records, write_system_file};
+use crate::{
+    HelperMode,
+    auth::{caller_uid, read_trusted_user_state, user_home},
+};
 use anyhow::{Result, bail};
 use catdot_core::*;
 use clap::{Parser, Subcommand};
@@ -149,7 +152,6 @@ pub fn run(mode: HelperMode) -> Result<()> {
         }
     }
 }
-
 
 fn validate_mode(mode: HelperMode, command: &Cmd) -> Result<()> {
     let query = matches!(
