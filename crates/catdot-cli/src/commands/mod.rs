@@ -3,8 +3,6 @@ use catdot_core::*;
 use clap::{Parser, Subcommand};
 use std::process::Command;
 
-use crate::services::print_system_record_diagnostics;
-
 mod runtime;
 
 use runtime::{
@@ -83,6 +81,29 @@ fn confirm(yes: bool) -> Result<()> {
     } else {
         bail!("cancelled")
     }
+}
+
+fn system_doctor_report() -> Result<SystemDoctorReport> {
+    match std::fs::symlink_metadata("/var/lib/catdot") {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SystemDoctorReport::default());
+        }
+        Ok(_) | Err(_) => {}
+    }
+    let uid = unsafe { libc::geteuid() }.to_string();
+    let output = Command::new("pkexec")
+        .arg("/usr/lib/catdot/catdot-helper")
+        .args(["doctor-system", "--uid", &uid])
+        .output()
+        .context("obtain system diagnostics from catdot helper")?;
+    if !output.status.success() {
+        bail!(
+            "helper could not inspect system Catdot state: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+    toml::from_str(&String::from_utf8_lossy(&output.stdout))
+        .context("parse system Catdot diagnostics")
 }
 
 fn print_missing_packages(
@@ -493,7 +514,12 @@ pub fn run() -> Result<i32> {
                     }
                 }
             }
-            print_system_record_diagnostics();
+            let system = system_doctor_report()?;
+            for line in system.lines {
+                println!("{line}");
+            }
+            warnings |= system.warnings != 0;
+            errors |= system.errors != 0;
             return Ok(if errors {
                 2
             } else if warnings {

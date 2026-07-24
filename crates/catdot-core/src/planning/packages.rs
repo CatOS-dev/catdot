@@ -151,6 +151,14 @@ pub struct Requirement {
     pub uids: Vec<u32>,
     pub references: Vec<PackageReference>,
 }
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SystemDoctorReport {
+    pub lines: Vec<String>,
+    pub warnings: usize,
+    pub errors: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackagePlanPreview {

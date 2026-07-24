@@ -19,7 +19,7 @@ pub use manifest::{
 };
 pub use planning::{
     InstallReason, ManagedPackage, PackageAvailability, PackageBackend, PackagePlan,
-    PackagePlanPreview, PackageReference, PackageReplacement, Requirement, SystemPackageState, UserRecord,
+    PackagePlanPreview, PackageReference, PackageReplacement, Requirement, SystemDoctorReport, SystemPackageState, UserRecord,
     aggregate_packages, aggregate_requirements, expand_exec, install_plan, packages_for_state,
     prunable,
 };

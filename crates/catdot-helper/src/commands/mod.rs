@@ -1,8 +1,8 @@
-use crate::auth::{caller_uid, user_home};
+use crate::auth::{caller_uid, read_trusted_user_state, user_home};
 use crate::backend::{
     hold_packages, open_handle, prepared_removal_plan, removable_with_alpm, remove_with_alpm,
 };
-use crate::system::{load_records, user_record_path, valid_records};
+use crate::system::{ensure_system_database, load_records, user_record_path, valid_records};
 use anyhow::{Result, bail};
 use catdot_core::*;
 use clap::{Parser, Subcommand};
@@ -75,6 +75,10 @@ enum Cmd {
         #[arg(long)]
         uid: u32,
     },
+    DoctorSystem {
+        #[arg(long)]
+        uid: u32,
+    },
 }
 pub fn run() -> Result<()> {
     if unsafe { libc::geteuid() } == 0 {
@@ -107,6 +111,10 @@ pub fn run() -> Result<()> {
         Cmd::UsersList { uid } => {
             require_root()?;
             users_list(caller_uid(uid)?)
+        }
+        Cmd::DoctorSystem { uid } => {
+            require_root()?;
+            system_doctor(caller_uid(uid)?)
         }
         Cmd::Resolve {
             uid,
@@ -247,6 +255,99 @@ fn canonical_prune_plan(
     })
 }
 
+
+fn system_doctor(_caller: u32) -> Result<()> {
+    let database = PathBuf::from(DB);
+    ensure_system_database(&database)?;
+    let _lock = lock(&database.join("lock"))?;
+    let handle = open_handle()?;
+    let records = load_records(&database)?;
+    let mut report = SystemDoctorReport::default();
+
+    for record in records {
+        match user_home(record.uid) {
+            Ok(_) => {
+                report
+                    .lines
+                    .push(format!("system user record: uid {}: valid", record.uid));
+                match read_trusted_user_state(record.uid, &record.state_path) {
+                    Ok(state) => {
+                        if state.active_generation != record.active_generation
+                            || state.generation != record.pending_generation
+                        {
+                            report.lines.push(format!(
+                                "warning: uid {} state generations differ from the system record",
+                                record.uid
+                            ));
+                            report.warnings += 1;
+                        }
+                        if !record.pending_requirements.is_empty() {
+                            report.lines.push(format!(
+                                "warning: uid {} has pending package requirements",
+                                record.uid
+                            ));
+                            report.warnings += 1;
+                        }
+                    }
+                    Err(error) => {
+                        report.lines.push(format!(
+                            "error: uid {} state cannot be verified: {error}",
+                            record.uid
+                        ));
+                        report.errors += 1;
+                    }
+                }
+            }
+            Err(_) => {
+                report
+                    .lines
+                    .push(format!("warning: system user record: uid {}: missing", record.uid));
+                report.warnings += 1;
+            }
+        }
+    }
+
+    let packages = read_system_packages(&database.join("packages.toml"))?;
+    for managed in packages.packages.values() {
+        match handle.localdb().pkg(managed.name.as_str()) {
+            Ok(package) => {
+                if managed.install_reason == InstallReason::Dependency
+                    && package.reason() == alpm::PackageReason::Explicit
+                {
+                    report.lines.push(format!(
+                        "warning: package {} was explicitly adopted by the administrator",
+                        managed.name
+                    ));
+                    report.warnings += 1;
+                }
+            }
+            Err(_) => {
+                report.lines.push(format!(
+                    "error: Catdot package record {} is not installed",
+                    managed.name
+                ));
+                report.errors += 1;
+            }
+        }
+    }
+
+    let transactions = database.join("transactions");
+    if let Ok(entries) = fs::read_dir(&transactions) {
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().is_some_and(|extension| extension == "toml") {
+                report.lines.push(format!(
+                    "warning: unfinished package transaction: {}",
+                    path.display()
+                ));
+                report.warnings += 1;
+            }
+        }
+    }
+
+    print!("{}", toml::to_string(&report)?);
+    Ok(())
+}
 
 fn caller_uid_from_pkexec() -> Result<u32> {
     let value = std::env::var("PKEXEC_UID")
