@@ -64,7 +64,7 @@ pub(super) fn apply(
 }
 
 fn prepare(uid: u32, generation: u64, state_path: &Path, optional: bool) -> Result<ResolveContext> {
-    let profiles = discover_profiles(Path::new(DEFAULT_PROFILE_ROOT))?;
+    let profiles = discover_profile_registry(Path::new(DEFAULT_PROFILE_ROOT))?.valid_profiles;
     let state = read_trusted_user_state(uid, state_path)?;
     if state.generation != generation {
         bail!("state changed; run catdot resolve again")

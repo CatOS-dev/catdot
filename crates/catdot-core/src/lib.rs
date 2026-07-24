@@ -13,7 +13,8 @@ pub use activation::{
 };
 pub use error::{Error, Result};
 pub use manifest::{
-    ComponentDef, DEFAULT_PROFILE_ROOT, Link, Profile, discover_profiles, profile_root,
+    ComponentDef, DEFAULT_PROFILE_ROOT, Link, Profile, ProfileDiagnostic, ProfileDiagnosticKind,
+    ProfileRegistry, discover_profile_registry, discover_profiles, profile_root,
 };
 pub use planning::{
     InstallReason, ManagedPackage, PackageAvailability, PackageBackend, PackagePlan,

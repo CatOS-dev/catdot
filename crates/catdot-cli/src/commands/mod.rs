@@ -232,13 +232,27 @@ fn prune_helper(dry_run: bool, yes: bool) -> Result<()> {
 }
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    let ps = profiles()?;
+    let registry = profiles()?;
+    let ps = &registry.valid_profiles;
     let path = state_file()?;
     let mut state = read_state(&path)?;
     match cli.command {
         Cmd::List { profile } => {
             if let Some(id) = profile {
-                let p = ps.get(&id).context("unknown profile")?;
+                let p = match ps.get(&id) {
+                    Some(profile) => profile,
+                    None => {
+                        if let Some(diagnostic) = registry.diagnostics.iter().find(|diagnostic| {
+                            diagnostic
+                                .profile_directory
+                                .file_name()
+                                .is_some_and(|name| name == std::ffi::OsStr::new(&id))
+                        }) {
+                            bail!("invalid profile {id}: {}", diagnostic.message);
+                        }
+                        bail!("unknown profile {id}");
+                    }
+                };
                 println!("{} — {}", p.id, p.name);
                 for (id, c) in &p.components {
                     println!("  {} ({})", id, c.role)
@@ -246,6 +260,12 @@ pub fn run() -> Result<()> {
             } else {
                 for p in ps.values() {
                     println!("{} — {}", p.id, p.name)
+                }
+                if !registry.diagnostics.is_empty() {
+                    println!(
+                        "Invalid profiles: {} (run: catdot doctor)",
+                        registry.diagnostics.len()
+                    );
                 }
             }
         }
@@ -258,7 +278,7 @@ pub fn run() -> Result<()> {
         Cmd::Select { first, reference } => {
             let selected;
             if let Some(reference) = reference {
-                select_component(&mut state, &ps, &first, &reference)?;
+                select_component(&mut state, ps, &first, &reference)?;
                 selected = format!("Selected {first}: {reference}");
             } else {
                 let p = ps.get(&first).context("unknown profile")?;
@@ -266,14 +286,14 @@ pub fn run() -> Result<()> {
                 state.generation = state.generation.max(read_state(&path)?.generation + 1);
                 selected = format!("Selected profile {first}");
             }
-            apply(&ps, &state, None)?;
+            apply(ps, &state, None)?;
             write_state(&path, &state)?;
             println!("{selected}");
-            print_missing_packages(&ps, &state)?;
+            print_missing_packages(ps, &state)?;
         }
         Cmd::Disable { role } => {
             if state.components.contains_key(&role)
-                && let Err(error) = deactivate(&ps, &state, &role)
+                && let Err(error) = deactivate(ps, &state, &role)
             {
                 eprintln!("warning: could not remove managed links for disabled {role}: {error}");
             }
@@ -282,11 +302,11 @@ pub fn run() -> Result<()> {
             write_state(&path, &state)?;
         }
         Cmd::Apply => {
-            apply(&ps, &state, None)?;
-            print_missing_packages(&ps, &state)?;
+            apply(ps, &state, None)?;
+            print_missing_packages(ps, &state)?;
         }
-        Cmd::Adopt { role } => apply(&ps, &state, Some(&role))?,
-        Cmd::Exec { role, arguments } => return exec_role(&ps, &state, &role, &arguments),
+        Cmd::Adopt { role } => apply(ps, &state, Some(&role))?,
+        Cmd::Exec { role, arguments } => return exec_role(ps, &state, &role, &arguments),
         Cmd::Resolve {
             dry_run,
             yes,
@@ -294,8 +314,16 @@ pub fn run() -> Result<()> {
         } => helper("resolve", &state, &path, with_optional, dry_run, yes)?,
         Cmd::Prune { dry_run, yes } => helper("prune", &state, &path, false, dry_run, yes)?,
         Cmd::Doctor => {
+            for diagnostic in &registry.diagnostics {
+                println!(
+                    "invalid profile: {} ({:?}): {}",
+                    diagnostic.manifest_path.display(),
+                    diagnostic.kind,
+                    diagnostic.message
+                );
+            }
             for role in state.components.keys() {
-                match component_for(&ps, &state, role) {
+                match component_for(ps, &state, role) {
                     Ok((_p, c, r)) => {
                         let m: Vec<_> = c
                             .packages

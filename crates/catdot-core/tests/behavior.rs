@@ -85,6 +85,32 @@ fn discovery_rejects_unknown_fields_and_escape() {
 }
 
 #[test]
+fn discovery_keeps_valid_profiles_when_another_manifest_is_invalid() {
+    let dir = tempdir().unwrap();
+    let valid = dir.path().join("valid");
+    let invalid = dir.path().join("invalid");
+    fs::create_dir_all(valid.join("waybar")).unwrap();
+    fs::create_dir_all(&invalid).unwrap();
+    fs::write(valid.join("waybar/config"), "config").unwrap();
+    fs::write(
+        valid.join("profile.toml"),
+        manifest().replace("demo", "valid"),
+    )
+    .unwrap();
+    fs::write(invalid.join("profile.toml"), "not valid = [toml").unwrap();
+
+    let registry = discover_profile_registry(dir.path()).unwrap();
+
+    assert!(registry.valid_profiles.contains_key("valid"));
+    assert_eq!(registry.diagnostics.len(), 1);
+    let diagnostic = &registry.diagnostics[0];
+    assert_eq!(diagnostic.profile_directory, invalid);
+    assert_eq!(diagnostic.manifest_path, invalid.join("profile.toml"));
+    assert_eq!(diagnostic.kind, ProfileDiagnosticKind::Toml);
+    assert!(!diagnostic.message.is_empty());
+}
+
+#[test]
 fn discovery_rejects_a_profile_directory_symlink_outside_the_profile_root() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("profiles");

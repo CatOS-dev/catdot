@@ -149,6 +149,58 @@ fn unresolved_component_cannot_be_executed() {
 }
 
 #[test]
+fn invalid_profile_does_not_block_list_doctor_or_an_unrelated_exec() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let valid = root.path().join("valid");
+    let invalid = root.path().join("invalid");
+    fs::create_dir_all(valid.join("terminal")).unwrap();
+    fs::create_dir_all(&invalid).unwrap();
+    fs::write(
+        valid.join("profile.toml"),
+        "schema = 1\n[profile]\nid = \"valid\"\nname = \"Valid\"\ndescription = \"test\"\n[defaults]\nterminal = \"terminal\"\n[components.terminal]\nrole = \"terminal\"\npath = \"terminal\"\nexec = [\"/usr/bin/true\"]\n",
+    )
+    .unwrap();
+    fs::write(invalid.join("profile.toml"), "this = [bad").unwrap();
+    let state_dir = home.path().join(".local/state/catdot");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.toml"),
+        "generation = 1\n[components]\nterminal = \"valid/terminal\"\n",
+    )
+    .unwrap();
+    let binary = env!("CARGO_BIN_EXE_catdot");
+
+    let list = Command::new(binary)
+        .arg("list")
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let list = String::from_utf8(list.stdout).unwrap();
+    assert!(list.contains("valid") && list.contains("Invalid profiles: 1"));
+
+    let doctor = Command::new(binary)
+        .arg("doctor")
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(doctor.status.success());
+    let doctor = String::from_utf8(doctor.stdout).unwrap();
+    assert!(doctor.contains("invalid/profile.toml") && doctor.contains("Toml"));
+
+    let exec = Command::new(binary)
+        .args(["exec", "terminal"])
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .status()
+        .unwrap();
+    assert!(exec.success());
+}
+
+#[test]
 fn select_reports_missing_packages_and_the_resolve_command() {
     let root = tempdir().unwrap();
     let home = tempdir().unwrap();
