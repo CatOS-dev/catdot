@@ -694,12 +694,19 @@ fn confined_link_targets_reject_symlink_escapes_but_allow_nested_directories() {
 fn shipped_profiles_are_limited_to_the_default_appearance_profile() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../profiles");
     let profiles = discover_profiles(&root).unwrap();
-    assert_eq!(profiles.keys().map(String::as_str).collect::<Vec<_>>(), ["catos-default"]);
+    assert_eq!(
+        profiles.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["catos-default"]
+    );
 
     let profile = &profiles["catos-default"];
     let state = select_profile(profile).unwrap();
     assert_eq!(
-        state.components.keys().map(String::as_str).collect::<Vec<_>>(),
+        state
+            .components
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
         ["gtk-theme", "qt-theme"]
     );
     assert_eq!(profile.components.len(), 2);
