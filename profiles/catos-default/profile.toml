@@ -13,11 +13,11 @@ qt-theme = "qt"
 role = "gtk-theme"
 path = "gtk"
 backend = "gtk"
-packages = ["catos-graphite-gtk-theme", "catos-tela-icon-theme-blue", "catos-bibata-cursor"]
+packages = ["catos-graphite-gtk-theme", "tela-icon-theme-git", "catos-bibata-cursor"]
 
 [components.gtk.settings]
-theme = "Graphite-Dark"
-icon_theme = "Tela-circle-blue-dark"
+theme = "Graphite-Dark-nord"
+icon_theme = "Tela-blue-dark"
 cursor_theme = "Bibata-Modern-Ice"
 font = "Noto Sans 10"
 color_scheme = "prefer-dark"
@@ -26,10 +26,10 @@ color_scheme = "prefer-dark"
 role = "qt-theme"
 path = "qt"
 backend = "qtct-kvantum"
-packages = ["qt5ct", "qt6ct", "kvantum", "catos-graphite-kvantum-theme"]
+packages = ["qt5ct", "qt6ct", "kvantum"]
 
 [components.qt.settings]
 qt5_style = "kvantum"
 qt6_style = "kvantum"
-kvantum_theme = "GraphiteDark"
-icon_theme = "Tela-circle-blue-dark"
+kvantum_theme = "KvantumAlt"
+icon_theme = "Tela-blue-dark"
