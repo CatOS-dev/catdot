@@ -2,7 +2,9 @@ use crate::auth::{caller_uid, read_trusted_user_state, user_home};
 use crate::backend::{
     hold_packages, open_handle, prepared_removal_plan, removable_with_alpm, remove_with_alpm,
 };
-use crate::system::{ensure_system_database, load_records, user_record_path, valid_records};
+use crate::system::{
+    ensure_system_database, load_records, user_record_path, valid_records, write_system_file,
+};
 use anyhow::{Result, bail};
 use catdot_core::*;
 use clap::{Parser, Subcommand};
@@ -11,7 +13,7 @@ use std::{fs, path::PathBuf};
 mod package_journal;
 mod resolve;
 
-use package_journal::recover_pending;
+use package_journal::{PruneJournal, recover_pending};
 
 pub(super) const DB: &str = "/var/lib/catdot";
 #[derive(Parser)]
@@ -182,11 +184,19 @@ fn prune(uid: u32, _generation: u64, digest: &str) -> Result<()> {
     if plan.digest() != digest {
         bail!("plan changed; run catdot prune again")
     };
-    remove_with_alpm(&mut handle, &plan.remove)?;
     for name in &plan.remove {
         state.packages.remove(name);
     }
-    write_system_packages(&database.join("packages.toml"), &state)?;
+    let mut journal = PruneJournal::prepared(&database, &plan, state)?;
+    journal.verify(digest)?;
+    remove_with_alpm(&mut handle, &plan.remove)?;
+    journal.mark_alpm_committed()?;
+    write_system_file(
+        &database.join("packages.toml"),
+        &toml::to_string_pretty(journal.expected_packages())?,
+    )?;
+    journal.mark_records_committed()?;
+    journal.complete()?;
     Ok(())
 }
 
@@ -411,7 +421,10 @@ fn refresh_package_references(database: &std::path::Path) -> Result<()> {
             .get(&package.name)
             .map_or_else(Vec::new, |requirement| requirement.references.clone());
     }
-    write_system_packages(&database.join("packages.toml"), &state)?;
+    write_system_file(
+        &database.join("packages.toml"),
+        &toml::to_string_pretty(&state)?,
+    )?;
     Ok(())
 }
 fn users_list(_caller: u32) -> Result<()> {

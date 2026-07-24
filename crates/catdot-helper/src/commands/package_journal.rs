@@ -18,6 +18,90 @@ enum JournalStage {
     Complete,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+enum PruneJournalStage {
+    Prepared,
+    AlpmCommitted,
+    RecordsCommitted,
+    Complete,
+}
+
+#[derive(Debug, Deserialize)]
+struct JournalHeader {
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct PruneJournal {
+    kind: String,
+    id: String,
+    plan_digest: String,
+    removed_packages: BTreeSet<String>,
+    expected_packages: SystemPackageState,
+    stage: PruneJournalStage,
+    #[serde(skip)]
+    path: PathBuf,
+}
+
+impl PruneJournal {
+    pub(super) fn prepared(
+        database: &Path,
+        plan: &PackagePlan,
+        expected_packages: SystemPackageState,
+    ) -> Result<Self> {
+        let id = journal_id(0, 0)?;
+        let path = journal_directory(database)?.join(format!("prune-{id}.toml"));
+        let journal = Self {
+            kind: "prune".into(),
+            id,
+            plan_digest: plan.digest(),
+            removed_packages: plan.remove.iter().cloned().collect(),
+            expected_packages,
+            stage: PruneJournalStage::Prepared,
+            path,
+        };
+        journal.persist()?;
+        Ok(journal)
+    }
+
+    pub(super) fn verify(&self, digest: &str) -> Result<()> {
+        if self.plan_digest != digest {
+            bail!("prune journal does not match the confirmed plan")
+        }
+        Ok(())
+    }
+
+    pub(super) fn mark_alpm_committed(&mut self) -> Result<()> {
+        self.stage = PruneJournalStage::AlpmCommitted;
+        self.persist()
+    }
+
+    pub(super) fn mark_records_committed(&mut self) -> Result<()> {
+        self.stage = PruneJournalStage::RecordsCommitted;
+        self.persist()
+    }
+
+    pub(super) fn expected_packages(&self) -> &SystemPackageState {
+        &self.expected_packages
+    }
+
+    pub(super) fn complete(mut self) -> Result<()> {
+        self.stage = PruneJournalStage::Complete;
+        self.persist()?;
+        fs::remove_file(&self.path).with_context(|| format!("remove {}", self.path.display()))?;
+        sync_directory(
+            self.path
+                .parent()
+                .context("prune journal has no parent directory")?,
+        )
+    }
+
+    fn persist(&self) -> Result<()> {
+        write_system_file(&self.path, &toml::to_string_pretty(self)?)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct PackageJournal {
     id: String,
@@ -158,10 +242,19 @@ where
         if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
             continue;
         }
-        let mut journal: PackageJournal = toml::from_str(
-            &fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?,
-        )
-        .with_context(|| format!("parse {}", path.display()))?;
+        let contents =
+            fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let header: JournalHeader =
+            toml::from_str(&contents).with_context(|| format!("parse {}", path.display()))?;
+        if header.kind.as_deref() == Some("prune") {
+            let mut journal: PruneJournal =
+                toml::from_str(&contents).with_context(|| format!("parse {}", path.display()))?;
+            journal.path = path;
+            recover_prune_journal(journal, &mut package_present)?;
+            continue;
+        }
+        let mut journal: PackageJournal =
+            toml::from_str(&contents).with_context(|| format!("parse {}", path.display()))?;
         journal.path = path;
         match journal.stage {
             JournalStage::Prepared => {
@@ -195,6 +288,45 @@ where
                 journal.complete()?;
             }
             JournalStage::RecordsCommitted | JournalStage::Complete => journal.complete()?,
+        }
+    }
+    Ok(())
+}
+
+fn recover_prune_journal<F>(mut journal: PruneJournal, package_present: &mut F) -> Result<()>
+where
+    F: FnMut(&str) -> bool,
+{
+    let present = journal
+        .removed_packages
+        .iter()
+        .filter(|package| package_present(package))
+        .count();
+    match journal.stage {
+        PruneJournalStage::Prepared if present == journal.removed_packages.len() => {
+            journal.complete()?;
+        }
+        PruneJournalStage::Prepared | PruneJournalStage::AlpmCommitted if present == 0 => {
+            let database = journal
+                .path
+                .parent()
+                .and_then(Path::parent)
+                .context("prune journal is outside the transaction directory")?;
+            write_system_file(
+                &database.join("packages.toml"),
+                &toml::to_string_pretty(&journal.expected_packages)?,
+            )?;
+            journal.mark_records_committed()?;
+            journal.complete()?;
+        }
+        PruneJournalStage::Prepared | PruneJournalStage::AlpmCommitted => {
+            bail!(
+                "prune journal {} has a partial or uncertain ALPM result",
+                journal.id
+            )
+        }
+        PruneJournalStage::RecordsCommitted | PruneJournalStage::Complete => {
+            journal.complete()?;
         }
     }
     Ok(())
@@ -241,7 +373,7 @@ fn sync_directory(directory: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PackageJournal, PreparedTransaction, recover_pending};
+    use super::{PackageJournal, PreparedTransaction, PruneJournal, recover_pending};
     use catdot_core::{InstallReason, ManagedPackage, PackagePlan, SystemPackageState, UserRecord};
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -394,6 +526,38 @@ mod tests {
             fs::read_to_string(database.join("packages.toml")).unwrap(),
             toml::to_string_pretty(&expected_packages).unwrap()
         );
+        assert_eq!(
+            fs::read_dir(database.join("transactions")).unwrap().count(),
+            0
+        );
+    }
+
+    #[test]
+    fn interrupted_prune_replays_the_post_removal_package_state() {
+        let directory = tempdir().unwrap();
+        let database = directory.path();
+        let initial = packages();
+        fs::write(
+            database.join("packages.toml"),
+            toml::to_string_pretty(&initial).unwrap(),
+        )
+        .unwrap();
+        let expected = SystemPackageState::default();
+        let prune_plan = PackagePlan {
+            install: vec![],
+            remove: vec!["dependency".into()],
+            replacements: vec![],
+            satisfied: vec![],
+        };
+
+        PruneJournal::prepared(database, &prune_plan, expected.clone()).unwrap();
+        recover_pending(database, |name| name != "dependency").unwrap();
+
+        let recovered: SystemPackageState = toml::from_str(
+            &fs::read_to_string(database.join("packages.toml")).unwrap(),
+        )
+        .unwrap();
+        assert!(recovered.packages.is_empty());
         assert_eq!(
             fs::read_dir(database.join("transactions")).unwrap().count(),
             0
