@@ -26,6 +26,8 @@ Keep the first line under 72 characters. Use `fix` for verified bugs, `feat` for
 
 Each repair stage must end in its own commit. Do not combine unrelated fixes, and do not rewrite or squash the established baseline commit.
 
+Formatting-only changes must always use a separate `style` commit. Lockfile-only updates, documentation-only changes, generated metadata, and other changes unrelated to runtime behavior must likewise be committed separately from implementation changes.
+
 ## Required checks
 
 Before reporting completion, run:
