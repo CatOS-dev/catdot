@@ -1,4 +1,4 @@
-use alpm::{Alpm, PackageReason, SigLevel, TransFlag};
+use alpm::{Alpm, CommitError, PackageReason, PrepareError, SigLevel, TransFlag, Usage};
 use anyhow::{Context, Result, bail};
 use catdot_core::{PackageAvailability, PackageBackend, PackagePlan, install_plan};
 use std::{collections::BTreeSet, process::Command};
@@ -8,21 +8,52 @@ pub fn open_handle() -> Result<Alpm> {
     let database = pacman_conf_value("DBPath")?;
     let mut handle =
         Alpm::new(root.as_str(), database.as_str()).context("open libalpm database")?;
+    let cache_dirs = pacman_conf_required_values("CacheDir")?;
+    let hook_dirs = pacman_conf_values("HookDir")?;
+    let architectures = pacman_conf_required_values("Architecture")?;
+    let log_file = pacman_conf_value("LogFile")?;
+    let gpg_dir = pacman_conf_value("GPGDir")?;
     handle
         .set_default_siglevel(signature_level(&pacman_conf_values("SigLevel")?))
         .context("configure default pacman signature policy")?;
-    let cache_dirs = pacman_conf_values("CacheDir")?;
     handle
         .set_cachedirs(cache_dirs.iter().map(String::as_str))
         .context("configure libalpm cache")?;
+    handle
+        .set_hookdirs(hook_dirs.iter().map(String::as_str))
+        .context("configure libalpm hooks")?;
+    handle
+        .set_architectures(architectures.iter().map(String::as_str))
+        .context("configure libalpm architectures")?;
+    handle
+        .set_logfile(log_file)
+        .context("configure libalpm log file")?;
+    handle
+        .set_gpgdir(gpg_dir)
+        .context("configure libalpm GPG directory")?;
+    handle.set_check_space(check_space(&pacman_conf_values("CheckSpace")?));
+    handle.set_parallel_downloads(
+        pacman_conf_value("ParallelDownloads")?
+            .parse()
+            .context("parse pacman ParallelDownloads as an unsigned integer")?,
+    );
     for repo in pacman_conf_values("--repo-list")? {
+        let servers = pacman_repo_values(&repo, "Server")?
+            .into_iter()
+            .map(|server| expand_server(&server, &repo, &architectures))
+            .collect::<Result<Vec<_>>>()?;
+        if servers.is_empty() {
+            bail!("enabled pacman repository {repo} has no servers")
+        }
         let db = handle
             .register_syncdb_mut(
                 repo.as_str(),
                 repository_signature_level(&pacman_repo_raw_values(&repo, "SigLevel")?),
             )
             .with_context(|| format!("register {repo} sync database"))?;
-        for server in pacman_repo_values(&repo, "Server")? {
+        db.set_usage(repository_usage(&pacman_repo_raw_values(&repo, "Usage")?)?)
+            .with_context(|| format!("configure usage for {repo}"))?;
+        for server in servers {
             db.add_server(server)
                 .with_context(|| format!("configure server for {repo}"))?;
         }
@@ -41,31 +72,81 @@ fn pacman_conf_values(directive: &str) -> Result<Vec<String>> {
             String::from_utf8_lossy(&output.stderr).trim()
         )
     }
-    let values: Vec<_> = String::from_utf8(output.stdout)?
+    Ok(String::from_utf8(output.stdout)?
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .map(|line| line.strip_prefix("CacheDir = ").unwrap_or(line).to_owned())
-        .collect();
-    if values.is_empty() {
-        bail!("pacman-conf {directive} returned no values")
+        .map(normalize_pacman_conf_value)
+        .collect())
+}
+
+fn normalize_pacman_conf_value(line: &str) -> String {
+    let Some((key, value)) = line.split_once('=') else {
+        return line.to_owned();
+    };
+    if !key.trim().is_empty()
+        && key
+            .trim()
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        value.trim().to_owned()
+    } else {
+        line.to_owned()
     }
-    Ok(values)
 }
 
 fn pacman_conf_value(directive: &str) -> Result<String> {
-    let values = pacman_conf_values(directive)?;
+    let values = pacman_conf_required_values(directive)?;
     values
         .into_iter()
         .next()
         .context("pacman-conf returned no primary value")
 }
 
+fn pacman_conf_required_values(directive: &str) -> Result<Vec<String>> {
+    let values = pacman_conf_values(directive)?;
+    if values.is_empty() {
+        bail!("pacman-conf {directive} returned no values")
+    }
+    Ok(values)
+}
+
 fn pacman_repo_values(repo: &str, directive: &str) -> Result<Vec<String>> {
     Ok(pacman_repo_raw_values(repo, directive)?
         .into_iter()
-        .filter_map(|line| line.strip_prefix("Server = ").map(str::to_owned))
+        .map(|line| normalize_pacman_conf_value(&line))
         .collect())
+}
+
+fn expand_server(server: &str, repo: &str, architectures: &[String]) -> Result<String> {
+    let architecture = architectures
+        .first()
+        .context("pacman-conf Architecture returned no values")?;
+    Ok(server.replace("$repo", repo).replace("$arch", architecture))
+}
+
+fn check_space(values: &[String]) -> bool {
+    values.iter().any(|value| value == "CheckSpace")
+        && !values.iter().any(|value| value == "NoCheckSpace")
+}
+
+fn repository_usage(values: &[String]) -> Result<Usage> {
+    if values.is_empty() {
+        return Ok(Usage::ALL);
+    }
+    let mut usage = Usage::NONE;
+    for value in values.iter().flat_map(|value| value.split_whitespace()) {
+        usage |= match value {
+            "All" => Usage::ALL,
+            "Sync" => Usage::SYNC,
+            "Search" => Usage::SEARCH,
+            "Install" => Usage::INSTALL,
+            "Upgrade" => Usage::UPGRADE,
+            _ => bail!("unsupported pacman repository Usage value {value}"),
+        };
+    }
+    Ok(usage)
 }
 
 fn pacman_repo_raw_values(repo: &str, directive: &str) -> Result<Vec<String>> {
@@ -194,15 +275,14 @@ pub fn install_with_alpm(handle: &mut Alpm, names: &[String]) -> Result<()> {
             .trans_add_pkg(package)
             .map_err(|error| anyhow::anyhow!("add package {name} to transaction: {error}"))?;
     }
-    let prepare_error = handle.trans_prepare().err().map(|error| error.to_string());
-    if let Some(error) = prepare_error {
+    let prepare_failure = handle.trans_prepare().err().map(prepare_error);
+    if let Some(error) = prepare_failure {
         let _ = handle.trans_release();
-        bail!("libalpm dependency/conflict validation failed: {error}")
+        return Err(error);
     }
-    let commit_error = handle.trans_commit().err().map(|error| error.to_string());
-    if let Some(error) = commit_error {
+    if let Err(error) = handle.trans_commit() {
         let _ = handle.trans_release();
-        bail!("libalpm transaction failed: {error}")
+        return Err(commit_error(error));
     }
     for name in names {
         handle
@@ -216,6 +296,24 @@ pub fn install_with_alpm(handle: &mut Alpm, names: &[String]) -> Result<()> {
         .trans_release()
         .context("release libalpm transaction")?;
     Ok(())
+}
+
+fn prepare_error(error: PrepareError<'_>) -> anyhow::Error {
+    anyhow::anyhow!(
+        "libalpm prepare failed ({:?}): {}; data: {:?}",
+        error.error(),
+        error,
+        error.data()
+    )
+}
+
+fn commit_error(error: CommitError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "libalpm commit failed ({:?}): {}; data: {:?}",
+        error.error(),
+        error,
+        error.data()
+    )
 }
 
 fn sync_package<'a>(handle: &'a Alpm, name: &str) -> Result<&'a alpm::Package> {
