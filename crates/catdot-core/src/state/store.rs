@@ -34,6 +34,12 @@ pub fn managed_links_path(state_path: &Path) -> Result<PathBuf> {
         .ok_or_else(|| Error::Message("state path has no parent".into()))?;
     Ok(parent.join("managed-links.toml"))
 }
+pub fn state_lock_path(state_path: &Path) -> Result<PathBuf> {
+    let parent = state_path
+        .parent()
+        .ok_or_else(|| Error::Message("state path has no parent".into()))?;
+    Ok(parent.join("lock"))
+}
 pub fn read_state(path: &Path) -> Result<UserState> {
     if !path.exists() {
         return Ok(UserState::default());
@@ -96,6 +102,47 @@ pub fn write_state(path: &Path, state: &UserState) -> Result<()> {
         path,
         &toml::to_string_pretty(state).map_err(|error| Error::Message(error.to_string()))?,
     )
+}
+pub fn validate_user_state(state: &UserState, profiles: &BTreeMap<String, Profile>) -> Result<()> {
+    for (role, reference) in &state.components {
+        if !valid_state_id(role) {
+            return Err(Error::Message(format!("invalid saved role {role}")));
+        }
+        let mut parts = reference.split('/');
+        let (Some(profile_id), Some(component_id), None) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(Error::Message(format!(
+                "invalid saved component reference {reference}"
+            )));
+        };
+        if !valid_state_id(profile_id) || !valid_state_id(component_id) {
+            return Err(Error::Message(format!(
+                "invalid saved component reference {reference}"
+            )));
+        }
+        let profile = profiles.get(profile_id).ok_or_else(|| {
+            Error::Message(format!("profile {profile_id} is no longer installed"))
+        })?;
+        let component = profile.components.get(component_id).ok_or_else(|| {
+            Error::Message(format!("component {reference} is no longer installed"))
+        })?;
+        if component.role != *role {
+            return Err(Error::Message(format!(
+                "{reference} has role {}, not {role}",
+                component.role
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn valid_state_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 pub fn read_user_records(directory: &Path) -> Result<Vec<crate::UserRecord>> {
     if !directory.exists() {

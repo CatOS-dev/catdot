@@ -1,4 +1,5 @@
 use catdot_core::*;
+use fs2::FileExt;
 use std::{fs, os::unix::fs::MetadataExt};
 use tempfile::tempdir;
 
@@ -170,6 +171,80 @@ fn selection_exec_and_dependency_aggregation_are_deterministic() {
     assert_eq!(needs["waybar"].uids, vec![1000, 1001]);
     assert_eq!(needs["waybar"].references[0].uid, 1000);
     assert_eq!(needs["waybar"].references[1].uid, 1001);
+}
+
+#[test]
+fn user_state_validation_rejects_wrong_role_and_malformed_references() {
+    let dir = tempdir().unwrap();
+    let profile_dir = dir.path().join("demo");
+    fs::create_dir_all(&profile_dir).unwrap();
+    let profile = Profile {
+        id: "demo".into(),
+        name: "Demo".into(),
+        description: "test".into(),
+        root: profile_dir,
+        defaults: Default::default(),
+        components: [
+            (
+                "terminal".into(),
+                ComponentDef {
+                    role: "terminal".into(),
+                    path: dir.path().into(),
+                    packages: vec![],
+                    optional_packages: vec![],
+                    exec: vec![],
+                    links: vec![],
+                    backend: None,
+                    settings: Default::default(),
+                },
+            ),
+            (
+                "waybar".into(),
+                ComponentDef {
+                    role: "bar".into(),
+                    path: dir.path().into(),
+                    packages: vec![],
+                    optional_packages: vec![],
+                    exec: vec![],
+                    links: vec![],
+                    backend: None,
+                    settings: Default::default(),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let profiles = [("demo".into(), profile)].into_iter().collect();
+
+    for reference in ["demo/waybar", "demo//terminal", "demo/", "/terminal"] {
+        let state = UserState {
+            generation: 1,
+            components: [("terminal".into(), reference.into())]
+                .into_iter()
+                .collect(),
+        };
+        assert!(
+            validate_user_state(&state, &profiles).is_err(),
+            "{reference}"
+        );
+    }
+}
+
+#[test]
+fn user_state_lock_prevents_overlapping_updates_and_releases() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("state.toml");
+    let lock_path = state_lock_path(&path).unwrap();
+    let held = lock(&lock_path).unwrap();
+    let second = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    assert!(second.try_lock_exclusive().is_err());
+    drop(held);
+    second.lock_exclusive().unwrap();
 }
 
 #[test]

@@ -235,7 +235,33 @@ pub fn run() -> Result<()> {
     let registry = profiles()?;
     let ps = &registry.valid_profiles;
     let path = state_file()?;
-    let mut state = read_state(&path)?;
+    let is_doctor = matches!(&cli.command, Cmd::Doctor);
+    let mutates_state = matches!(
+        &cli.command,
+        Cmd::Select { .. } | Cmd::Disable { .. } | Cmd::Apply | Cmd::Adopt { .. }
+    );
+    let _state_lock = if mutates_state {
+        Some(lock(&state_lock_path(&path)?)?)
+    } else {
+        None
+    };
+    let mut state = match read_state(&path) {
+        Ok(state) => state,
+        Err(error) if is_doctor => {
+            println!("broken state: {error}");
+            UserState::default()
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if !is_doctor {
+        if let Cmd::Disable { role } = &cli.command {
+            let mut remaining = state.clone();
+            remaining.components.remove(role);
+            validate_user_state(&remaining, ps)?;
+        } else {
+            validate_user_state(&state, ps)?;
+        }
+    }
     match cli.command {
         Cmd::List { profile } => {
             if let Some(id) = profile {
@@ -321,6 +347,9 @@ pub fn run() -> Result<()> {
                     diagnostic.kind,
                     diagnostic.message
                 );
+            }
+            if let Err(error) = validate_user_state(&state, ps) {
+                println!("broken state: {error}");
             }
             for role in state.components.keys() {
                 match component_for(ps, &state, role) {
