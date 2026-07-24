@@ -409,7 +409,10 @@ pub fn run() -> Result<()> {
             if transactions.exists()
                 && std::fs::read_dir(&transactions)?.any(|entry| {
                     entry.ok().is_some_and(|entry| {
-                        entry.path().extension().is_some_and(|extension| extension == "toml")
+                        entry
+                            .path()
+                            .extension()
+                            .is_some_and(|extension| extension == "toml")
                     })
                 })
             {

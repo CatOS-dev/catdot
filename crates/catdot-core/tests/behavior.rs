@@ -482,7 +482,12 @@ fn activation_journal_completes_after_state_write_crash() {
     recover_activation_journals(&state_path).unwrap();
 
     assert_eq!(read_state(&state_path).unwrap(), new);
-    assert_eq!(fs::read_dir(activation_transactions_path(&state_path).unwrap()).unwrap().count(), 0);
+    assert_eq!(
+        fs::read_dir(activation_transactions_path(&state_path).unwrap())
+            .unwrap()
+            .count(),
+        0
+    );
 }
 
 #[test]

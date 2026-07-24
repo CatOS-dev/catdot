@@ -47,7 +47,11 @@ pub fn activation_transactions_path(state_path: &Path) -> Result<PathBuf> {
 }
 
 impl ActivationJournal {
-    pub fn begin(state_path: &Path, old_active_state: UserState, new_active_state: UserState) -> Result<Self> {
+    pub fn begin(
+        state_path: &Path,
+        old_active_state: UserState,
+        new_active_state: UserState,
+    ) -> Result<Self> {
         let directory = activation_transactions_path(state_path)?;
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -69,9 +73,12 @@ impl ActivationJournal {
     }
 
     pub fn track_file(&mut self, path: &Path, expected_contents: &[u8]) -> Result<()> {
-        self.track(path, Snapshot::File {
-            contents: expected_contents.to_vec(),
-        })
+        self.track(
+            path,
+            Snapshot::File {
+                contents: expected_contents.to_vec(),
+            },
+        )
     }
 
     pub fn track_symlink(&mut self, path: &Path, expected_target: &Path) -> Result<()> {
@@ -143,10 +150,12 @@ pub fn recover_activation_journals(state_path: &Path) -> Result<()> {
         path: directory.display().to_string(),
         source,
     })? {
-        let path = entry.map_err(|source| Error::Io {
-            path: directory.display().to_string(),
-            source,
-        })?.path();
+        let path = entry
+            .map_err(|source| Error::Io {
+                path: directory.display().to_string(),
+                source,
+            })?
+            .path();
         if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
             continue;
         }
@@ -154,10 +163,11 @@ pub fn recover_activation_journals(state_path: &Path) -> Result<()> {
             path: path.display().to_string(),
             source,
         })?;
-        let mut journal: ActivationJournal = toml::from_str(&contents).map_err(|source| Error::Toml {
-            path: path.display().to_string(),
-            source,
-        })?;
+        let mut journal: ActivationJournal =
+            toml::from_str(&contents).map_err(|source| Error::Toml {
+                path: path.display().to_string(),
+                source,
+            })?;
         if journal.state_path != state_path {
             return Err(Error::Message(format!(
                 "activation journal {} belongs to another state file",
@@ -173,7 +183,9 @@ pub fn recover_activation_journals(state_path: &Path) -> Result<()> {
 fn recover(journal: &ActivationJournal) -> Result<()> {
     let current = read_state(&journal.state_path)?;
     if current != journal.old_active_state && current != journal.new_active_state {
-        return Err(Error::Message("activation state was changed outside the journal".into()));
+        return Err(Error::Message(
+            "activation state was changed outside the journal".into(),
+        ));
     }
     if journal.stage == JournalStage::StateWritten && current == journal.new_active_state {
         return journal.clone().complete();
@@ -229,9 +241,7 @@ fn restore(path: &Path, snapshot: &Snapshot) -> Result<()> {
     }
     match snapshot {
         Snapshot::Missing => Ok(()),
-        Snapshot::File { contents } => {
-            atomic_write(path, &String::from_utf8_lossy(contents))
-        }
+        Snapshot::File { contents } => atomic_write(path, &String::from_utf8_lossy(contents)),
         Snapshot::Symlink { target } => {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|source| Error::Io {
