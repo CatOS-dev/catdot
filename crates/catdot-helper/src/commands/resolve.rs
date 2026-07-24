@@ -1,13 +1,14 @@
 use crate::{
     auth::{caller_uid, read_trusted_user_state, user_home},
-    backend::{
-        install_with_alpm, open_handle, prepared_install_plan, removable_with_alpm, satisfier_name,
-    },
+    backend::{install_with_alpm, open_handle, prepared_install_plan, satisfier_name},
     system::{load_records, replace_record, user_record_path, valid_records},
+};
+use super::package_journal::{
+    PackageJournal, PreparedTransaction, commit_records, recover_pending,
 };
 use anyhow::{Result, bail};
 use catdot_core::*;
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{collections::BTreeMap, path::Path};
 
 use super::DB;
 
@@ -46,26 +47,49 @@ pub(super) fn apply(
 ) -> Result<()> {
     caller_uid(uid)?;
     let _lock = lock(&Path::new(DB).join("lock"))?;
-    let context = prepare(uid, generation, state_path, optional)?;
     let database = Path::new(DB);
     let mut handle = open_handle()?;
+    recover_pending(database, |name| handle.localdb().pkg(name).is_ok())?;
+    let context = prepare(uid, generation, state_path, optional)?;
     if context.plan.digest() != digest {
         bail!("plan changed; run catdot resolve again")
     }
-    install_with_alpm(&mut handle, &context.plan.install)?;
-    let package_state = updated_package_state(database, &context.records, &context.plan, &handle)?;
-    commit_management_records(
-        &database.join("packages.toml"),
-        &toml::to_string_pretty(&package_state)?,
-        &user_record_path(database, uid),
-        &toml::to_string_pretty(&context.record)?,
+    let expected_packages = planned_package_state(database, &context.records, &context.plan)?;
+    let transaction_packages = context.plan.install.iter().cloned().collect();
+    let previously_present = context
+        .plan
+        .install
+        .iter()
+        .filter(|name| handle.localdb().pkg(name.as_str()).is_ok())
+        .cloned()
+        .collect();
+    let mut journal = PackageJournal::prepared(
+        database,
+        &context.plan,
+        PreparedTransaction {
+            uid,
+            generation,
+            direct_requirements: context.record.pending_requirements.clone(),
+            transaction_packages,
+            previously_present,
+            expected_record: context.record.clone(),
+            expected_packages,
+        },
     )?;
+    journal.verify(uid, generation, digest)?;
+    install_with_alpm(&mut handle, &context.plan.install)?;
+    journal.mark_alpm_committed()?;
+    commit_records(database, journal.expected_packages(), journal.expected_record())?;
+    journal.mark_records_committed()?;
+    journal.complete()?;
     Ok(())
 }
 
 pub(super) fn finalize(uid: u32, generation: u64, state_path: &Path) -> Result<()> {
     caller_uid(uid)?;
     let _lock = lock(&Path::new(DB).join("lock"))?;
+    let handle = open_handle()?;
+    recover_pending(Path::new(DB), |name| handle.localdb().pkg(name).is_ok())?;
     let state = read_trusted_user_state(uid, state_path)?;
     if state.active_generation != generation || state.active_generation != state.generation {
         bail!("active state is not ready to finalize")
@@ -134,11 +158,10 @@ fn normalize_requirement_providers(records: &mut [UserRecord], handle: &alpm::Al
     Ok(())
 }
 
-fn updated_package_state(
+fn planned_package_state(
     database: &Path,
     records: &[UserRecord],
     plan: &PackagePlan,
-    handle: &alpm::Alpm,
 ) -> Result<SystemPackageState> {
     let mut state = read_system_packages(&database.join("packages.toml"))?;
     let requirements = aggregate_requirements(records);
@@ -155,14 +178,24 @@ fn updated_package_state(
                 was_missing_before_catdot: prior
                     .is_some_and(|package| package.was_missing_before_catdot)
                     || plan.install.contains(&name),
-                install_reason: if removable_with_alpm(handle, &name) {
-                    InstallReason::Dependency
-                } else {
-                    InstallReason::Explicit
-                },
+                install_reason: prior
+                    .map(|package| package.install_reason.clone())
+                    .unwrap_or(InstallReason::Dependency),
+                introduced_by_transaction: prior
+                    .and_then(|package| package.introduced_by_transaction.clone()),
                 references: requirement.references,
             },
         );
+    }
+    for name in &plan.install {
+        packages.entry(name.clone()).or_insert_with(|| ManagedPackage {
+            name: name.clone(),
+            catdot_installed: true,
+            was_missing_before_catdot: true,
+            install_reason: InstallReason::Dependency,
+            introduced_by_transaction: None,
+            references: vec![],
+        });
     }
     for (name, package) in previous {
         if package.catdot_installed && !packages.contains_key(&name) {
@@ -171,59 +204,4 @@ fn updated_package_state(
     }
     state.packages = packages;
     Ok(state)
-}
-
-fn commit_management_records(
-    package_path: &Path,
-    package_contents: &str,
-    user_path: &Path,
-    user_contents: &str,
-) -> Result<()> {
-    let previous_packages = fs::read_to_string(package_path).ok();
-    atomic_write(package_path, package_contents)?;
-    if let Err(error) = atomic_write(user_path, user_contents) {
-        if let Err(restore_error) = restore_file(package_path, previous_packages.as_deref()) {
-            bail!(
-                "could not write user record ({error}) and could not restore package record ({restore_error})"
-            )
-        }
-        return Err(error.into());
-    }
-    Ok(())
-}
-
-fn restore_file(path: &Path, contents: Option<&str>) -> Result<()> {
-    match contents {
-        Some(contents) => atomic_write(path, contents).map_err(Into::into),
-        None if path.exists() => {
-            fs::remove_file(path)?;
-            Ok(())
-        }
-        None => Ok(()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::commit_management_records;
-    use std::fs;
-    use tempfile::tempdir;
-
-    #[test]
-    fn failed_user_record_write_restores_the_previous_package_record() {
-        let directory = tempdir().unwrap();
-        let package = directory.path().join("packages.toml");
-        let blocked_parent = directory.path().join("blocked");
-        fs::write(&package, "previous packages").unwrap();
-        fs::write(&blocked_parent, "not a directory").unwrap();
-
-        let result = commit_management_records(
-            &package,
-            "new packages",
-            &blocked_parent.join("1000.toml"),
-            "new user",
-        );
-        assert!(result.is_err());
-        assert_eq!(fs::read_to_string(&package).unwrap(), "previous packages");
-    }
 }

@@ -7,6 +7,9 @@ use clap::{Parser, Subcommand};
 use std::{fs, path::PathBuf};
 
 mod resolve;
+mod package_journal;
+
+use package_journal::recover_pending;
 
 pub(super) const DB: &str = "/var/lib/catdot";
 #[derive(Parser)]
@@ -159,8 +162,9 @@ fn prune(uid: u32, _generation: u64, digest: &str) -> Result<()> {
     caller_uid(uid)?;
     let _lock = lock(&PathBuf::from(DB).join("lock"))?;
     let database = PathBuf::from(DB);
-    let mut state = read_system_packages(&database.join("packages.toml"))?;
     let mut handle = open_handle()?;
+    recover_pending(&database, |name| handle.localdb().pkg(name).is_ok())?;
+    let mut state = read_system_packages(&database.join("packages.toml"))?;
     let plan = canonical_prune_plan(&mut handle, &state)?;
     if plan.digest() != digest {
         bail!("plan changed; run catdot prune again")
@@ -211,13 +215,14 @@ fn caller_uid_from_pkexec() -> Result<u32> {
 fn users_prune(_caller: u32) -> Result<()> {
     let _lock = lock(&PathBuf::from(DB).join("lock"))?;
     let database = PathBuf::from(DB);
+    let mut handle = open_handle()?;
+    recover_pending(&database, |name| handle.localdb().pkg(name).is_ok())?;
     for uid in stale_user_record_uids()? {
         println!("removing stale record for uid {uid}");
         fs::remove_file(user_record_path(&database, uid))?;
     }
     refresh_package_references(&database)?;
     let state = read_system_packages(&database.join("packages.toml"))?;
-    let mut handle = open_handle()?;
     let plan = canonical_prune_plan(&mut handle, &state)?;
     if !plan.remove.is_empty() {
         println!("Packages now eligible for catdot prune:");

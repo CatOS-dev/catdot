@@ -231,6 +231,8 @@ pub struct ManagedPackage {
     pub catdot_installed: bool,
     pub was_missing_before_catdot: bool,
     pub install_reason: InstallReason,
+    #[serde(default)]
+    pub introduced_by_transaction: Option<String>,
     pub references: Vec<PackageReference>,
 }
 

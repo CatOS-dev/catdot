@@ -280,6 +280,7 @@ fn plan_digest_and_prune_rules_protect_packages() {
         catdot_installed: true,
         was_missing_before_catdot: true,
         install_reason: InstallReason::Dependency,
+        introduced_by_transaction: None,
         references: vec![],
     };
     assert!(prunable(&owned, false));
