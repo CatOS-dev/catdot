@@ -116,7 +116,8 @@ fn helper(
     let state_path = state_path
         .to_str()
         .context("state path is not valid UTF-8")?;
-    let output = Command::new("/usr/lib/catdot/catdot-helper")
+    let output = Command::new("pkexec")
+        .arg("/usr/lib/catdot/catdot-helper")
         .args([
             "resolve-plan",
             "--uid",
@@ -190,7 +191,8 @@ fn helper(
 }
 fn prune_helper(dry_run: bool, yes: bool) -> Result<()> {
     let uid = unsafe { libc::geteuid() }.to_string();
-    let output = Command::new("/usr/lib/catdot/catdot-helper")
+    let output = Command::new("pkexec")
+        .arg("/usr/lib/catdot/catdot-helper")
         .args(["prune-plan", "--uid", &uid])
         .output()
         .context("obtain canonical prune plan from catdot helper")?;

@@ -75,6 +75,9 @@ enum Cmd {
     },
 }
 pub fn run() -> Result<()> {
+    if unsafe { libc::geteuid() } == 0 {
+        unsafe { libc::umask(0o022) };
+    }
     let cli = Cli::parse();
     match cli.command {
         Cmd::ResolvePlan {
@@ -195,15 +198,42 @@ fn canonical_prune_plan(
     handle: &mut alpm::Alpm,
     state: &SystemPackageState,
 ) -> Result<PackagePlan> {
-    let candidates: Vec<_> = state
+    let mut candidates: Vec<_> = state
         .packages
         .values()
         .filter(|package| prunable(package, false) && removable_with_alpm(handle, &package.name))
         .map(|package| package.name.clone())
         .collect();
+    let remove = loop {
+        match prepared_removal_plan(handle, &candidates) {
+            Ok(plan) => break plan,
+            Err(_) if candidates.is_empty() => break vec![],
+            Err(_) => {
+                let mut best = None;
+                for index in 0..candidates.len() {
+                    let mut trial = candidates.clone();
+                    trial.remove(index);
+                    if let Ok(plan) = prepared_removal_plan(handle, &trial)
+                        && best.as_ref().is_none_or(
+                            |(_, best_plan): &(Vec<String>, Vec<String>)| {
+                                plan.len() > best_plan.len()
+                            },
+                        )
+                    {
+                        best = Some((trial, plan));
+                    }
+                }
+                if let Some((trial, _)) = best {
+                    candidates = trial;
+                } else {
+                    candidates.pop();
+                }
+            }
+        }
+    };
     Ok(PackagePlan {
         install: vec![],
-        remove: prepared_removal_plan(handle, &candidates)?,
+        remove,
         satisfied: vec![],
     })
 }

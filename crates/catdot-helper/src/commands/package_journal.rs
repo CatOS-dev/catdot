@@ -1,6 +1,6 @@
-use crate::system::user_record_path;
+use crate::system::{user_record_path, write_system_file};
 use anyhow::{Context, Result, bail};
-use catdot_core::{PackagePlan, SystemPackageState, UserRecord, atomic_write};
+use catdot_core::{PackagePlan, SystemPackageState, UserRecord};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -13,6 +13,7 @@ use std::{
 enum JournalStage {
     Prepared,
     AlpmCommitted,
+    RecordsPrepared,
     RecordsCommitted,
     Complete,
 }
@@ -49,11 +50,7 @@ impl PackageJournal {
         plan: &PackagePlan,
         input: PreparedTransaction,
     ) -> Result<Self> {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("read system clock for package transaction journal")?
-            .as_nanos();
-        let id = format!("{}-{}-{stamp}", input.uid, input.generation);
+        let id = journal_id(input.uid, input.generation)?;
         let mut expected_packages = input.expected_packages;
         for package in &input.transaction_packages {
             if !input.previously_present.contains(package)
@@ -74,6 +71,30 @@ impl PackageJournal {
             expected_record: input.expected_record,
             expected_packages,
             stage: JournalStage::Prepared,
+            path,
+        };
+        journal.persist()?;
+        Ok(journal)
+    }
+
+    pub(super) fn records_prepared(
+        database: &Path,
+        expected_packages: SystemPackageState,
+        expected_record: UserRecord,
+    ) -> Result<Self> {
+        let id = journal_id(expected_record.uid, expected_record.active_generation)?;
+        let path = journal_directory(database)?.join(format!("finalize-{id}.toml"));
+        let journal = Self {
+            id,
+            plan_digest: "finalize".into(),
+            uid: expected_record.uid,
+            generation: expected_record.active_generation,
+            direct_requirements: expected_record.active_requirements.clone(),
+            transaction_packages: BTreeSet::new(),
+            previously_present: BTreeSet::new(),
+            expected_record,
+            expected_packages,
+            stage: JournalStage::RecordsPrepared,
             path,
         };
         journal.persist()?;
@@ -117,7 +138,7 @@ impl PackageJournal {
     }
 
     fn persist(&self) -> Result<()> {
-        atomic_write(&self.path, &toml::to_string_pretty(self)?)?;
+        write_system_file(&self.path, &toml::to_string_pretty(self)?)?;
         Ok(())
     }
 }
@@ -154,7 +175,7 @@ where
                 }
                 journal.complete()?;
             }
-            JournalStage::AlpmCommitted => {
+            JournalStage::AlpmCommitted | JournalStage::RecordsPrepared => {
                 if journal
                     .transaction_packages
                     .iter()
@@ -179,6 +200,14 @@ where
     Ok(())
 }
 
+fn journal_id(uid: u32, generation: u64) -> Result<String> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("read system clock for package transaction journal")?
+        .as_nanos();
+    Ok(format!("{uid}-{generation}-{stamp}"))
+}
+
 pub(super) fn commit_records(
     database: &Path,
     packages: &SystemPackageState,
@@ -187,14 +216,14 @@ pub(super) fn commit_records(
     let package_path = database.join("packages.toml");
     let record_path = user_record_path(database, record.uid);
     let previous_packages = fs::read_to_string(&package_path).ok();
-    atomic_write(&package_path, &toml::to_string_pretty(packages)?)?;
-    if let Err(error) = atomic_write(&record_path, &toml::to_string_pretty(record)?) {
+    write_system_file(&package_path, &toml::to_string_pretty(packages)?)?;
+    if let Err(error) = write_system_file(&record_path, &toml::to_string_pretty(record)?) {
         match previous_packages {
-            Some(contents) => atomic_write(&package_path, &contents)?,
+            Some(contents) => write_system_file(&package_path, &contents)?,
             None if package_path.exists() => fs::remove_file(&package_path)?,
             None => {}
         }
-        return Err(error.into());
+        return Err(error);
     }
     Ok(())
 }
@@ -339,6 +368,35 @@ mod tests {
 
         assert!(journal.verify(1000, 3, &plan().digest()).is_err());
         assert!(journal.verify(1000, 2, "different digest").is_err());
+    }
+
+    #[test]
+    fn interrupted_finalize_replays_the_matching_user_and_package_records() {
+        let directory = tempdir().unwrap();
+        let database = directory.path();
+        let expected_record = record();
+        let expected_packages = packages();
+
+        PackageJournal::records_prepared(
+            database,
+            expected_packages.clone(),
+            expected_record.clone(),
+        )
+        .unwrap();
+        recover_pending(database, |_| false).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(database.join("users/1000.toml")).unwrap(),
+            toml::to_string_pretty(&expected_record).unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(database.join("packages.toml")).unwrap(),
+            toml::to_string_pretty(&expected_packages).unwrap()
+        );
+        assert_eq!(
+            fs::read_dir(database.join("transactions")).unwrap().count(),
+            0
+        );
     }
 
     #[test]

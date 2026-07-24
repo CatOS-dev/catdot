@@ -4,7 +4,7 @@ use super::package_journal::{
 use crate::{
     auth::{caller_uid, read_trusted_user_state, user_home},
     backend::{install_with_alpm, open_handle, prepared_install_plan, satisfier_name},
-    system::{load_records, replace_record, user_record_path, valid_records},
+    system::{ensure_system_database, load_records, replace_record, valid_records},
 };
 use anyhow::{Result, bail};
 use catdot_core::*;
@@ -24,6 +24,7 @@ pub(super) fn print_plan(
     state_path: &Path,
     optional: bool,
 ) -> Result<()> {
+    ensure_system_database(Path::new(DB))?;
     let _lock = if unsafe { libc::geteuid() } == 0 {
         Some(lock(&Path::new(DB).join("lock"))?)
     } else {
@@ -46,6 +47,7 @@ pub(super) fn apply(
     optional: bool,
 ) -> Result<()> {
     caller_uid(uid)?;
+    ensure_system_database(Path::new(DB))?;
     let _lock = lock(&Path::new(DB).join("lock"))?;
     let database = Path::new(DB);
     let mut handle = open_handle()?;
@@ -91,6 +93,7 @@ pub(super) fn apply(
 
 pub(super) fn finalize(uid: u32, generation: u64, state_path: &Path) -> Result<()> {
     caller_uid(uid)?;
+    ensure_system_database(Path::new(DB))?;
     let _lock = lock(&Path::new(DB).join("lock"))?;
     let handle = open_handle()?;
     recover_pending(Path::new(DB), |name| handle.localdb().pkg(name).is_ok())?;
@@ -101,19 +104,31 @@ pub(super) fn finalize(uid: u32, generation: u64, state_path: &Path) -> Result<(
     let database = Path::new(DB);
     let mut records = load_records(database)?;
     let record = records
-        .iter_mut()
+        .iter()
         .find(|record| record.uid == uid)
         .ok_or_else(|| anyhow::anyhow!("pending user record is missing"))?;
     if record.pending_generation != generation || record.state_path != state_path {
         bail!("pending record generation does not match active state")
     }
-    record.active_generation = generation;
-    record.active_components = state.active_components;
-    record.active_requirements = std::mem::take(&mut record.pending_requirements);
-    atomic_write(
-        &user_record_path(database, uid),
-        &toml::to_string_pretty(record)?,
+    let profiles = discover_profile_registry(Path::new(DEFAULT_PROFILE_ROOT))?.valid_profiles;
+    let mut finalized = UserRecord::from_state(uid, state_path, &state, &profiles, false)?;
+    normalize_requirement_providers(std::slice::from_mut(&mut finalized), &handle)?;
+    replace_record(&mut records, finalized.clone());
+    let requirements = aggregate_requirements(&records);
+    let mut packages = read_system_packages(&database.join("packages.toml"))?;
+    for package in packages.packages.values_mut() {
+        package.references = requirements
+            .get(&package.name)
+            .map_or_else(Vec::new, |requirement| requirement.references.clone());
+    }
+    let mut journal = PackageJournal::records_prepared(database, packages, finalized)?;
+    commit_records(
+        database,
+        journal.expected_packages(),
+        journal.expected_record(),
     )?;
+    journal.mark_records_committed()?;
+    journal.complete()?;
     Ok(())
 }
 

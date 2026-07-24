@@ -1,26 +1,69 @@
 use anyhow::{Context, Result, bail};
 use catdot_core::UserRecord;
 use std::{
+    ffi::CString,
     fs,
     io::Read,
-    os::unix::{fs::MetadataExt, fs::OpenOptionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
 };
+
+const SYSTEM_DIRECTORY_MODE: u32 = 0o700;
+const SYSTEM_FILE_MODE: u32 = 0o600;
 
 pub fn user_record_path(database: &Path, uid: u32) -> PathBuf {
     database.join("users").join(format!("{uid}.toml"))
 }
+
+pub fn ensure_system_database(database: &Path) -> Result<()> {
+    ensure_system_directory(database)?;
+    ensure_system_directory(&database.join("users"))?;
+    ensure_system_directory(&database.join("transactions"))
+}
+
+pub fn write_system_file(path: &Path, contents: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("system file has no parent directory")?;
+    ensure_system_directory(parent)?;
+    catdot_core::atomic_write(path, contents)?;
+    secure_path(path, SYSTEM_FILE_MODE)
+}
+
+fn ensure_system_directory(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
+    secure_path(path, SYSTEM_DIRECTORY_MODE)
+}
+
+fn secure_path(path: &Path, mode: u32) -> Result<()> {
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    if unsafe { libc::geteuid() } == 0 && unsafe { libc::chown(path.as_ptr(), 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("set root ownership on {}", path.to_string_lossy()));
+    }
+    fs::set_permissions(
+        path.to_string_lossy().as_ref(),
+        fs::Permissions::from_mode(mode),
+    )
+    .with_context(|| format!("set mode {mode:o} on {}", path.to_string_lossy()))
+}
+
 pub fn load_records(database: &Path) -> Result<Vec<UserRecord>> {
     load_records_for_owner(database, 0)
 }
 
 fn load_records_for_owner(database: &Path, owner: u32) -> Result<Vec<UserRecord>> {
     let directory = database.join("users");
-    if !directory.exists() {
-        return Ok(vec![]);
-    }
-    let directory_metadata = fs::symlink_metadata(&directory)
-        .with_context(|| format!("inspect {}", directory.display()))?;
+    let directory_metadata = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", directory.display()));
+        }
+    };
     if !directory_metadata.is_dir()
         || directory_metadata.uid() != owner
         || directory_metadata.mode() & 0o002 != 0
