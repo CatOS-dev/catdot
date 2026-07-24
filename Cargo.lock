@@ -127,6 +127,7 @@ dependencies = [
  "catdot-core",
  "clap",
  "libc",
+ "serde",
  "tempfile",
  "toml",
 ]
