@@ -1,24 +1,53 @@
-pkgname=catdot
+pkgbase=catdot
+pkgname=('catdot' 'catos-niri-default' 'catos-sway-default' 'catos-graphite-profile')
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='CatOS system desktop profile manager'
+pkgdesc='CatOS desktop profile manager'
 arch=('x86_64')
+url='https://github.com/CatOS-dev/catdot'
 license=('GPL-3.0-or-later')
-depends=('pacman' 'polkit' 'libalpm.so=16-64')
 makedepends=('cargo')
-source=()
-sha256sums=()
+source=("${pkgbase}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+# The v${pkgver} archive does not exist yet. Replace SKIP with its verified
+# checksum when publishing the corresponding release tag.
+sha256sums=('SKIP')
 
 build() {
-  cd "$startdir/.."
+  cd "${srcdir}/${pkgbase}-${pkgver}"
   cargo build --release --locked
 }
 
-package() {
-  cd "$startdir/.."
-  install -Dm755 target/release/catdot "$pkgdir/usr/bin/catdot"
-  install -Dm755 target/release/catdot-helper "$pkgdir/usr/lib/catdot/catdot-helper"
-  install -Dm644 packaging/org.catos.catdot.policy "$pkgdir/usr/share/polkit-1/actions/org.catos.catdot.policy"
-  install -d "$pkgdir/usr/share/catdot/profiles"
-  cp -a profiles/. "$pkgdir/usr/share/catdot/profiles/"
+package_catdot() {
+  depends=('pacman' 'polkit' 'libalpm.so=16-64')
+  cd "${srcdir}/${pkgbase}-${pkgver}"
+  install -Dm755 target/release/catdot "${pkgdir}/usr/bin/catdot"
+  install -Dm755 target/release/catdot-helper "${pkgdir}/usr/lib/catdot/catdot-helper"
+  install -Dm644 packaging/org.catos.catdot.policy \
+    "${pkgdir}/usr/share/polkit-1/actions/org.catos.catdot.policy"
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+}
+
+package_catos-niri-default() {
+  pkgdesc='Default CatOS Niri profile for Catdot'
+  depends=("catdot=${pkgver}-${pkgrel}")
+  cd "${srcdir}/${pkgbase}-${pkgver}"
+  install -d "${pkgdir}/usr/share/catdot/profiles"
+  cp -a profiles/catos-niri-default "${pkgdir}/usr/share/catdot/profiles/"
+}
+
+package_catos-sway-default() {
+  pkgdesc='Default CatOS Sway profile for Catdot'
+  depends=("catdot=${pkgver}-${pkgrel}")
+  cd "${srcdir}/${pkgbase}-${pkgver}"
+  install -d "${pkgdir}/usr/share/catdot/profiles"
+  cp -a profiles/catos-sway-default "${pkgdir}/usr/share/catdot/profiles/"
+}
+
+package_catos-graphite-profile() {
+  pkgdesc='Graphite theme profile for Catdot'
+  depends=("catdot=${pkgver}-${pkgrel}")
+  cd "${srcdir}/${pkgbase}-${pkgver}"
+  install -d "${pkgdir}/usr/share/catdot/profiles"
+  cp -a profiles/catos-graphite "${pkgdir}/usr/share/catdot/profiles/"
 }
