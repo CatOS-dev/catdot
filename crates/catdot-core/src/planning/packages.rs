@@ -2,7 +2,10 @@ use super::{PackageBackend, require_available};
 use crate::{Error, Profile, Result, UserState};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+};
 
 fn resolve<'a>(
     profiles: &'a BTreeMap<String, Profile>,
@@ -70,38 +73,63 @@ pub fn packages_for_state(
 #[serde(deny_unknown_fields)]
 pub struct UserRecord {
     pub uid: u32,
-    pub generation: u64,
+    pub pending_generation: u64,
+    pub active_generation: u64,
+    pub state_path: PathBuf,
     pub components: BTreeMap<String, String>,
-    pub requirements: BTreeMap<String, BTreeSet<String>>,
+    pub active_components: BTreeMap<String, String>,
+    pub active_requirements: BTreeMap<String, BTreeSet<String>>,
+    pub pending_requirements: BTreeMap<String, BTreeSet<String>>,
 }
 impl UserRecord {
     pub fn from_state(
         uid: u32,
+        state_path: &Path,
         state: &UserState,
         profiles: &BTreeMap<String, Profile>,
         optional: bool,
     ) -> Result<Self> {
-        let mut requirements = BTreeMap::new();
-        for reference in state.components.values() {
-            let (_, component) = resolve(profiles, reference)?;
-            for package in component.packages.iter().chain(if optional {
-                component.optional_packages.iter()
-            } else {
-                [].iter()
-            }) {
-                requirements
-                    .entry(package.clone())
-                    .or_insert_with(BTreeSet::new)
-                    .insert(reference.clone());
-            }
-        }
+        let active_requirements =
+            requirements_for_components(&state.active_components, profiles, optional)?;
+        let pending_requirements = if state.active_generation == state.generation
+            && state.active_components == state.components
+        {
+            BTreeMap::new()
+        } else {
+            requirements_for_components(&state.components, profiles, optional)?
+        };
         Ok(Self {
             uid,
-            generation: state.generation,
+            pending_generation: state.generation,
+            active_generation: state.active_generation,
+            state_path: state_path.into(),
             components: state.components.clone(),
-            requirements,
+            active_components: state.active_components.clone(),
+            active_requirements,
+            pending_requirements,
         })
     }
+}
+fn requirements_for_components(
+    components: &BTreeMap<String, String>,
+    profiles: &BTreeMap<String, Profile>,
+    optional: bool,
+) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let mut requirements = BTreeMap::new();
+    for reference in components.values() {
+        let (_, component) = resolve(profiles, reference)?;
+        for package in component.packages.iter().chain(if optional {
+            component.optional_packages.iter()
+        } else {
+            [].iter()
+        }) {
+            requirements
+                .entry(package.clone())
+                .or_insert_with(BTreeSet::new)
+                .insert(reference.clone());
+        }
+    }
+    Ok(requirements)
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -124,7 +152,11 @@ pub struct PackagePlanPreview {
 pub fn aggregate_requirements(records: &[UserRecord]) -> BTreeMap<String, Requirement> {
     let mut requirements = BTreeMap::new();
     for record in records {
-        for (package, references) in &record.requirements {
+        for (package, references) in record
+            .active_requirements
+            .iter()
+            .chain(&record.pending_requirements)
+        {
             let requirement = requirements.entry(package.clone()).or_insert(Requirement {
                 uids: vec![],
                 references: vec![],
@@ -149,7 +181,13 @@ pub fn aggregate_requirements(records: &[UserRecord]) -> BTreeMap<String, Requir
 pub fn aggregate_packages(records: &[UserRecord]) -> BTreeSet<String> {
     records
         .iter()
-        .flat_map(|record| record.requirements.keys().cloned())
+        .flat_map(|record| {
+            record
+                .active_requirements
+                .keys()
+                .chain(record.pending_requirements.keys())
+                .cloned()
+        })
         .collect()
 }
 pub fn install_plan<B: PackageBackend>(

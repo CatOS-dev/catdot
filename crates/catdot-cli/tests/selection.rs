@@ -223,7 +223,73 @@ fn select_reports_missing_packages_and_the_resolve_command() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Selected launcher: demo/launcher"));
+    assert!(stdout.contains("Selected desired launcher: demo/launcher"));
+    assert!(stdout.contains("Active launcher remains: none"));
     assert!(stdout.contains("Missing packages:\n  catdot-test-package-that-is-not-installed"));
     assert!(stdout.contains("Run:\n  catdot resolve"));
+}
+
+#[test]
+fn select_keeps_a_linked_component_inactive_until_resolve() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let profile = root.path().join("demo");
+    fs::create_dir_all(profile.join("terminal")).unwrap();
+    fs::write(profile.join("terminal/config"), "config").unwrap();
+    fs::write(
+        profile.join("profile.toml"),
+        "schema = 1\n[profile]\nid = \"demo\"\nname = \"Demo\"\ndescription = \"test\"\n[defaults]\n[components.terminal]\nrole = \"terminal\"\npath = \"terminal\"\npackages = []\nexec = [\"true\"]\n[[components.terminal.links]]\nsource = \"config\"\ntarget = \"{xdg_config_home}/demo/config\"\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .args(["select", "terminal", "demo/terminal"])
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!home.path().join(".config/demo/config").exists());
+    let state = fs::read_to_string(home.path().join(".local/state/catdot/state.toml")).unwrap();
+    assert!(state.contains("terminal = \"demo/terminal\""));
+    assert!(!state.contains("[active_components]\nterminal"));
+}
+
+#[test]
+fn exec_uses_the_old_active_component_while_a_new_choice_is_pending() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let profile = root.path().join("demo");
+    fs::create_dir_all(profile.join("old")).unwrap();
+    fs::create_dir_all(profile.join("new")).unwrap();
+    fs::write(
+        profile.join("profile.toml"),
+        "schema = 1\n[profile]\nid = \"demo\"\nname = \"Demo\"\ndescription = \"test\"\n[defaults]\n[components.old]\nrole = \"terminal\"\npath = \"old\"\nexec = [\"true\"]\n[components.new]\nrole = \"terminal\"\npath = \"new\"\nexec = [\"false\"]\n",
+    )
+    .unwrap();
+    let state_dir = home.path().join(".local/state/catdot");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.toml"),
+        "schema = 1\ngeneration = 2\nactive_generation = 1\n[components]\nterminal = \"demo/new\"\n[active_components]\nterminal = \"demo/old\"\n",
+    )
+    .unwrap();
+
+    let status = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .args(["exec", "terminal"])
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .status()
+        .unwrap();
+
+    assert!(status.success());
 }

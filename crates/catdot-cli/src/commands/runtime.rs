@@ -151,22 +151,6 @@ pub(super) fn apply(
     Ok(())
 }
 
-pub(super) fn deactivate(
-    profiles: &std::collections::BTreeMap<String, Profile>,
-    state: &UserState,
-    role: &str,
-) -> Result<()> {
-    let registry = managed_links_path(&state_file()?)?;
-    let home = home()?;
-    let xdg = xdg_config_home(&home);
-    reconcile_managed_links(
-        &registry,
-        &desired_links(profiles, state, &home, &xdg, Some(role))?,
-        &[],
-    )
-    .map_err(Into::into)
-}
-
 fn desired_links(
     profiles: &std::collections::BTreeMap<String, Profile>,
     state: &UserState,
@@ -207,7 +191,15 @@ pub(super) fn exec_role(
     role: &str,
     arguments: &[String],
 ) -> Result<()> {
-    let (profile, component, reference) = component_for(profiles, state, role)?;
+    if !state.active_components.contains_key(role) {
+        if state.components.contains_key(role) {
+            bail!("{role} is selected but not activated; run: catdot resolve");
+        }
+        bail!("role is not selected");
+    }
+    let mut active = state.clone();
+    active.components = active.active_components.clone();
+    let (profile, component, reference) = component_for(profiles, &active, role)?;
     let missing: Vec<_> = component
         .packages
         .iter()

@@ -165,8 +165,8 @@ fn selection_exec_and_dependency_aggregation_are_deterministic() {
         .unwrap(),
         ";touch /tmp/not-a-command"
     );
-    let a = UserRecord::from_state(1000, &state, &profiles, false).unwrap();
-    let b = UserRecord::from_state(1001, &state, &profiles, false).unwrap();
+    let a = UserRecord::from_state(1000, dir.path(), &state, &profiles, false).unwrap();
+    let b = UserRecord::from_state(1001, dir.path(), &state, &profiles, false).unwrap();
     let needs = aggregate_requirements(&[a, b]);
     assert_eq!(needs["waybar"].uids, vec![1000, 1001]);
     assert_eq!(needs["waybar"].references[0].uid, 1000);
@@ -219,10 +219,13 @@ fn user_state_validation_rejects_wrong_role_and_malformed_references() {
 
     for reference in ["demo/waybar", "demo//terminal", "demo/", "/terminal"] {
         let state = UserState {
+            schema: 1,
             generation: 1,
             components: [("terminal".into(), reference.into())]
                 .into_iter()
                 .collect(),
+            active_generation: 0,
+            active_components: Default::default(),
         };
         assert!(
             validate_user_state(&state, &profiles).is_err(),
@@ -245,6 +248,15 @@ fn user_state_lock_prevents_overlapping_updates_and_releases() {
     assert!(second.try_lock_exclusive().is_err());
     drop(held);
     second.lock_exclusive().unwrap();
+}
+
+#[test]
+fn legacy_state_migrates_to_matching_active_components() {
+    let state =
+        parse_state_text("generation = 4\n[components]\nterminal = \"demo/terminal\"\n").unwrap();
+    assert_eq!(state.schema, 1);
+    assert_eq!(state.active_generation, 4);
+    assert_eq!(state.active_components, state.components);
 }
 
 #[test]
@@ -312,6 +324,89 @@ fn package_plan_uses_injected_backend_without_touching_the_system() {
     assert_eq!(plan.install, ["fuzzel"]);
     assert_eq!(plan.satisfied, ["waybar"]);
     assert!(install_plan(&backend, &["missing".into()].into_iter().collect()).is_err());
+}
+
+#[test]
+fn pending_requirements_keep_packages_referenced() {
+    let directory = tempdir().unwrap();
+    let record = UserRecord {
+        uid: 1000,
+        pending_generation: 2,
+        active_generation: 1,
+        state_path: directory.path().join("state.toml"),
+        components: Default::default(),
+        active_components: Default::default(),
+        active_requirements: Default::default(),
+        pending_requirements: [("new-package".into(), ["demo/new".into()].into_iter().collect())]
+            .into_iter()
+            .collect(),
+    };
+    assert!(aggregate_packages(&[record]).contains("new-package"));
+}
+
+#[test]
+fn staged_record_keeps_active_and_pending_requirements() {
+    let directory = tempdir().unwrap();
+    let profile = Profile {
+        id: "demo".into(),
+        name: "Demo".into(),
+        description: "test".into(),
+        root: directory.path().into(),
+        defaults: Default::default(),
+        components: [
+            (
+                "old".into(),
+                ComponentDef {
+                    role: "terminal".into(),
+                    path: directory.path().into(),
+                    packages: vec!["old-package".into()],
+                    optional_packages: vec![],
+                    exec: vec![],
+                    links: vec![],
+                    backend: None,
+                    settings: Default::default(),
+                },
+            ),
+            (
+                "new".into(),
+                ComponentDef {
+                    role: "terminal".into(),
+                    path: directory.path().into(),
+                    packages: vec!["new-package".into()],
+                    optional_packages: vec![],
+                    exec: vec![],
+                    links: vec![],
+                    backend: None,
+                    settings: Default::default(),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let profiles = [("demo".into(), profile)].into_iter().collect();
+    let state = UserState {
+        schema: 1,
+        generation: 2,
+        components: [("terminal".into(), "demo/new".into())]
+            .into_iter()
+            .collect(),
+        active_generation: 1,
+        active_components: [("terminal".into(), "demo/old".into())]
+            .into_iter()
+            .collect(),
+    };
+
+    let record = UserRecord::from_state(1000, directory.path(), &state, &profiles, false).unwrap();
+
+    assert!(record.active_requirements.contains_key("old-package"));
+    assert!(record.pending_requirements.contains_key("new-package"));
+    assert_eq!(
+        aggregate_packages(&[record]),
+        ["new-package".into(), "old-package".into()]
+            .into_iter()
+            .collect()
+    );
 }
 
 #[test]

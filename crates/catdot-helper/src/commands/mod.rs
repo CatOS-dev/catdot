@@ -42,6 +42,14 @@ enum Cmd {
         #[arg(long, conflicts_with = "with_optional")]
         without_optional: bool,
     },
+    Finalize {
+        #[arg(long)]
+        uid: u32,
+        #[arg(long)]
+        generation: u64,
+        #[arg(long)]
+        state_path: PathBuf,
+    },
     Prune {
         #[arg(long)]
         uid: u32,
@@ -102,6 +110,14 @@ pub fn run() -> Result<()> {
         } => {
             require_root()?;
             resolve::apply(uid, generation, &state_path, &digest, with_optional)
+        }
+        Cmd::Finalize {
+            uid,
+            generation,
+            state_path,
+        } => {
+            require_root()?;
+            resolve::finalize(uid, generation, &state_path)
         }
         Cmd::Prune {
             uid,

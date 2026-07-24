@@ -63,6 +63,32 @@ pub(super) fn apply(
     Ok(())
 }
 
+pub(super) fn finalize(uid: u32, generation: u64, state_path: &Path) -> Result<()> {
+    caller_uid(uid)?;
+    let _lock = lock(&Path::new(DB).join("lock"))?;
+    let state = read_trusted_user_state(uid, state_path)?;
+    if state.active_generation != generation || state.active_generation != state.generation {
+        bail!("active state is not ready to finalize")
+    }
+    let database = Path::new(DB);
+    let mut records = load_records(database)?;
+    let record = records
+        .iter_mut()
+        .find(|record| record.uid == uid)
+        .ok_or_else(|| anyhow::anyhow!("pending user record is missing"))?;
+    if record.pending_generation != generation || record.state_path != state_path {
+        bail!("pending record generation does not match active state")
+    }
+    record.active_generation = generation;
+    record.active_components = state.active_components;
+    record.active_requirements = std::mem::take(&mut record.pending_requirements);
+    atomic_write(
+        &user_record_path(database, uid),
+        &toml::to_string_pretty(record)?,
+    )?;
+    Ok(())
+}
+
 fn prepare(uid: u32, generation: u64, state_path: &Path, optional: bool) -> Result<ResolveContext> {
     let profiles = discover_profile_registry(Path::new(DEFAULT_PROFILE_ROOT))?.valid_profiles;
     let state = read_trusted_user_state(uid, state_path)?;
@@ -70,7 +96,7 @@ fn prepare(uid: u32, generation: u64, state_path: &Path, optional: bool) -> Resu
     if state.generation != generation {
         bail!("state changed; run catdot resolve again")
     }
-    let record = UserRecord::from_state(uid, &state, &profiles, optional)?;
+    let record = UserRecord::from_state(uid, state_path, &state, &profiles, optional)?;
     let database = Path::new(DB);
     let mut records = valid_records(load_records(database)?, |record_uid| {
         user_home(record_uid).is_ok()
@@ -94,14 +120,15 @@ fn prepare(uid: u32, generation: u64, state_path: &Path, optional: bool) -> Resu
 
 fn normalize_requirement_providers(records: &mut [UserRecord], handle: &alpm::Alpm) -> Result<()> {
     for record in records {
-        let requirements = std::mem::take(&mut record.requirements);
-        for (dependency, components) in requirements {
-            let package = satisfier_name(handle, &dependency)?;
-            record
-                .requirements
-                .entry(package)
-                .or_default()
-                .extend(components);
+        for requirements in [
+            &mut record.active_requirements,
+            &mut record.pending_requirements,
+        ] {
+            let pending = std::mem::take(requirements);
+            for (dependency, components) in pending {
+                let package = satisfier_name(handle, &dependency)?;
+                requirements.entry(package).or_default().extend(components);
+            }
         }
     }
     Ok(())

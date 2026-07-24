@@ -43,7 +43,7 @@ where
 mod tests {
     use super::valid_records;
     use catdot_core::UserRecord;
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, path::PathBuf};
 
     #[test]
     fn invalid_uid_records_are_not_aggregated() {
@@ -51,9 +51,13 @@ mod tests {
             .into_iter()
             .map(|uid| UserRecord {
                 uid,
-                generation: 1,
+                pending_generation: 1,
+                active_generation: 1,
+                state_path: PathBuf::from("/home/test/.local/state/catdot/state.toml"),
                 components: BTreeMap::new(),
-                requirements: BTreeMap::new(),
+                active_components: BTreeMap::new(),
+                active_requirements: BTreeMap::new(),
+                pending_requirements: BTreeMap::new(),
             })
             .collect();
         let active = valid_records(records, |uid| uid == 1000);

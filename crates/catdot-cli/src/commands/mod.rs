@@ -8,8 +8,7 @@ use crate::services::print_system_record_diagnostics;
 mod runtime;
 
 use runtime::{
-    apply, component_for, deactivate, exec_role, package_present, profiles, state_file,
-    unresolved_packages,
+    apply, component_for, exec_role, package_present, profiles, state_file, unresolved_packages,
 };
 
 #[derive(Parser)]
@@ -238,7 +237,11 @@ pub fn run() -> Result<()> {
     let is_doctor = matches!(&cli.command, Cmd::Doctor);
     let mutates_state = matches!(
         &cli.command,
-        Cmd::Select { .. } | Cmd::Disable { .. } | Cmd::Apply | Cmd::Adopt { .. }
+        Cmd::Select { .. }
+            | Cmd::Disable { .. }
+            | Cmd::Apply
+            | Cmd::Adopt { .. }
+            | Cmd::Resolve { .. }
     );
     let _state_lock = if mutates_state {
         Some(lock(&state_lock_path(&path)?)?)
@@ -298,38 +301,43 @@ pub fn run() -> Result<()> {
         Cmd::Current => {
             println!("generation = {}", state.generation);
             for (r, c) in state.components {
-                println!("{r} = {c}")
+                println!("desired {r} = {c}")
+            }
+            for (r, c) in state.active_components {
+                println!("active {r} = {c}")
             }
         }
         Cmd::Select { first, reference } => {
-            let selected;
             if let Some(reference) = reference {
                 select_component(&mut state, ps, &first, &reference)?;
-                selected = format!("Selected {first}: {reference}");
             } else {
                 let p = ps.get(&first).context("unknown profile")?;
-                state = select_profile(p)?;
-                state.generation = state.generation.max(read_state(&path)?.generation + 1);
-                selected = format!("Selected profile {first}");
+                let desired = select_profile(p)?;
+                state.components = desired.components;
+                state.generation += 1;
             }
-            apply(ps, &state, None)?;
             write_state(&path, &state)?;
-            println!("{selected}");
+            for (role, reference) in &state.components {
+                println!("Selected desired {role}: {reference}");
+                match state.active_components.get(role) {
+                    Some(active) => println!("Active {role} remains: {active}"),
+                    None => println!("Active {role} remains: none"),
+                }
+            }
             print_missing_packages(ps, &state)?;
+            println!("Run: catdot resolve");
         }
         Cmd::Disable { role } => {
-            if state.components.contains_key(&role)
-                && let Err(error) = deactivate(ps, &state, &role)
-            {
-                eprintln!("warning: could not remove managed links for disabled {role}: {error}");
-            }
             state.components.remove(&role);
             state.generation += 1;
             write_state(&path, &state)?;
+            println!("Disabled desired {role}; run: catdot resolve");
         }
         Cmd::Apply => {
-            apply(ps, &state, None)?;
-            print_missing_packages(ps, &state)?;
+            let mut active = state.clone();
+            active.components = active.active_components.clone();
+            apply(ps, &active, None)?;
+            println!("Reapplied active configuration");
         }
         Cmd::Adopt { role } => apply(ps, &state, Some(&role))?,
         Cmd::Exec { role, arguments } => return exec_role(ps, &state, &role, &arguments),
@@ -337,7 +345,34 @@ pub fn run() -> Result<()> {
             dry_run,
             yes,
             with_optional,
-        } => helper("resolve", &state, &path, with_optional, dry_run, yes)?,
+        } => {
+            helper("resolve", &state, &path, with_optional, dry_run, yes)?;
+            if !dry_run {
+                apply(ps, &state, None)?;
+                state.active_components = state.components.clone();
+                state.active_generation = state.generation;
+                write_state(&path, &state)?;
+                let uid = unsafe { libc::geteuid() }.to_string();
+                let generation = state.generation.to_string();
+                let state_path = path.to_str().context("state path is not valid UTF-8")?;
+                let status = Command::new("pkexec")
+                    .arg("/usr/lib/catdot/catdot-helper")
+                    .args([
+                        "finalize",
+                        "--uid",
+                        &uid,
+                        "--generation",
+                        &generation,
+                        "--state-path",
+                        state_path,
+                    ])
+                    .status()
+                    .context("finalize Catdot activation")?;
+                if !status.success() {
+                    bail!("helper finalize failed; active and pending requirements were retained")
+                }
+            }
+        }
         Cmd::Prune { dry_run, yes } => helper("prune", &state, &path, false, dry_run, yes)?,
         Cmd::Doctor => {
             for diagnostic in &registry.diagnostics {

@@ -56,7 +56,8 @@ pub fn read_trusted_user_state(uid: u32, path: &Path) -> Result<catdot_core::Use
     let mut text = String::new();
     file.read_to_string(&mut text)
         .with_context(|| format!("read state file {}", path.display()))?;
-    toml::from_str(&text).with_context(|| format!("parse state file {}", path.display()))
+    catdot_core::parse_state_text(&text)
+        .with_context(|| format!("parse state file {}", path.display()))
 }
 
 #[cfg(test)]

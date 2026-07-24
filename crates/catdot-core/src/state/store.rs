@@ -1,5 +1,5 @@
 use crate::{Error, Result, error::io, manifest::Profile};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error as _};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
@@ -8,12 +8,38 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize)]
 pub struct UserState {
+    pub schema: u32,
     pub generation: u64,
-    #[serde(default)]
     pub components: BTreeMap<String, String>,
+    pub active_generation: u64,
+    pub active_components: BTreeMap<String, String>,
+}
+impl Default for UserState {
+    fn default() -> Self {
+        Self {
+            schema: 1,
+            generation: 0,
+            components: BTreeMap::new(),
+            active_generation: 0,
+            active_components: BTreeMap::new(),
+        }
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawUserState {
+    #[serde(default)]
+    schema: Option<u32>,
+    #[serde(default)]
+    generation: u64,
+    #[serde(default)]
+    components: BTreeMap<String, String>,
+    #[serde(default)]
+    active_generation: u64,
+    #[serde(default)]
+    active_components: BTreeMap<String, String>,
 }
 pub fn state_path(home: &Path) -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
@@ -44,10 +70,32 @@ pub fn read_state(path: &Path) -> Result<UserState> {
     if !path.exists() {
         return Ok(UserState::default());
     };
-    toml::from_str(&io(path, fs::read_to_string(path))?).map_err(|source| Error::Toml {
+    parse_state_text(&io(path, fs::read_to_string(path))?).map_err(|source| Error::Toml {
         path: path.display().to_string(),
         source,
     })
+}
+pub fn parse_state_text(text: &str) -> std::result::Result<UserState, toml::de::Error> {
+    let raw: RawUserState = toml::from_str(text)?;
+    match raw.schema {
+        None => Ok(UserState {
+            schema: 1,
+            generation: raw.generation,
+            components: raw.components.clone(),
+            active_generation: raw.generation,
+            active_components: raw.components,
+        }),
+        Some(1) => Ok(UserState {
+            schema: 1,
+            generation: raw.generation,
+            components: raw.components,
+            active_generation: raw.active_generation,
+            active_components: raw.active_components,
+        }),
+        Some(schema) => Err(toml::de::Error::custom(format!(
+            "unsupported state schema {schema}"
+        ))),
+    }
 }
 pub fn atomic_write(path: &Path, contents: &str) -> Result<()> {
     let parent = path
@@ -104,7 +152,18 @@ pub fn write_state(path: &Path, state: &UserState) -> Result<()> {
     )
 }
 pub fn validate_user_state(state: &UserState, profiles: &BTreeMap<String, Profile>) -> Result<()> {
-    for (role, reference) in &state.components {
+    if state.schema != 1 || state.active_generation > state.generation {
+        return Err(Error::Message("invalid state generation".into()));
+    }
+    validate_components(&state.components, profiles)?;
+    validate_components(&state.active_components, profiles)
+}
+
+fn validate_components(
+    components: &BTreeMap<String, String>,
+    profiles: &BTreeMap<String, Profile>,
+) -> Result<()> {
+    for (role, reference) in components {
         if !valid_state_id(role) {
             return Err(Error::Message(format!("invalid saved role {role}")));
         }
@@ -184,8 +243,11 @@ pub fn select_profile(profile: &Profile) -> Result<UserState> {
         .map(|(role, id)| (role.clone(), format!("{}/{}", profile.id, id)))
         .collect();
     Ok(UserState {
+        schema: 1,
         generation: 1,
         components,
+        active_generation: 0,
+        active_components: BTreeMap::new(),
     })
 }
 pub fn select_component(
