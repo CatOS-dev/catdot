@@ -132,9 +132,7 @@ fn prepare(uid: u32, generation: u64, state_path: &Path, optional: bool) -> Resu
         bail!("state changed; run catdot resolve again")
     }
     let record = UserRecord::from_state(uid, state_path, &state, &profiles, optional)?;
-    let mut records = valid_records(existing_records, |record_uid| {
-        user_home(record_uid).is_ok()
-    });
+    let mut records = valid_records(existing_records, |record_uid| user_home(record_uid).is_ok());
     replace_record(&mut records, record.clone());
     let mut handle = open_handle()?;
     normalize_requirement_providers(&mut records, &handle)?;

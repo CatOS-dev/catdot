@@ -667,18 +667,27 @@ fn confined_link_targets_reject_symlink_escapes_but_allow_nested_directories() {
 
     let registry = directory.path().join("managed-links.toml");
     let mut escaped = LinkTransaction::new(&registry).unwrap();
-    escaped.confine_targets_to(std::slice::from_ref(&root)).unwrap();
-    assert!(escaped
-        .stage(&source, &root.join("escaped/config"), false)
-        .is_err());
+    escaped
+        .confine_targets_to(std::slice::from_ref(&root))
+        .unwrap();
+    assert!(
+        escaped
+            .stage(&source, &root.join("escaped/config"), false)
+            .is_err()
+    );
 
     let mut nested = LinkTransaction::new(&registry).unwrap();
-    nested.confine_targets_to(std::slice::from_ref(&root)).unwrap();
+    nested
+        .confine_targets_to(std::slice::from_ref(&root))
+        .unwrap();
     nested
         .stage(&source, &root.join("normal/nested/config"), false)
         .unwrap();
     nested.commit().unwrap();
-    assert_eq!(fs::read_link(root.join("normal/nested/config")).unwrap(), source);
+    assert_eq!(
+        fs::read_link(root.join("normal/nested/config")).unwrap(),
+        source
+    );
 }
 
 #[test]

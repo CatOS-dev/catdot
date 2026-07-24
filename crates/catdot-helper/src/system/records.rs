@@ -25,7 +25,10 @@ fn load_records_for_owner(database: &Path, owner: u32) -> Result<Vec<UserRecord>
         || directory_metadata.uid() != owner
         || directory_metadata.mode() & 0o002 != 0
     {
-        bail!("unsafe Catdot user record directory {}", directory.display())
+        bail!(
+            "unsafe Catdot user record directory {}",
+            directory.display()
+        )
     }
     let mut records = Vec::new();
     for entry in fs::read_dir(&directory).context("read Catdot user records")? {
@@ -52,10 +55,13 @@ fn load_records_for_owner(database: &Path, owner: u32) -> Result<Vec<UserRecord>
         let mut text = String::new();
         file.read_to_string(&mut text)
             .with_context(|| format!("read {}", path.display()))?;
-        let record: UserRecord = toml::from_str(&text)
-            .with_context(|| format!("parse {}", path.display()))?;
+        let record: UserRecord =
+            toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
         if record.uid != file_name_uid {
-            bail!("user record UID does not match its filename: {}", path.display())
+            bail!(
+                "user record UID does not match its filename: {}",
+                path.display()
+            )
         }
         records.push(record);
     }

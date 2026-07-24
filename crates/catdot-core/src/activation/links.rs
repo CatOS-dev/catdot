@@ -4,7 +4,10 @@ use std::{
     collections::BTreeMap,
     ffi::CString,
     fs,
-    os::{fd::{AsRawFd, FromRawFd, OwnedFd}, unix::ffi::OsStrExt},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::ffi::OsStrExt,
+    },
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -128,8 +131,14 @@ impl LinkTransaction {
     }
 
     pub fn confine_targets_to(&mut self, roots: &[PathBuf]) -> Result<()> {
-        if roots.is_empty() || roots.iter().any(|root| !root.is_absolute() || !root.is_dir()) {
-            return Err(Error::Message("trusted link roots must be existing absolute directories".into()));
+        if roots.is_empty()
+            || roots
+                .iter()
+                .any(|root| !root.is_absolute() || !root.is_dir())
+        {
+            return Err(Error::Message(
+                "trusted link roots must be existing absolute directories".into(),
+            ));
         }
         self.trusted_roots = roots.to_vec();
         Ok(())
@@ -353,13 +362,24 @@ fn validate_confined_parent(target: &Path, roots: &[PathBuf]) -> Result<()> {
         .iter()
         .filter(|root| target.starts_with(root))
         .max_by_key(|root| root.components().count())
-        .ok_or_else(|| Error::Message(format!("link target escapes trusted roots: {}", target.display())))?;
-    let relative = target.strip_prefix(root).map_err(|_| Error::Message("invalid link target".into()))?;
-    let parent = relative.parent().ok_or_else(|| Error::Message("link target has no parent".into()))?;
+        .ok_or_else(|| {
+            Error::Message(format!(
+                "link target escapes trusted roots: {}",
+                target.display()
+            ))
+        })?;
+    let relative = target
+        .strip_prefix(root)
+        .map_err(|_| Error::Message("invalid link target".into()))?;
+    let parent = relative
+        .parent()
+        .ok_or_else(|| Error::Message("link target has no parent".into()))?;
     let mut directory = open_root(root)?;
     for component in parent.components() {
         let std::path::Component::Normal(name) = component else {
-            return Err(Error::Message("link target contains an unsafe path component".into()));
+            return Err(Error::Message(
+                "link target contains an unsafe path component".into(),
+            ));
         };
         directory = open_or_create_directory(directory, name)?;
     }
@@ -369,7 +389,12 @@ fn validate_confined_parent(target: &Path, roots: &[PathBuf]) -> Result<()> {
 fn open_root(path: &Path) -> Result<OwnedFd> {
     let path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| Error::Message("trusted root contains NUL".into()))?;
-    let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
     if fd < 0 {
         return Err(Error::Io {
             path: path.to_string_lossy().into_owned(),
