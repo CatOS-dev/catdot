@@ -30,28 +30,48 @@ pub fn activate_managed_link(
     adopt: bool,
 ) -> Result<()> {
     let mut transaction = LinkTransaction::new(registry_path)?;
-    if let Err(error) = transaction.stage(source, target, adopt) {
-        let _ = transaction.rollback();
-        return Err(error);
+    transaction.stage(source, target, adopt)?;
+    transaction.commit()
+}
+
+pub fn reconcile_managed_links(
+    registry_path: &Path,
+    desired: &[(PathBuf, PathBuf)],
+    adopted_targets: &[PathBuf],
+) -> Result<()> {
+    let mut transaction = LinkTransaction::new(registry_path)?;
+    transaction.reconcile();
+    for (target, source) in desired {
+        transaction.stage(source, target, adopted_targets.contains(target))?;
     }
-    if let Err(error) = transaction.commit() {
-        let _ = transaction.rollback();
-        return Err(error);
-    }
-    Ok(())
+    transaction.commit()
 }
 
 pub struct LinkTransaction {
     registry_path: PathBuf,
     registry: LinkRegistry,
+    desired: BTreeMap<String, DesiredLink>,
     changes: Vec<LinkChange>,
+    reconcile: bool,
+}
+
+struct DesiredLink {
+    target: PathBuf,
+    source: PathBuf,
+    adopt: bool,
+}
+
+enum LinkAction {
+    Create(DesiredLink),
+    Replace(DesiredLink),
+    Remove { target: PathBuf },
+    Keep,
 }
 
 struct LinkChange {
     target: PathBuf,
-    source: PathBuf,
+    source: Option<PathBuf>,
     backup: Option<PathBuf>,
-    keep_backup: bool,
 }
 
 impl LinkTransaction {
@@ -59,7 +79,9 @@ impl LinkTransaction {
         Ok(Self {
             registry_path: registry_path.to_owned(),
             registry: read_link_registry(registry_path)?,
+            desired: BTreeMap::new(),
             changes: vec![],
+            reconcile: false,
         })
     }
 
@@ -76,88 +98,82 @@ impl LinkTransaction {
                 target.display()
             )));
         }
-        if self.changes.iter().any(|change| change.target == target) {
+        let key = target.display().to_string();
+        if self.desired.contains_key(&key) {
             return Err(Error::Message(format!(
                 "duplicate Catdot link target: {}",
                 target.display()
             )));
         }
-        let source = io(source, source.canonicalize())?;
-        let key = target.display().to_string();
-        let source_text = source.display().to_string();
-        let owned = self
-            .registry
-            .entries
-            .get(&key)
-            .is_some_and(|saved| saved == &source_text);
-        let mut backup = None;
-        let mut keep_backup = false;
-
-        if let Some(parent) = target.parent() {
-            io(parent, fs::create_dir_all(parent))?;
-        }
-
-        if let Ok(metadata) = fs::symlink_metadata(target) {
-            let matches_saved = metadata.file_type().is_symlink()
-                && fs::read_link(target).ok().as_deref() == Some(source.as_path());
-            if !(adopt || owned && matches_saved) {
-                return Err(Error::Message(format!(
-                    "refusing to replace unmanaged {}: use catdot adopt <role>",
-                    target.display()
-                )));
-            }
-            let path = backup_path(target)?;
-            io(target, fs::rename(target, &path))?;
-            backup = Some(path);
-            keep_backup = adopt;
-        }
-        if let Err(source_error) = std::os::unix::fs::symlink(&source, target) {
-            if let Some(backup) = &backup {
-                let _ = fs::rename(backup, target);
-            }
-            return Err(Error::Io {
-                path: target.display().to_string(),
-                source: source_error,
-            });
-        }
-        self.registry.entries.insert(key, source_text);
-        self.changes.push(LinkChange {
-            target: target.to_owned(),
-            source,
-            backup,
-            keep_backup,
-        });
+        self.desired.insert(
+            key,
+            DesiredLink {
+                target: target.to_owned(),
+                source: io(source, source.canonicalize())?,
+                adopt,
+            },
+        );
         Ok(())
     }
 
+    pub fn reconcile(&mut self) {
+        self.reconcile = true;
+    }
+
     pub fn commit(&mut self) -> Result<()> {
-        atomic_write(
-            &self.registry_path,
-            &toml::to_string_pretty(&self.registry)
-                .map_err(|error| Error::Message(error.to_string()))?,
-        )?;
-        for change in &self.changes {
-            if !change.keep_backup
-                && let Some(backup) = &change.backup
-            {
-                let _ = fs::remove_file(backup);
+        let actions = self.plan()?;
+        let mut new_registry = self.registry.clone();
+        if self.reconcile {
+            new_registry.entries.clear();
+        }
+        new_registry.entries.extend(
+            self.desired
+                .iter()
+                .map(|(target, desired)| (target.clone(), desired.source.display().to_string())),
+        );
+        for action in actions {
+            if let Err(error) = self.apply(action) {
+                let _ = self.rollback();
+                return Err(error);
             }
         }
+        if let Err(error) = atomic_write(
+            &self.registry_path,
+            &toml::to_string_pretty(&new_registry)
+                .map_err(|error| Error::Message(error.to_string()))?,
+        ) {
+            let _ = self.rollback();
+            return Err(error);
+        }
+        self.registry = new_registry;
+        for change in &self.changes {
+            if let Some(backup) = &change.backup {
+                io(backup, fs::remove_file(backup))?;
+            }
+        }
+        self.changes.clear();
         Ok(())
     }
 
     pub fn rollback(&mut self) -> Result<()> {
         for change in self.changes.iter().rev() {
-            let metadata = io(&change.target, fs::symlink_metadata(&change.target))?;
-            if !metadata.file_type().is_symlink()
-                || fs::read_link(&change.target).ok().as_deref() != Some(change.source.as_path())
-            {
+            if let Some(source) = &change.source {
+                let metadata = io(&change.target, fs::symlink_metadata(&change.target))?;
+                if !metadata.file_type().is_symlink()
+                    || fs::read_link(&change.target).ok().as_deref() != Some(source.as_path())
+                {
+                    return Err(Error::Message(format!(
+                        "cannot roll back changed link {}",
+                        change.target.display()
+                    )));
+                }
+                io(&change.target, fs::remove_file(&change.target))?;
+            } else if change.target.exists() {
                 return Err(Error::Message(format!(
                     "cannot roll back changed link {}",
                     change.target.display()
                 )));
             }
-            io(&change.target, fs::remove_file(&change.target))?;
             if let Some(backup) = &change.backup {
                 io(&change.target, fs::rename(backup, &change.target))?;
             }
@@ -165,37 +181,127 @@ impl LinkTransaction {
         self.changes.clear();
         Ok(())
     }
+
+    fn plan(&self) -> Result<Vec<LinkAction>> {
+        let mut actions = Vec::new();
+        for (key, desired) in &self.desired {
+            match self.registry.entries.get(key) {
+                Some(saved) if link_matches(&desired.target, saved) => {
+                    if saved == &desired.source.display().to_string() {
+                        actions.push(LinkAction::Keep);
+                    } else {
+                        actions.push(LinkAction::Replace(DesiredLink {
+                            target: desired.target.clone(),
+                            source: desired.source.clone(),
+                            adopt: desired.adopt,
+                        }));
+                    }
+                }
+                Some(_) => return changed_link_error(&desired.target),
+                None if fs::symlink_metadata(&desired.target).is_ok() && !desired.adopt => {
+                    return Err(Error::Message(format!(
+                        "refusing to replace unmanaged {}: use catdot adopt <role>",
+                        desired.target.display()
+                    )));
+                }
+                None if fs::symlink_metadata(&desired.target).is_ok() => {
+                    actions.push(LinkAction::Replace(DesiredLink {
+                        target: desired.target.clone(),
+                        source: desired.source.clone(),
+                        adopt: true,
+                    }));
+                }
+                None => actions.push(LinkAction::Create(DesiredLink {
+                    target: desired.target.clone(),
+                    source: desired.source.clone(),
+                    adopt: desired.adopt,
+                })),
+            }
+        }
+        for (target, saved) in &self.registry.entries {
+            if self.reconcile && !self.desired.contains_key(target) {
+                let target = PathBuf::from(target);
+                if !link_matches(&target, saved) {
+                    return changed_link_error(&target);
+                }
+                actions.push(LinkAction::Remove { target });
+            }
+        }
+        Ok(actions)
+    }
+
+    fn apply(&mut self, action: LinkAction) -> Result<()> {
+        match action {
+            LinkAction::Keep => Ok(()),
+            LinkAction::Create(desired) => self.create(desired, None),
+            LinkAction::Replace(desired) => {
+                let backup = backup_path(&desired.target)?;
+                io(&desired.target, fs::rename(&desired.target, &backup))?;
+                self.create(desired, Some(backup))
+            }
+            LinkAction::Remove { target } => {
+                let backup = backup_path(&target)?;
+                io(&target, fs::rename(&target, &backup))?;
+                self.changes.push(LinkChange {
+                    target,
+                    source: None,
+                    backup: Some(backup),
+                });
+                Ok(())
+            }
+        }
+    }
+
+    fn create(&mut self, desired: DesiredLink, backup: Option<PathBuf>) -> Result<()> {
+        if let Some(parent) = desired.target.parent() {
+            io(parent, fs::create_dir_all(parent))?;
+        }
+        if let Err(source_error) = std::os::unix::fs::symlink(&desired.source, &desired.target) {
+            if let Some(backup) = &backup {
+                let _ = fs::rename(backup, &desired.target);
+            }
+            return Err(Error::Io {
+                path: desired.target.display().to_string(),
+                source: source_error,
+            });
+        }
+        self.changes.push(LinkChange {
+            target: desired.target,
+            source: Some(desired.source),
+            backup,
+        });
+        Ok(())
+    }
+}
+
+fn link_matches(target: &Path, expected: &str) -> bool {
+    fs::symlink_metadata(target).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        && fs::read_link(target)
+            .ok()
+            .is_some_and(|actual| actual == Path::new(expected))
+}
+
+fn changed_link_error(target: &Path) -> Result<Vec<LinkAction>> {
+    Err(Error::Message(format!(
+        "refusing to replace changed managed link {}",
+        target.display()
+    )))
 }
 
 pub fn deactivate_managed_link(registry_path: &Path, source: &Path, target: &Path) -> Result<()> {
     let source = io(source, source.canonicalize())?;
     let key = target.display().to_string();
-    let mut registry = read_link_registry(registry_path)?;
-    let source_text = source.display().to_string();
-    if registry.entries.get(&key) != Some(&source_text) {
+    let registry = read_link_registry(registry_path)?;
+    if registry.entries.get(&key) != Some(&source.display().to_string()) {
         return Err(Error::Message(format!(
             "refusing to remove unregistered {}",
             target.display()
         )));
     }
-    let metadata = io(target, fs::symlink_metadata(target))?;
-    if !metadata.file_type().is_symlink()
-        || fs::read_link(target).ok().as_deref() != Some(source.as_path())
-    {
-        return Err(Error::Message(format!(
-            "refusing to remove changed managed link {}",
-            target.display()
-        )));
-    }
-    io(target, fs::remove_file(target))?;
-    registry.entries.remove(&key);
-    atomic_write(
-        registry_path,
-        &toml::to_string_pretty(&registry).map_err(|error| Error::Message(error.to_string()))?,
-    )
+    reconcile_managed_links(registry_path, &[], &[])
 }
 
-fn backup_path(target: &Path) -> Result<std::path::PathBuf> {
+fn backup_path(target: &Path) -> Result<PathBuf> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| Error::Message(error.to_string()))?

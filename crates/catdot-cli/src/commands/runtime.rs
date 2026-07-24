@@ -103,32 +103,36 @@ pub(super) fn apply(
     let registry = managed_links_path(&state_file()?)?;
     let xdg = xdg_config_home(&home);
     let mut links = LinkTransaction::new(&registry)?;
-    for (role, reference) in &state.components {
-        if adopt.is_some_and(|selected_role| selected_role != role) {
-            continue;
-        }
+    let desired = if let Some(role) = adopt {
         let (profile, component, _) = component_for(profiles, state, role)?;
+        component
+            .links
+            .iter()
+            .map(|link| {
+                Ok((
+                    link_target(link, &home, &xdg)?,
+                    profile.root.join(&component.path).join(&link.source),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        links.reconcile();
+        desired_links(profiles, state, &home, &xdg, None)?
+    };
+    for (target, source) in desired {
+        let should_adopt = adopt.is_some();
+        if let Err(error) = links.stage(&source, &target, should_adopt) {
+            return Err(error.into());
+        }
+    }
+    for role in state.components.keys() {
+        let (_profile, component, _) = component_for(profiles, state, role)?;
         if component
             .packages
             .iter()
             .any(|package| !package_present(package))
         {
             continue;
-        }
-        for link in &component.links {
-            let source = profile.root.join(&component.path).join(&link.source);
-            if !source.is_file() {
-                let _ = links.rollback();
-                bail!(
-                    "{reference}: link source {} does not exist",
-                    source.display()
-                )
-            }
-            let target = link_target(link, &home, &xdg)?;
-            if let Err(error) = links.stage(&source, &target, adopt == Some(role)) {
-                let _ = links.rollback();
-                return Err(error.into());
-            }
         }
         if component.backend.is_some() {
             let desktop = env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
@@ -152,17 +156,49 @@ pub(super) fn deactivate(
     state: &UserState,
     role: &str,
 ) -> Result<()> {
+    let registry = managed_links_path(&state_file()?)?;
     let home = home()?;
     let xdg = xdg_config_home(&home);
-    let registry = managed_links_path(&state_file()?)?;
-    let (profile, component, reference) = component_for(profiles, state, role)?;
-    for link in &component.links {
-        let source = profile.root.join(&component.path).join(&link.source);
-        let target = link_target(link, &home, &xdg)?;
-        deactivate_managed_link(&registry, &source, &target)
-            .with_context(|| format!("deactivate {reference} link {}", target.display()))?;
+    reconcile_managed_links(
+        &registry,
+        &desired_links(profiles, state, &home, &xdg, Some(role))?,
+        &[],
+    )
+    .map_err(Into::into)
+}
+
+fn desired_links(
+    profiles: &std::collections::BTreeMap<String, Profile>,
+    state: &UserState,
+    home: &std::path::Path,
+    xdg: &std::path::Path,
+    excluded_role: Option<&str>,
+) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut desired = Vec::new();
+    for (role, reference) in &state.components {
+        if excluded_role == Some(role.as_str()) {
+            continue;
+        }
+        let (profile, component, _) = component_for(profiles, state, role)?;
+        if component
+            .packages
+            .iter()
+            .any(|package| !package_present(package))
+        {
+            continue;
+        }
+        for link in &component.links {
+            let source = profile.root.join(&component.path).join(&link.source);
+            if !source.is_file() {
+                bail!(
+                    "{reference}: link source {} does not exist",
+                    source.display()
+                );
+            }
+            desired.push((link_target(link, home, xdg)?, source));
+        }
     }
-    Ok(())
+    Ok(desired)
 }
 
 pub(super) fn exec_role(

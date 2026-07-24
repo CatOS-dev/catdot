@@ -9,7 +9,7 @@ pub mod theme;
 
 pub use activation::{
     LinkRegistry, LinkTransaction, activate_managed_link, deactivate_managed_link, lock,
-    read_link_registry,
+    read_link_registry, reconcile_managed_links,
 };
 pub use error::{Error, Result};
 pub use manifest::{

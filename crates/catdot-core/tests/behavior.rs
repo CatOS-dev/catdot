@@ -1,5 +1,5 @@
 use catdot_core::*;
-use std::fs;
+use std::{fs, os::unix::fs::MetadataExt};
 use tempfile::tempdir;
 
 struct FakeBackend(std::collections::BTreeMap<String, PackageAvailability>);
@@ -292,12 +292,98 @@ fn link_transaction_rolls_back_earlier_links_after_a_later_conflict() {
 
     let mut transaction = LinkTransaction::new(&registry).unwrap();
     transaction.stage(&source, &first, false).unwrap();
-    assert!(transaction.stage(&source, &blocked, false).is_err());
+    transaction.stage(&source, &blocked, false).unwrap();
+    assert!(transaction.commit().is_err());
     transaction.rollback().unwrap();
 
     assert!(!first.exists());
     assert_eq!(fs::read_to_string(&blocked).unwrap(), "user file");
     assert!(read_link_registry(&registry).unwrap().entries.is_empty());
+}
+
+#[test]
+fn reconciliation_replaces_a_managed_link_with_its_new_profile_source() {
+    let dir = tempdir().unwrap();
+    let registry = dir.path().join("managed-links.toml");
+    let source_a = dir.path().join("profile-a");
+    let source_b = dir.path().join("profile-b");
+    let target = dir.path().join("config");
+    fs::write(&source_a, "a").unwrap();
+    fs::write(&source_b, "b").unwrap();
+    activate_managed_link(&registry, &source_a, &target, false).unwrap();
+
+    reconcile_managed_links(&registry, &[(target.clone(), source_b.clone())], &[]).unwrap();
+
+    assert_eq!(fs::read_link(&target).unwrap(), source_b);
+    assert_eq!(
+        read_link_registry(&registry).unwrap().entries[&target.display().to_string()],
+        source_b.display().to_string()
+    );
+}
+
+#[test]
+fn reconciliation_removes_orphaned_registered_links_without_the_old_source_file() {
+    let dir = tempdir().unwrap();
+    let registry = dir.path().join("managed-links.toml");
+    let source = dir.path().join("removed-profile-source");
+    let target = dir.path().join("bar-config");
+    fs::write(&source, "bar").unwrap();
+    activate_managed_link(&registry, &source, &target, false).unwrap();
+    fs::remove_file(&source).unwrap();
+
+    reconcile_managed_links(&registry, &[], &[]).unwrap();
+
+    assert!(!target.exists());
+    assert!(read_link_registry(&registry).unwrap().entries.is_empty());
+}
+
+#[test]
+fn reconciliation_rejects_a_changed_managed_link_without_partial_changes() {
+    let dir = tempdir().unwrap();
+    let registry = dir.path().join("managed-links.toml");
+    let first_old = dir.path().join("first-old");
+    let first_new = dir.path().join("first-new");
+    let second_old = dir.path().join("second-old");
+    let second_new = dir.path().join("second-new");
+    let elsewhere = dir.path().join("elsewhere");
+    let first = dir.path().join("first");
+    let second = dir.path().join("second");
+    for source in [&first_old, &first_new, &second_old, &second_new, &elsewhere] {
+        fs::write(source, "config").unwrap();
+    }
+    activate_managed_link(&registry, &first_old, &first, false).unwrap();
+    activate_managed_link(&registry, &second_old, &second, false).unwrap();
+    fs::remove_file(&second).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &second).unwrap();
+
+    assert!(
+        reconcile_managed_links(
+            &registry,
+            &[
+                (first.clone(), first_new.clone()),
+                (second.clone(), second_new)
+            ],
+            &[],
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read_link(&first).unwrap(), first_old);
+    assert_eq!(fs::read_link(&second).unwrap(), elsewhere);
+}
+
+#[test]
+fn reconciliation_keeps_unchanged_links_in_place() {
+    let dir = tempdir().unwrap();
+    let registry = dir.path().join("managed-links.toml");
+    let source = dir.path().join("source");
+    let target = dir.path().join("target");
+    fs::write(&source, "config").unwrap();
+    activate_managed_link(&registry, &source, &target, false).unwrap();
+    let before = fs::symlink_metadata(&target).unwrap();
+
+    reconcile_managed_links(&registry, &[(target.clone(), source)], &[]).unwrap();
+
+    assert_eq!(fs::symlink_metadata(&target).unwrap().ino(), before.ino());
 }
 
 #[test]
