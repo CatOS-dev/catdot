@@ -230,7 +230,7 @@ fn prune_helper(dry_run: bool, yes: bool) -> Result<()> {
     }
     Ok(())
 }
-pub fn run() -> Result<()> {
+pub fn run() -> Result<i32> {
     let cli = Cli::parse();
     let registry = profiles()?;
     let ps = &registry.valid_profiles;
@@ -359,7 +359,10 @@ pub fn run() -> Result<()> {
             }
             journal.complete()?;
         }
-        Cmd::Exec { role, arguments } => return exec_role(ps, &state, &role, &arguments),
+        Cmd::Exec { role, arguments } => {
+            exec_role(ps, &state, &role, &arguments)?;
+            return Ok(0);
+        }
         Cmd::Resolve {
             dry_run,
             yes,
@@ -405,6 +408,8 @@ pub fn run() -> Result<()> {
         }
         Cmd::Prune { dry_run, yes } => helper("prune", &state, &path, false, dry_run, yes)?,
         Cmd::Doctor => {
+            let mut warnings = false;
+            let mut errors = false;
             let transactions = activation_transactions_path(&path)?;
             if transactions.exists()
                 && std::fs::read_dir(&transactions)?.any(|entry| {
@@ -417,17 +422,38 @@ pub fn run() -> Result<()> {
                 })
             {
                 println!("warning: unfinished activation transaction; run catdot resolve or apply");
+                warnings = true;
             }
             for diagnostic in &registry.diagnostics {
                 println!(
-                    "invalid profile: {} ({:?}): {}",
+                    "warning: invalid profile {} ({:?}): {}",
                     diagnostic.manifest_path.display(),
                     diagnostic.kind,
                     diagnostic.message
                 );
+                warnings = true;
             }
             if let Err(error) = validate_user_state(&state, ps) {
-                println!("broken state: {error}");
+                println!("error: broken state: {error}");
+                errors = true;
+            }
+            if state.generation != state.active_generation {
+                println!(
+                    "warning: pending activation (desired generation {}, active generation {})",
+                    state.generation, state.active_generation
+                );
+                warnings = true;
+            }
+            for (target, source) in read_link_registry(&managed_links_path(&path)?)?.entries {
+                let matches = std::fs::symlink_metadata(&target)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                    && std::fs::read_link(&target)
+                        .ok()
+                        .is_some_and(|actual| actual == std::path::Path::new(&source));
+                if !matches {
+                    println!("warning: changed or missing managed link: {target}");
+                    warnings = true;
+                }
             }
             for role in state.components.keys() {
                 match component_for(ps, &state, role) {
@@ -441,13 +467,24 @@ pub fn run() -> Result<()> {
                         if m.is_empty() {
                             println!("ok: {role} = {r}")
                         } else {
-                            println!("unresolved: {role} = {r}; missing {}", m.join(", "))
+                            println!("error: unresolved: {role} = {r}; missing {}", m.join(", "));
+                            errors = true;
                         }
                     }
-                    Err(e) => println!("broken: {role}: {e}"),
+                    Err(e) => {
+                        println!("error: broken: {role}: {e}");
+                        errors = true;
+                    }
                 }
             }
             print_system_record_diagnostics();
+            return Ok(if errors {
+                2
+            } else if warnings {
+                1
+            } else {
+                0
+            });
         }
         Cmd::Users { command } => match command {
             UsersCmd::List => {
@@ -482,5 +519,5 @@ pub fn run() -> Result<()> {
             }
         },
     }
-    Ok(())
+    Ok(0)
 }

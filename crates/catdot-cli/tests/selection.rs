@@ -53,8 +53,8 @@ fn select_persists_profile_defaults_and_cross_profile_override() {
         .env_remove("XDG_STATE_HOME")
         .output()
         .unwrap();
-    assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("broken: bar"));
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("error: broken: bar"));
 
     let output = Command::new(binary)
         .args(["disable", "bar"])
@@ -187,7 +187,7 @@ fn invalid_profile_does_not_block_list_doctor_or_an_unrelated_exec() {
         .env("HOME", home.path())
         .output()
         .unwrap();
-    assert!(doctor.status.success());
+    assert_eq!(doctor.status.code(), Some(1));
     let doctor = String::from_utf8(doctor.stdout).unwrap();
     assert!(doctor.contains("invalid/profile.toml") && doctor.contains("Toml"));
 
@@ -292,4 +292,35 @@ fn exec_uses_the_old_active_component_while_a_new_choice_is_pending() {
         .unwrap();
 
     assert!(status.success());
+}
+
+#[test]
+fn doctor_uses_zero_for_healthy_state_and_two_for_broken_state() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    write_profile(root.path(), "demo", "terminal", "terminal");
+    let binary = env!("CARGO_BIN_EXE_catdot");
+    let healthy = Command::new(binary)
+        .arg("doctor")
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert_eq!(healthy.status.code(), Some(0));
+
+    let state_dir = home.path().join(".local/state/catdot");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.toml"),
+        "schema = 1\ngeneration = 1\nactive_generation = 1\n[components]\nterminal = \"missing/terminal\"\n[active_components]\nterminal = \"missing/terminal\"\n",
+    )
+    .unwrap();
+    let broken = Command::new(binary)
+        .arg("doctor")
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert_eq!(broken.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&broken.stdout).contains("error: broken state"));
 }
