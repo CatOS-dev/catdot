@@ -158,6 +158,17 @@ impl LinkTransaction {
         toml::to_string_pretty(&registry).map_err(|error| Error::Message(error.to_string()))
     }
 
+    pub fn planned_removals(&self) -> Result<Vec<PathBuf>> {
+        Ok(self
+            .plan()?
+            .into_iter()
+            .filter_map(|action| match action {
+                LinkAction::Remove { target } => Some(target),
+                _ => None,
+            })
+            .collect())
+    }
+
     pub fn commit(&mut self) -> Result<()> {
         let actions = self.plan()?;
         let new_registry: LinkRegistry = toml::from_str(&self.expected_registry_contents()?)

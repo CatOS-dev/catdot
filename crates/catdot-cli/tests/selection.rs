@@ -118,6 +118,47 @@ fn adopt_touches_only_the_requested_role() {
 }
 
 #[test]
+fn adopt_uses_the_active_component_when_a_new_provider_is_pending() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let profile = root.path().join("demo");
+    fs::create_dir_all(profile.join("a")).unwrap();
+    fs::create_dir_all(profile.join("b")).unwrap();
+    fs::write(profile.join("a/config"), "a").unwrap();
+    fs::write(profile.join("b/config"), "b").unwrap();
+    fs::write(
+        profile.join("profile.toml"),
+        "schema = 1\n[profile]\nid = \"demo\"\nname = \"Demo\"\ndescription = \"test\"\n[defaults]\nrole = \"a\"\n[components.a]\nrole = \"role\"\npath = \"a\"\n[[components.a.links]]\nsource = \"config\"\ntarget = \"{xdg_config_home}/role/config\"\n[components.b]\nrole = \"role\"\npath = \"b\"\n[[components.b.links]]\nsource = \"config\"\ntarget = \"{xdg_config_home}/role/config\"\n",
+    )
+    .unwrap();
+    let state_dir = home.path().join(".local/state/catdot");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.toml"),
+        "schema = 1\ngeneration = 2\nactive_generation = 1\n[components]\nrole = \"demo/b\"\n[active_components]\nrole = \"demo/a\"\n",
+    )
+    .unwrap();
+    let target = home.path().join(".config/role/config");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "unmanaged").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .args(["adopt", "role"])
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(fs::read_link(&target).unwrap(), profile.join("a/config"));
+    let state = fs::read_to_string(state_dir.join("state.toml")).unwrap();
+    assert!(state.contains("role = \"demo/b\""));
+    assert!(state.contains("role = \"demo/a\""));
+}
+
+#[test]
 fn unresolved_component_cannot_be_executed() {
     let root = tempdir().unwrap();
     let home = tempdir().unwrap();

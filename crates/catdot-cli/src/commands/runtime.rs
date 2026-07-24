@@ -109,7 +109,12 @@ pub(super) fn apply(
     let mut links = LinkTransaction::new(&registry)?;
     links.confine_targets_to(&[home.clone(), xdg.clone()])?;
     let desired = if let Some(role) = adopt {
-        let (profile, component, _) = component_for(profiles, state, role)?;
+        if !state.active_components.contains_key(role) {
+            bail!("role has no active component; run catdot resolve first")
+        }
+        let mut active = state.clone();
+        active.components = active.active_components.clone();
+        let (profile, component, _) = component_for(profiles, &active, role)?;
         component
             .links
             .iter()
@@ -134,28 +139,33 @@ pub(super) fn apply(
         }
     }
     if let Some(journal) = &mut journal {
+        for target in links.planned_removals()? {
+            journal.track_removal(&target)?;
+        }
         journal.track_file(&registry, links.expected_registry_contents()?.as_bytes())?;
     }
-    for role in state.components.keys() {
-        let (_profile, component, _) = component_for(profiles, state, role)?;
-        if component
-            .packages
-            .iter()
-            .any(|package| !package_present(package))
-        {
-            continue;
-        }
-        if component.backend.is_some() {
-            let desktop = env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-            let plasma = desktop.contains("KDE") || desktop.contains("Plasma");
-            if let Some(journal) = &mut journal {
-                for (path, contents) in theme_expected_files(component, &xdg, plasma)? {
-                    journal.track_file(&path, &contents)?;
-                }
+    if adopt.is_none() {
+        for role in state.components.keys() {
+            let (_profile, component, _) = component_for(profiles, state, role)?;
+            if component
+                .packages
+                .iter()
+                .any(|package| !package_present(package))
+            {
+                continue;
             }
-            if let Err(error) = apply_theme(component, &xdg, plasma) {
-                let _ = links.rollback();
-                return Err(error.into());
+            if component.backend.is_some() {
+                let desktop = env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+                let plasma = desktop.contains("KDE") || desktop.contains("Plasma");
+                if let Some(journal) = &mut journal {
+                    for (path, contents) in theme_expected_files(component, &xdg, plasma)? {
+                        journal.track_file(&path, &contents)?;
+                    }
+                }
+                if let Err(error) = apply_theme(component, &xdg, plasma) {
+                    let _ = links.rollback();
+                    return Err(error.into());
+                }
             }
         }
     }

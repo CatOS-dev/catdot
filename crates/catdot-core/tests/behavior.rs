@@ -492,6 +492,92 @@ fn activation_journal_completes_after_state_write_crash() {
 }
 
 #[test]
+fn activation_journal_restores_reconciled_link_removals_and_registry() {
+    let directory = tempdir().unwrap();
+    let state_path = directory.path().join("state.toml");
+    let target = directory.path().join("config");
+    let old_source = directory.path().join("old-config");
+    let manual_source = directory.path().join("manual-config");
+    let registry = directory.path().join("managed-links.toml");
+    let old = UserState::default();
+    let new = UserState {
+        generation: 1,
+        active_generation: 1,
+        ..old.clone()
+    };
+    write_state(&state_path, &old).unwrap();
+    fs::write(&old_source, "old").unwrap();
+    fs::write(&manual_source, "manual").unwrap();
+    std::os::unix::fs::symlink(&old_source, &target).unwrap();
+    fs::write(&registry, "old registry").unwrap();
+
+    let mut journal = ActivationJournal::begin(&state_path, old.clone(), new.clone()).unwrap();
+    journal.track_removal(&target).unwrap();
+    journal.track_file(&registry, b"new registry").unwrap();
+    journal.mark_applying().unwrap();
+    fs::remove_file(&target).unwrap();
+    fs::write(&registry, "new registry").unwrap();
+
+    recover_activation_journals(&state_path).unwrap();
+    assert_eq!(fs::read_link(&target).unwrap(), old_source);
+    assert_eq!(fs::read_to_string(&registry).unwrap(), "old registry");
+    assert_eq!(read_state(&state_path).unwrap(), old);
+    assert_eq!(
+        fs::read_dir(activation_transactions_path(&state_path).unwrap())
+            .unwrap()
+            .count(),
+        0
+    );
+
+    let mut journal = ActivationJournal::begin(&state_path, UserState::default(), new).unwrap();
+    journal.track_removal(&target).unwrap();
+    journal.mark_applying().unwrap();
+    fs::remove_file(&target).unwrap();
+    std::os::unix::fs::symlink(&manual_source, &target).unwrap();
+
+    assert!(recover_activation_journals(&state_path).is_err());
+    assert_eq!(fs::read_link(&target).unwrap(), manual_source);
+}
+
+#[test]
+fn activation_journal_recovers_created_replaced_links_and_theme_files() {
+    let directory = tempdir().unwrap();
+    let state_path = directory.path().join("state.toml");
+    let created = directory.path().join("created-link");
+    let replaced = directory.path().join("replaced-link");
+    let old_source = directory.path().join("old-source");
+    let new_source = directory.path().join("new-source");
+    let theme_file = directory.path().join("config/gtk-3.0/settings.ini");
+    let old = UserState::default();
+    let new = UserState {
+        generation: 1,
+        active_generation: 1,
+        ..old.clone()
+    };
+    write_state(&state_path, &old).unwrap();
+    fs::write(&old_source, "old").unwrap();
+    fs::write(&new_source, "new").unwrap();
+    std::os::unix::fs::symlink(&old_source, &replaced).unwrap();
+
+    let mut journal = ActivationJournal::begin(&state_path, old.clone(), new).unwrap();
+    journal.track_symlink(&created, &new_source).unwrap();
+    journal.track_symlink(&replaced, &new_source).unwrap();
+    journal.track_file(&theme_file, b"new theme").unwrap();
+    journal.mark_applying().unwrap();
+    std::os::unix::fs::symlink(&new_source, &created).unwrap();
+    fs::remove_file(&replaced).unwrap();
+    std::os::unix::fs::symlink(&new_source, &replaced).unwrap();
+    fs::create_dir_all(theme_file.parent().unwrap()).unwrap();
+    fs::write(&theme_file, "new theme").unwrap();
+
+    recover_activation_journals(&state_path).unwrap();
+    assert!(fs::symlink_metadata(&created).is_err());
+    assert_eq!(fs::read_link(&replaced).unwrap(), old_source);
+    assert!(fs::symlink_metadata(&theme_file).is_err());
+    assert_eq!(read_state(&state_path).unwrap(), old);
+}
+
+#[test]
 fn activation_requires_a_registered_link_owner_and_ini_merge_preserves_keys() {
     let dir = tempdir().unwrap();
     let target = dir.path().join("config");
@@ -603,6 +689,21 @@ fn reconciliation_removes_orphaned_registered_links_without_the_old_source_file(
 
     assert!(!target.exists());
     assert!(read_link_registry(&registry).unwrap().entries.is_empty());
+}
+
+#[test]
+fn reconciliation_plan_includes_removed_managed_links() {
+    let dir = tempdir().unwrap();
+    let registry = dir.path().join("managed-links.toml");
+    let source = dir.path().join("source");
+    let target = dir.path().join("target");
+    fs::write(&source, "config").unwrap();
+    activate_managed_link(&registry, &source, &target, false).unwrap();
+
+    let mut transaction = LinkTransaction::new(&registry).unwrap();
+    transaction.reconcile();
+
+    assert_eq!(transaction.planned_removals().unwrap(), vec![target]);
 }
 
 #[test]
