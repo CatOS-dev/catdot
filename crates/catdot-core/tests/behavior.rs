@@ -337,9 +337,12 @@ fn pending_requirements_keep_packages_referenced() {
         components: Default::default(),
         active_components: Default::default(),
         active_requirements: Default::default(),
-        pending_requirements: [("new-package".into(), ["demo/new".into()].into_iter().collect())]
-            .into_iter()
-            .collect(),
+        pending_requirements: [(
+            "new-package".into(),
+            ["demo/new".into()].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect(),
     };
     assert!(aggregate_packages(&[record]).contains("new-package"));
 }
