@@ -159,6 +159,20 @@ fn helper(
     for x in &plan.satisfied {
         println!("  {x}")
     }
+    if !plan.replacements.is_empty() {
+        println!("Replace:");
+        for replacement in &plan.replacements {
+            println!(
+                "  {} -> {} ({})",
+                replacement.remove, replacement.install, replacement.reason
+            );
+        }
+    } else if !plan.remove.is_empty() {
+        println!("Remove for installation:");
+        for package in &plan.remove {
+            println!("  {package}");
+        }
+    }
     if dry_run {
         return Ok(());
     }

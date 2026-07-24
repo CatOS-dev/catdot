@@ -264,6 +264,7 @@ fn plan_digest_and_prune_rules_protect_packages() {
     let plan = PackagePlan {
         install: vec!["waybar".into()],
         remove: vec![],
+        replacements: vec![],
         satisfied: vec![],
     };
     assert_ne!(
@@ -271,6 +272,7 @@ fn plan_digest_and_prune_rules_protect_packages() {
         PackagePlan {
             install: vec!["mako".into()],
             remove: vec![],
+            replacements: vec![],
             satisfied: vec![]
         }
         .digest()

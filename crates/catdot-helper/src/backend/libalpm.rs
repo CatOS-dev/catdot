@@ -1,7 +1,16 @@
-use alpm::{Alpm, CommitError, PackageReason, PrepareError, SigLevel, TransFlag, Usage};
+use alpm::{
+    Alpm, AnyQuestion, CommitError, PackageFrom, PackageReason, PrepareError, Question, SigLevel,
+    TransFlag, Usage,
+};
 use anyhow::{Context, Result, bail};
-use catdot_core::{PackageAvailability, PackageBackend, PackagePlan, install_plan};
-use std::{collections::BTreeSet, process::Command};
+use catdot_core::{
+    PackageAvailability, PackageBackend, PackagePlan, PackageReplacement, install_plan,
+};
+use std::{
+    collections::BTreeSet,
+    process::Command,
+    sync::{Arc, Mutex},
+};
 
 pub fn open_handle() -> Result<Alpm> {
     let root = pacman_conf_value("RootDir")?;
@@ -37,6 +46,37 @@ pub fn open_handle() -> Result<Alpm> {
             .parse()
             .context("parse pacman ParallelDownloads as an unsigned integer")?,
     );
+    handle
+        .set_ignorepkgs(pacman_conf_values("IgnorePkg")?.iter().map(String::as_str))
+        .context("configure pacman IgnorePkg")?;
+    handle
+        .set_ignoregroups(
+            pacman_conf_values("IgnoreGroup")?
+                .iter()
+                .map(String::as_str),
+        )
+        .context("configure pacman IgnoreGroup")?;
+    handle
+        .set_noupgrades(pacman_conf_values("NoUpgrade")?.iter().map(String::as_str))
+        .context("configure pacman NoUpgrade")?;
+    handle
+        .set_noextracts(pacman_conf_values("NoExtract")?.iter().map(String::as_str))
+        .context("configure pacman NoExtract")?;
+    if let Some(user) = pacman_conf_values("DownloadUser")?.into_iter().next() {
+        handle
+            .set_sandbox_user(Some(user))
+            .context("configure pacman DownloadUser")?;
+    }
+    handle.set_disable_dl_timeout(!pacman_conf_values("DisableDownloadTimeout")?.is_empty());
+    let disable_sandbox = !pacman_conf_values("DisableSandbox")?.is_empty();
+    handle.set_disable_sandbox_filesystem(disable_sandbox);
+    handle.set_disable_sandbox_syscalls(disable_sandbox);
+    handle
+        .set_local_file_siglevel(signature_level(&pacman_conf_values("LocalFileSigLevel")?))
+        .context("configure LocalFileSigLevel")?;
+    handle
+        .set_remote_file_siglevel(signature_level(&pacman_conf_values("RemoteFileSigLevel")?))
+        .context("configure RemoteFileSigLevel")?;
     for repo in pacman_conf_values("--repo-list")? {
         let servers = pacman_repo_values(&repo, "Server")?
             .into_iter()
@@ -210,6 +250,104 @@ pub fn satisfier_name(handle: &Alpm, dependency: &str) -> Result<String> {
         .with_context(|| format!("package {dependency} is unavailable in configured repositories"))
 }
 
+#[derive(Default)]
+struct InstallQuestionState {
+    replacements: BTreeSet<PackageReplacement>,
+}
+
+fn configure_install_questions(handle: &Alpm) -> Arc<Mutex<InstallQuestionState>> {
+    let state = Arc::new(Mutex::new(InstallQuestionState::default()));
+    let callback_state = Arc::clone(&state);
+    handle.set_question_cb(callback_state, |question: AnyQuestion<'_>, state| {
+        match question.question() {
+            Question::Replace(replace) => {
+                let replacement = PackageReplacement {
+                    remove: replace.oldpkg().name().to_owned(),
+                    install: replace.newpkg().name().to_owned(),
+                    reason: "repository replacement".to_owned(),
+                };
+                state.lock().expect("question state lock").replacements.insert(replacement);
+                replace.set_replace(true);
+            }
+            Question::Conflict(mut conflict) => {
+                let details = conflict.conflict();
+                let first = details.package1();
+                let second = details.package2();
+                let replacement = match (first.origin(), second.origin()) {
+                    (PackageFrom::LocalDb, PackageFrom::SyncDb) => Some(PackageReplacement {
+                        remove: first.name().to_owned(),
+                        install: second.name().to_owned(),
+                        reason: details.reason().to_string(),
+                    }),
+                    (PackageFrom::SyncDb, PackageFrom::LocalDb) => Some(PackageReplacement {
+                        remove: second.name().to_owned(),
+                        install: first.name().to_owned(),
+                        reason: details.reason().to_string(),
+                    }),
+                    _ => None,
+                };
+                if let Some(replacement) = replacement {
+                    state.lock().expect("question state lock").replacements.insert(replacement);
+                    conflict.set_remove(true);
+                } else {
+                    conflict.set_remove(false);
+                }
+            }
+            Question::SelectProvider(mut provider) => provider.set_index(0),
+            Question::InstallIgnorepkg(mut ignored) => ignored.set_install(false),
+            Question::RemovePkgs(mut packages) => packages.set_skip(false),
+            Question::ImportKey(mut key) => key.set_import(true),
+            Question::Corrupted(mut corrupted) => corrupted.set_remove(false),
+        }
+    });
+    state
+}
+
+fn prepared_install_transaction(
+    handle: &mut Alpm,
+    names: &[String],
+    flags: TransFlag,
+) -> Result<(Vec<String>, Vec<String>, Vec<PackageReplacement>)> {
+    let questions = configure_install_questions(handle);
+    handle
+        .trans_init(flags)
+        .context("initialize libalpm install transaction")?;
+    for name in names {
+        let package = sync_package(handle, name)?;
+        handle.trans_add_pkg(package).map_err(|error| {
+            anyhow::anyhow!("add package {name} to install transaction: {error}")
+        })?;
+    }
+    let prepare_failure = handle.trans_prepare().err().map(prepare_error);
+    if let Some(error) = prepare_failure {
+        let _ = handle.trans_release();
+        return Err(error);
+    }
+    let mut install = handle
+        .trans_add()
+        .iter()
+        .map(|package| package.name().to_owned())
+        .collect::<Vec<_>>();
+    let mut remove = handle
+        .trans_remove()
+        .iter()
+        .map(|package| package.name().to_owned())
+        .collect::<Vec<_>>();
+    let mut replacements = questions
+        .lock()
+        .expect("question state lock")
+        .replacements
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    install.sort();
+    install.dedup();
+    remove.sort();
+    remove.dedup();
+    replacements.sort();
+    Ok((install, remove, replacements))
+}
+
 pub fn prepared_install_plan(
     handle: &mut Alpm,
     packages: &BTreeSet<String>,
@@ -218,31 +356,20 @@ pub fn prepared_install_plan(
     if plan.install.is_empty() {
         return Ok(plan);
     }
-    handle
-        .trans_init(TransFlag::NO_LOCK)
-        .context("initialize libalpm planning transaction")?;
-    for name in &plan.install {
-        let package = sync_package(handle, name)?;
-        handle.trans_add_pkg(package).map_err(|error| {
-            anyhow::anyhow!("add package {name} to planning transaction: {error}")
-        })?;
+    let requested = plan.install.clone();
+    let result = prepared_install_transaction(handle, &requested, TransFlag::NO_LOCK);
+    match result {
+        Ok((install, remove, replacements)) => {
+            plan.install = install;
+            plan.remove = remove;
+            plan.replacements = replacements;
+            handle
+                .trans_release()
+                .context("release libalpm planning transaction")?;
+            Ok(plan)
+        }
+        Err(error) => Err(error),
     }
-    let result = handle
-        .trans_prepare()
-        .map_err(|error| anyhow::anyhow!("libalpm dependency/conflict validation failed: {error}"));
-    if result.is_ok() {
-        plan.install = handle
-            .trans_add()
-            .iter()
-            .map(|package| package.name().to_owned())
-            .collect();
-        plan.install.sort();
-    }
-    handle
-        .trans_release()
-        .context("release libalpm planning transaction")?;
-    result?;
-    Ok(plan)
 }
 
 struct AlpmQuery<'a>(&'a Alpm);
@@ -262,29 +389,21 @@ impl PackageBackend for AlpmQuery<'_> {
         Ok(removable_with_alpm(self.0, package))
     }
 }
-pub fn install_with_alpm(handle: &mut Alpm, names: &[String]) -> Result<()> {
-    if names.is_empty() {
+pub fn install_with_alpm(handle: &mut Alpm, plan: &PackagePlan) -> Result<()> {
+    if plan.install.is_empty() {
         return Ok(());
     }
-    handle
-        .trans_init(TransFlag::NONE)
-        .context("initialize libalpm transaction")?;
-    for name in names {
-        let package = sync_package(handle, name)?;
-        handle
-            .trans_add_pkg(package)
-            .map_err(|error| anyhow::anyhow!("add package {name} to transaction: {error}"))?;
-    }
-    let prepare_failure = handle.trans_prepare().err().map(prepare_error);
-    if let Some(error) = prepare_failure {
+    let (install, remove, replacements) =
+        prepared_install_transaction(handle, &plan.install, TransFlag::NONE)?;
+    if install != plan.install || remove != plan.remove || replacements != plan.replacements {
         let _ = handle.trans_release();
-        return Err(error);
+        bail!("libalpm transaction changed after confirmation; run catdot resolve again")
     }
     if let Err(error) = handle.trans_commit() {
         let _ = handle.trans_release();
         return Err(commit_error(error));
     }
-    for name in names {
+    for name in &plan.install {
         handle
             .localdb()
             .pkg(name.as_str())
@@ -321,6 +440,10 @@ fn sync_package<'a>(handle: &'a Alpm, name: &str) -> Result<&'a alpm::Package> {
         .syncdbs()
         .find_satisfier(name)
         .with_context(|| format!("locate package {name} in sync database"))
+}
+
+pub fn hold_packages() -> Result<BTreeSet<String>> {
+    Ok(pacman_conf_values("HoldPkg")?.into_iter().collect())
 }
 
 pub fn removable_with_alpm(handle: &Alpm, name: &str) -> bool {
@@ -401,7 +524,9 @@ pub fn remove_with_alpm(handle: &mut Alpm, names: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{open_handle, repository_signature_level, signature_level};
+    use super::{
+        open_handle, pacman_conf_values, repository_signature_level, signature_level,
+    };
     use alpm::SigLevel;
 
     #[test]
@@ -422,5 +547,26 @@ mod tests {
     fn opens_host_alpm_configuration_read_only() {
         let handle = open_handle().unwrap();
         assert!(!handle.syncdbs().is_empty());
+        let download_user = pacman_conf_values("DownloadUser").unwrap();
+        assert_eq!(
+            handle.sandbox_user(),
+            download_user.first().map(String::as_str)
+        );
+        assert_eq!(
+            handle.ignorepkgs().iter().collect::<Vec<_>>(),
+            pacman_conf_values("IgnorePkg")
+                .unwrap()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            handle.noupgrades().iter().collect::<Vec<_>>(),
+            pacman_conf_values("NoUpgrade")
+                .unwrap()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
     }
 }

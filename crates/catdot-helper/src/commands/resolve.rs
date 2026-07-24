@@ -79,7 +79,7 @@ pub(super) fn apply(
         },
     )?;
     journal.verify(uid, generation, digest)?;
-    install_with_alpm(&mut handle, &context.plan.install)?;
+    install_with_alpm(&mut handle, &context.plan)?;
     journal.mark_alpm_committed()?;
     commit_records(
         database,
@@ -223,6 +223,9 @@ fn planned_package_state(
             });
     }
     for (name, package) in previous {
+        if plan.remove.contains(&name) {
+            continue;
+        }
         if package.catdot_installed && !packages.contains_key(&name) {
             packages.insert(name, package);
         }

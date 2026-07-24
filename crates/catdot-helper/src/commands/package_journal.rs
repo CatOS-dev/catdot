@@ -285,6 +285,7 @@ mod tests {
         PackagePlan {
             install: vec!["dependency".into()],
             remove: vec![],
+            replacements: vec![],
             satisfied: vec![],
         }
     }

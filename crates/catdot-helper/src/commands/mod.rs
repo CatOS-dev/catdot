@@ -1,5 +1,7 @@
 use crate::auth::{caller_uid, user_home};
-use crate::backend::{open_handle, prepared_removal_plan, removable_with_alpm, remove_with_alpm};
+use crate::backend::{
+    hold_packages, open_handle, prepared_removal_plan, removable_with_alpm, remove_with_alpm,
+};
 use crate::system::{load_records, user_record_path, valid_records};
 use anyhow::{Result, bail};
 use catdot_core::*;
@@ -198,45 +200,54 @@ fn canonical_prune_plan(
     handle: &mut alpm::Alpm,
     state: &SystemPackageState,
 ) -> Result<PackagePlan> {
-    let mut candidates: Vec<_> = state
+    let held = hold_packages()?;
+    let mut candidates = state
         .packages
         .values()
-        .filter(|package| prunable(package, false) && removable_with_alpm(handle, &package.name))
+        .filter(|package| {
+            prunable(package, false)
+                && removable_with_alpm(handle, &package.name)
+                && !held.contains(&package.name)
+        })
         .map(|package| package.name.clone())
-        .collect();
-    let remove = loop {
-        match prepared_removal_plan(handle, &candidates) {
-            Ok(plan) => break plan,
-            Err(_) if candidates.is_empty() => break vec![],
-            Err(_) => {
-                let mut best = None;
-                for index in 0..candidates.len() {
-                    let mut trial = candidates.clone();
-                    trial.remove(index);
-                    if let Ok(plan) = prepared_removal_plan(handle, &trial)
-                        && best.as_ref().is_none_or(
-                            |(_, best_plan): &(Vec<String>, Vec<String>)| {
-                                plan.len() > best_plan.len()
-                            },
-                        )
-                    {
-                        best = Some((trial, plan));
-                    }
-                }
-                if let Some((trial, _)) = best {
-                    candidates = trial;
-                } else {
-                    candidates.pop();
+        .collect::<std::collections::BTreeSet<_>>();
+
+    loop {
+        let mut externally_required = std::collections::BTreeSet::new();
+        for package in handle.localdb().pkgs().iter() {
+            if candidates.contains(package.name()) {
+                continue;
+            }
+            for dependency in package.depends().iter() {
+                if let Some(provider) = handle
+                    .localdb()
+                    .pkgs()
+                    .find_satisfier(dependency.to_string())
+                    && candidates.contains(provider.name())
+                {
+                    externally_required.insert(provider.name().to_owned());
                 }
             }
         }
-    };
+        if externally_required.is_empty() {
+            break;
+        }
+        for package in externally_required {
+            candidates.remove(&package);
+        }
+    }
+
+    let names = candidates.into_iter().collect::<Vec<_>>();
+    let remove = prepared_removal_plan(handle, &names)?;
     Ok(PackagePlan {
         install: vec![],
         remove,
+        replacements: vec![],
         satisfied: vec![],
     })
 }
+
+
 fn caller_uid_from_pkexec() -> Result<u32> {
     let value = std::env::var("PKEXEC_UID")
         .map_err(|_| anyhow::anyhow!("missing PKEXEC_UID; helper must be launched by pkexec"))?;

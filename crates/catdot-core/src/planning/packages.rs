@@ -205,6 +205,7 @@ pub fn install_plan<B: PackageBackend>(
     let mut plan = PackagePlan {
         install: vec![],
         remove: vec![],
+        replacements: vec![],
         satisfied: vec![],
     };
     for package in packages {
@@ -216,10 +217,19 @@ pub fn install_plan<B: PackageBackend>(
     }
     Ok(plan)
 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PackageReplacement {
+    pub remove: String,
+    pub install: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PackagePlan {
     pub install: Vec<String>,
     pub remove: Vec<String>,
+    #[serde(default)]
+    pub replacements: Vec<PackageReplacement>,
     pub satisfied: Vec<String>,
 }
 impl PackagePlan {
