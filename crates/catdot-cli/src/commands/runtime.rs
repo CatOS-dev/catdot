@@ -98,6 +98,7 @@ pub(super) fn apply(
     profiles: &std::collections::BTreeMap<String, Profile>,
     state: &UserState,
     adopt: Option<&str>,
+    mut journal: Option<&mut ActivationJournal>,
 ) -> Result<()> {
     let home = home()?;
     let registry = managed_links_path(&state_file()?)?;
@@ -121,9 +122,15 @@ pub(super) fn apply(
     };
     for (target, source) in desired {
         let should_adopt = adopt.is_some();
+        if let Some(journal) = &mut journal {
+            journal.track_symlink(&target, &source.canonicalize()?)?;
+        }
         if let Err(error) = links.stage(&source, &target, should_adopt) {
             return Err(error.into());
         }
+    }
+    if let Some(journal) = &mut journal {
+        journal.track_file(&registry, links.expected_registry_contents()?.as_bytes())?;
     }
     for role in state.components.keys() {
         let (_profile, component, _) = component_for(profiles, state, role)?;
@@ -137,16 +144,37 @@ pub(super) fn apply(
         if component.backend.is_some() {
             let desktop = env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
             let plasma = desktop.contains("KDE") || desktop.contains("Plasma");
+            if let Some(journal) = &mut journal {
+                for (path, contents) in theme_expected_files(component, &xdg, plasma)? {
+                    journal.track_file(&path, &contents)?;
+                }
+            }
             if let Err(error) = apply_theme(component, &xdg, plasma) {
                 let _ = links.rollback();
                 return Err(error.into());
             }
-            sync_gtk_settings(component);
         }
     }
     if let Err(error) = links.commit() {
         let _ = links.rollback();
         return Err(error.into());
+    }
+    Ok(())
+}
+
+pub(super) fn sync_active_settings(
+    profiles: &std::collections::BTreeMap<String, Profile>,
+    state: &UserState,
+) -> Result<()> {
+    for role in state.components.keys() {
+        let (_, component, _) = component_for(profiles, state, role)?;
+        if component
+            .packages
+            .iter()
+            .all(|package| package_present(package))
+        {
+            sync_gtk_settings(component);
+        }
     }
     Ok(())
 }

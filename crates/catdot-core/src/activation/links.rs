@@ -120,17 +120,24 @@ impl LinkTransaction {
         self.reconcile = true;
     }
 
-    pub fn commit(&mut self) -> Result<()> {
-        let actions = self.plan()?;
-        let mut new_registry = self.registry.clone();
+    pub fn expected_registry_contents(&self) -> Result<String> {
+        self.plan()?;
+        let mut registry = self.registry.clone();
         if self.reconcile {
-            new_registry.entries.clear();
+            registry.entries.clear();
         }
-        new_registry.entries.extend(
+        registry.entries.extend(
             self.desired
                 .iter()
                 .map(|(target, desired)| (target.clone(), desired.source.display().to_string())),
         );
+        toml::to_string_pretty(&registry).map_err(|error| Error::Message(error.to_string()))
+    }
+
+    pub fn commit(&mut self) -> Result<()> {
+        let actions = self.plan()?;
+        let new_registry: LinkRegistry = toml::from_str(&self.expected_registry_contents()?)
+            .map_err(|error| Error::Message(error.to_string()))?;
         for action in actions {
             if let Err(error) = self.apply(action) {
                 let _ = self.rollback();

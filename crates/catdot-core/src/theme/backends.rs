@@ -60,14 +60,33 @@ fn restore_theme_write(write: &ThemeWrite) -> Result<()> {
     }
 }
 pub fn apply_theme(component: &ComponentDef, config_home: &Path, plasma: bool) -> Result<()> {
+    commit_theme_writes(&theme_writes(component, config_home, plasma)?)
+}
+
+pub fn theme_expected_files(
+    component: &ComponentDef,
+    config_home: &Path,
+    plasma: bool,
+) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+    Ok(theme_writes(component, config_home, plasma)?
+        .into_iter()
+        .map(|write| (write.path, write.contents.into_bytes()))
+        .collect())
+}
+
+fn theme_writes(
+    component: &ComponentDef,
+    config_home: &Path,
+    plasma: bool,
+) -> Result<Vec<ThemeWrite>> {
     match component.backend.as_deref() {
-        Some("gtk") => apply_gtk(&component.settings, config_home),
-        Some("qtct-kvantum") => apply_qtct_kvantum(&component.settings, config_home, plasma),
+        Some("gtk") => gtk_writes(&component.settings, config_home),
+        Some("qtct-kvantum") => qtct_kvantum_writes(&component.settings, config_home, plasma),
         Some(other) => Err(Error::Message(format!("unsupported theme backend {other}"))),
-        None => Ok(()),
+        None => Ok(vec![]),
     }
 }
-fn apply_gtk(settings: &BTreeMap<String, String>, config_home: &Path) -> Result<()> {
+fn gtk_writes(settings: &BTreeMap<String, String>, config_home: &Path) -> Result<Vec<ThemeWrite>> {
     let dark = if setting(settings, "color_scheme")? == "prefer-dark" {
         "1"
     } else {
@@ -80,7 +99,7 @@ fn apply_gtk(settings: &BTreeMap<String, String>, config_home: &Path) -> Result<
         ("gtk-font-name", setting(settings, "font")?),
         ("gtk-application-prefer-dark-theme", dark),
     ];
-    let writes = [
+    Ok(vec![
         merged_file(
             &config_home.join("gtk-3.0/settings.ini"),
             "Settings",
@@ -91,14 +110,13 @@ fn apply_gtk(settings: &BTreeMap<String, String>, config_home: &Path) -> Result<
             "Settings",
             &changes,
         )?,
-    ];
-    commit_theme_writes(&writes)
+    ])
 }
-fn apply_qtct_kvantum(
+fn qtct_kvantum_writes(
     settings: &BTreeMap<String, String>,
     config_home: &Path,
     plasma: bool,
-) -> Result<()> {
+) -> Result<Vec<ThemeWrite>> {
     if plasma {
         return Err(Error::Message(
             "qtct-kvantum is unsupported in a Plasma session; select a KDE-specific backend".into(),
@@ -127,7 +145,7 @@ fn apply_qtct_kvantum(
         "General",
         &[("theme", setting(settings, "kvantum_theme")?)],
     )?;
-    commit_theme_writes(&[qt5, qt6, kvantum])
+    Ok(vec![qt5, qt6, kvantum])
 }
 
 #[cfg(test)]

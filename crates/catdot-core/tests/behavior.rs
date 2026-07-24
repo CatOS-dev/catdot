@@ -423,6 +423,69 @@ fn atomic_write_replaces_complete_state_without_leaving_a_temporary_file() {
 }
 
 #[test]
+fn activation_journal_recovers_expected_changes_but_refuses_manual_edits() {
+    let directory = tempdir().unwrap();
+    let state_path = directory.path().join("state.toml");
+    let target = directory.path().join("target.ini");
+    let old = UserState::default();
+    let new = UserState {
+        generation: 1,
+        active_generation: 1,
+        ..old.clone()
+    };
+    write_state(&state_path, &old).unwrap();
+    fs::write(&target, "old").unwrap();
+
+    let mut journal = ActivationJournal::begin(&state_path, old.clone(), new).unwrap();
+    journal.track_file(&target, b"new").unwrap();
+    journal.mark_applying().unwrap();
+    fs::write(&target, "new").unwrap();
+    write_state(
+        &state_path,
+        &UserState {
+            generation: 1,
+            active_generation: 1,
+            ..old.clone()
+        },
+    )
+    .unwrap();
+
+    recover_activation_journals(&state_path).unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), "old");
+    assert_eq!(read_state(&state_path).unwrap().generation, 0);
+
+    let mut journal = ActivationJournal::begin(&state_path, old, UserState::default()).unwrap();
+    journal.track_file(&target, b"expected").unwrap();
+    journal.mark_applying().unwrap();
+    fs::write(&target, "manual change").unwrap();
+
+    assert!(recover_activation_journals(&state_path).is_err());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "manual change");
+}
+
+#[test]
+fn activation_journal_completes_after_state_write_crash() {
+    let directory = tempdir().unwrap();
+    let state_path = directory.path().join("state.toml");
+    let old = UserState::default();
+    let new = UserState {
+        generation: 1,
+        active_generation: 1,
+        ..old.clone()
+    };
+    write_state(&state_path, &old).unwrap();
+    let mut journal = ActivationJournal::begin(&state_path, old, new.clone()).unwrap();
+    journal.mark_applying().unwrap();
+    write_state(&state_path, &new).unwrap();
+    journal.mark_state_written().unwrap();
+
+    recover_activation_journals(&state_path).unwrap();
+
+    assert_eq!(read_state(&state_path).unwrap(), new);
+    assert_eq!(fs::read_dir(activation_transactions_path(&state_path).unwrap()).unwrap().count(), 0);
+}
+
+#[test]
 fn activation_requires_a_registered_link_owner_and_ini_merge_preserves_keys() {
     let dir = tempdir().unwrap();
     let target = dir.path().join("config");

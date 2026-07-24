@@ -8,7 +8,8 @@ use crate::services::print_system_record_diagnostics;
 mod runtime;
 
 use runtime::{
-    apply, component_for, exec_role, package_present, profiles, state_file, unresolved_packages,
+    apply, component_for, exec_role, package_present, profiles, state_file, sync_active_settings,
+    unresolved_packages,
 };
 
 #[derive(Parser)]
@@ -248,6 +249,9 @@ pub fn run() -> Result<()> {
     } else {
         None
     };
+    if mutates_state {
+        recover_activation_journals(&path)?;
+    }
     let mut state = match read_state(&path) {
         Ok(state) => state,
         Err(error) if is_doctor => {
@@ -336,10 +340,25 @@ pub fn run() -> Result<()> {
         Cmd::Apply => {
             let mut active = state.clone();
             active.components = active.active_components.clone();
-            apply(ps, &active, None)?;
+            let mut journal = ActivationJournal::begin(&path, state.clone(), state.clone())?;
+            journal.mark_applying()?;
+            if let Err(error) = apply(ps, &active, None, Some(&mut journal)) {
+                recover_activation_journals(&path)?;
+                return Err(error);
+            }
+            journal.complete()?;
+            sync_active_settings(ps, &active)?;
             println!("Reapplied active configuration");
         }
-        Cmd::Adopt { role } => apply(ps, &state, Some(&role))?,
+        Cmd::Adopt { role } => {
+            let mut journal = ActivationJournal::begin(&path, state.clone(), state.clone())?;
+            journal.mark_applying()?;
+            if let Err(error) = apply(ps, &state, Some(&role), Some(&mut journal)) {
+                recover_activation_journals(&path)?;
+                return Err(error);
+            }
+            journal.complete()?;
+        }
         Cmd::Exec { role, arguments } => return exec_role(ps, &state, &role, &arguments),
         Cmd::Resolve {
             dry_run,
@@ -348,10 +367,21 @@ pub fn run() -> Result<()> {
         } => {
             helper("resolve", &state, &path, with_optional, dry_run, yes)?;
             if !dry_run {
-                apply(ps, &state, None)?;
-                state.active_components = state.components.clone();
-                state.active_generation = state.generation;
-                write_state(&path, &state)?;
+                let old_state = state.clone();
+                let mut new_state = state.clone();
+                new_state.active_components = new_state.components.clone();
+                new_state.active_generation = new_state.generation;
+                let mut journal = ActivationJournal::begin(&path, old_state, new_state.clone())?;
+                journal.mark_applying()?;
+                if let Err(error) = apply(ps, &state, None, Some(&mut journal)) {
+                    recover_activation_journals(&path)?;
+                    return Err(error);
+                }
+                write_state(&path, &new_state)?;
+                journal.mark_state_written()?;
+                journal.complete()?;
+                state = new_state;
+                sync_active_settings(ps, &state)?;
                 let uid = unsafe { libc::geteuid() }.to_string();
                 let generation = state.generation.to_string();
                 let state_path = path.to_str().context("state path is not valid UTF-8")?;
@@ -375,6 +405,16 @@ pub fn run() -> Result<()> {
         }
         Cmd::Prune { dry_run, yes } => helper("prune", &state, &path, false, dry_run, yes)?,
         Cmd::Doctor => {
+            let transactions = activation_transactions_path(&path)?;
+            if transactions.exists()
+                && std::fs::read_dir(&transactions)?.any(|entry| {
+                    entry.ok().is_some_and(|entry| {
+                        entry.path().extension().is_some_and(|extension| extension == "toml")
+                    })
+                })
+            {
+                println!("warning: unfinished activation transaction; run catdot resolve or apply");
+            }
             for diagnostic in &registry.diagnostics {
                 println!(
                     "invalid profile: {} ({:?}): {}",

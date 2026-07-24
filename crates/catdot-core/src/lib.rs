@@ -8,8 +8,9 @@ pub mod state;
 pub mod theme;
 
 pub use activation::{
-    LinkRegistry, LinkTransaction, activate_managed_link, deactivate_managed_link, lock,
-    read_link_registry, reconcile_managed_links,
+    ActivationJournal, LinkRegistry, LinkTransaction, activate_managed_link,
+    activation_transactions_path, deactivate_managed_link, lock, read_link_registry,
+    reconcile_managed_links, recover_activation_journals,
 };
 pub use error::{Error, Result};
 pub use manifest::{
@@ -27,4 +28,4 @@ pub use state::{
     read_system_packages, read_user_records, select_component, select_profile, state_lock_path,
     state_path, validate_user_state, write_state, write_system_packages,
 };
-pub use theme::{apply_theme, merge_ini};
+pub use theme::{apply_theme, merge_ini, theme_expected_files};
