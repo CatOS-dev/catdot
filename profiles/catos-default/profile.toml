@@ -1,9 +1,9 @@
 schema = 1
 
 [profile]
-id = "catos-graphite"
-name = "CatOS Graphite"
-description = "CatOS GTK and Qt Graphite theme profile"
+id = "catos-default"
+name = "CatOS Default"
+description = "Default CatOS GTK and Qt appearance profile"
 
 [defaults]
 gtk-theme = "gtk"

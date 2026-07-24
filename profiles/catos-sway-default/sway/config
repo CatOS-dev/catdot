@@ -1,6 +1,0 @@
-set $mod Mod4
-exec_always catdot exec bar
-exec_always catdot exec notifications
-bindsym $mod+Return exec catdot exec terminal
-bindsym $mod+d exec catdot exec launcher
-bindsym $mod+q kill

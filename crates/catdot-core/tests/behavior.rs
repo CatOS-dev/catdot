@@ -691,21 +691,20 @@ fn confined_link_targets_reject_symlink_escapes_but_allow_nested_directories() {
 }
 
 #[test]
-fn shipped_niri_and_sway_profiles_are_valid_and_selectable() {
+fn shipped_profiles_are_limited_to_the_default_appearance_profile() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../profiles");
     let profiles = discover_profiles(&root).unwrap();
-    for id in ["catos-niri-default", "catos-sway-default"] {
-        let profile = profiles.get(id).unwrap();
-        let state = select_profile(profile).unwrap();
-        assert_eq!(state.components["wm"].split_once('/').unwrap().0, id);
-        assert_eq!(state.components["browser"].split_once('/').unwrap().0, id);
-        assert_eq!(state.components["editor"].split_once('/').unwrap().0, id);
-        assert!(
-            profile.components[profile.defaults.get("wm").unwrap()]
-                .path
-                .exists()
-        );
-    }
+    assert_eq!(profiles.keys().map(String::as_str).collect::<Vec<_>>(), ["catos-default"]);
+
+    let profile = &profiles["catos-default"];
+    let state = select_profile(profile).unwrap();
+    assert_eq!(
+        state.components.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["gtk-theme", "qt-theme"]
+    );
+    assert_eq!(profile.components.len(), 2);
+    assert_eq!(profile.components["gtk"].role, "gtk-theme");
+    assert_eq!(profile.components["qt"].role, "qt-theme");
 }
 
 #[test]
