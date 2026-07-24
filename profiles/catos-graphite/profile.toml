@@ -1,0 +1,35 @@
+schema = 1
+
+[profile]
+id = "catos-graphite"
+name = "CatOS Graphite"
+description = "CatOS GTK and Qt Graphite theme profile"
+
+[defaults]
+gtk-theme = "gtk"
+qt-theme = "qt"
+
+[components.gtk]
+role = "gtk-theme"
+path = "gtk"
+backend = "gtk"
+packages = ["catos-graphite-gtk-theme", "catos-tela-icon-theme-blue", "catos-bibata-cursor"]
+
+[components.gtk.settings]
+theme = "Graphite-Dark"
+icon_theme = "Tela-circle-blue-dark"
+cursor_theme = "Bibata-Modern-Ice"
+font = "Noto Sans 10"
+color_scheme = "prefer-dark"
+
+[components.qt]
+role = "qt-theme"
+path = "qt"
+backend = "qtct-kvantum"
+packages = ["qt5ct", "qt6ct", "kvantum", "catos-graphite-kvantum-theme"]
+
+[components.qt.settings]
+qt5_style = "kvantum"
+qt6_style = "kvantum"
+kvantum_theme = "GraphiteDark"
+icon_theme = "Tela-circle-blue-dark"

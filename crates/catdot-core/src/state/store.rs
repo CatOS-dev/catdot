@@ -1,0 +1,166 @@
+use crate::{Error, Result, error::io, manifest::Profile};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeMap,
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserState {
+    pub generation: u64,
+    #[serde(default)]
+    pub components: BTreeMap<String, String>,
+}
+pub fn state_path(home: &Path) -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                home.join(path)
+            }
+        })
+        .unwrap_or_else(|| home.join(".local/state"))
+        .join("catdot/state.toml")
+}
+pub fn managed_links_path(state_path: &Path) -> Result<PathBuf> {
+    let parent = state_path
+        .parent()
+        .ok_or_else(|| Error::Message("state path has no parent".into()))?;
+    Ok(parent.join("managed-links.toml"))
+}
+pub fn read_state(path: &Path) -> Result<UserState> {
+    if !path.exists() {
+        return Ok(UserState::default());
+    };
+    toml::from_str(&io(path, fs::read_to_string(path))?).map_err(|source| Error::Toml {
+        path: path.display().to_string(),
+        source,
+    })
+}
+pub fn atomic_write(path: &Path, contents: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::Message("path has no parent".into()))?;
+    io(parent, fs::create_dir_all(parent))?;
+    let (temporary, mut file) = create_temporary(parent, path)?;
+    io(&temporary, file.write_all(contents.as_bytes()))?;
+    io(&temporary, file.sync_all())?;
+    io(path, fs::rename(&temporary, path))?;
+    io(parent, File::open(parent))?
+        .sync_all()
+        .map_err(|source| Error::Io {
+            path: parent.display().to_string(),
+            source,
+        })
+}
+
+fn create_temporary(parent: &Path, path: &Path) -> Result<(PathBuf, File)> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| Error::Message(error.to_string()))?
+        .as_nanos();
+    for attempt in 0..32 {
+        let candidate = parent.join(format!(
+            ".{name}.{}-{stamp}-{attempt}.tmp",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(Error::Io {
+                    path: candidate.display().to_string(),
+                    source: error,
+                });
+            }
+        }
+    }
+    Err(Error::Message(format!(
+        "cannot create unique temporary file for {}",
+        path.display()
+    )))
+}
+pub fn write_state(path: &Path, state: &UserState) -> Result<()> {
+    atomic_write(
+        path,
+        &toml::to_string_pretty(state).map_err(|error| Error::Message(error.to_string()))?,
+    )
+}
+pub fn read_user_records(directory: &Path) -> Result<Vec<crate::UserRecord>> {
+    if !directory.exists() {
+        return Ok(vec![]);
+    }
+    let mut records = Vec::new();
+    for entry in io(directory, fs::read_dir(directory))? {
+        let path = io(directory, entry)?.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
+            continue;
+        }
+        let text = io(&path, fs::read_to_string(&path))?;
+        records.push(toml::from_str(&text).map_err(|source| Error::Toml {
+            path: path.display().to_string(),
+            source,
+        })?);
+    }
+    Ok(records)
+}
+pub fn read_system_packages(path: &Path) -> Result<crate::SystemPackageState> {
+    if !path.exists() {
+        return Ok(crate::SystemPackageState::default());
+    }
+    toml::from_str(&io(path, fs::read_to_string(path))?).map_err(|source| Error::Toml {
+        path: path.display().to_string(),
+        source,
+    })
+}
+pub fn write_system_packages(path: &Path, state: &crate::SystemPackageState) -> Result<()> {
+    atomic_write(
+        path,
+        &toml::to_string_pretty(state).map_err(|error| Error::Message(error.to_string()))?,
+    )
+}
+pub fn select_profile(profile: &Profile) -> Result<UserState> {
+    let components = profile
+        .defaults
+        .iter()
+        .map(|(role, id)| (role.clone(), format!("{}/{}", profile.id, id)))
+        .collect();
+    Ok(UserState {
+        generation: 1,
+        components,
+    })
+}
+pub fn select_component(
+    state: &mut UserState,
+    profiles: &BTreeMap<String, Profile>,
+    role: &str,
+    reference: &str,
+) -> Result<()> {
+    let (profile_id, component_id) = reference
+        .split_once('/')
+        .ok_or_else(|| Error::Message("component must be profile/component".into()))?;
+    let component = profiles
+        .get(profile_id)
+        .and_then(|profile| profile.components.get(component_id))
+        .ok_or_else(|| Error::Message(format!("unknown component {reference}")))?;
+    if component.role != role {
+        return Err(Error::Message(format!(
+            "{reference} has role {}, not {role}",
+            component.role
+        )));
+    }
+    state.components.insert(role.into(), reference.into());
+    state.generation += 1;
+    Ok(())
+}

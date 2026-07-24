@@ -1,0 +1,8 @@
+// Catdot-managed Niri entry point. Keep machine-specific outputs in a separate include.
+spawn-at-startup "catdot" "exec" "bar"
+spawn-at-startup "catdot" "exec" "notifications"
+binds {
+    Mod+Return { spawn "catdot" "exec" "terminal"; }
+    Mod+D { spawn "catdot" "exec" "launcher"; }
+    Mod+Q { close-window; }
+}
