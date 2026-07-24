@@ -258,15 +258,20 @@ struct InstallQuestionState {
 fn configure_install_questions(handle: &Alpm) -> Arc<Mutex<InstallQuestionState>> {
     let state = Arc::new(Mutex::new(InstallQuestionState::default()));
     let callback_state = Arc::clone(&state);
-    handle.set_question_cb(callback_state, |question: AnyQuestion<'_>, state| {
-        match question.question() {
+    handle.set_question_cb(
+        callback_state,
+        |question: AnyQuestion<'_>, state| match question.question() {
             Question::Replace(replace) => {
                 let replacement = PackageReplacement {
                     remove: replace.oldpkg().name().to_owned(),
                     install: replace.newpkg().name().to_owned(),
                     reason: "repository replacement".to_owned(),
                 };
-                state.lock().expect("question state lock").replacements.insert(replacement);
+                state
+                    .lock()
+                    .expect("question state lock")
+                    .replacements
+                    .insert(replacement);
                 replace.set_replace(true);
             }
             Question::Conflict(mut conflict) => {
@@ -287,7 +292,11 @@ fn configure_install_questions(handle: &Alpm) -> Arc<Mutex<InstallQuestionState>
                     _ => None,
                 };
                 if let Some(replacement) = replacement {
-                    state.lock().expect("question state lock").replacements.insert(replacement);
+                    state
+                        .lock()
+                        .expect("question state lock")
+                        .replacements
+                        .insert(replacement);
                     conflict.set_remove(true);
                 } else {
                     conflict.set_remove(false);
@@ -298,8 +307,8 @@ fn configure_install_questions(handle: &Alpm) -> Arc<Mutex<InstallQuestionState>
             Question::RemovePkgs(mut packages) => packages.set_skip(false),
             Question::ImportKey(mut key) => key.set_import(true),
             Question::Corrupted(mut corrupted) => corrupted.set_remove(false),
-        }
-    });
+        },
+    );
     state
 }
 
@@ -524,9 +533,7 @@ pub fn remove_with_alpm(handle: &mut Alpm, names: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        open_handle, pacman_conf_values, repository_signature_level, signature_level,
-    };
+    use super::{open_handle, pacman_conf_values, repository_signature_level, signature_level};
     use alpm::SigLevel;
 
     #[test]

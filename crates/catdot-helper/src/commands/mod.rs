@@ -255,7 +255,6 @@ fn canonical_prune_plan(
     })
 }
 
-
 fn system_doctor(_caller: u32) -> Result<()> {
     let database = PathBuf::from(DB);
     ensure_system_database(&database)?;
@@ -299,9 +298,10 @@ fn system_doctor(_caller: u32) -> Result<()> {
                 }
             }
             Err(_) => {
-                report
-                    .lines
-                    .push(format!("warning: system user record: uid {}: missing", record.uid));
+                report.lines.push(format!(
+                    "warning: system user record: uid {}: missing",
+                    record.uid
+                ));
                 report.warnings += 1;
             }
         }
@@ -335,7 +335,10 @@ fn system_doctor(_caller: u32) -> Result<()> {
     if let Ok(entries) = fs::read_dir(&transactions) {
         for entry in entries {
             let path = entry?.path();
-            if path.extension().is_some_and(|extension| extension == "toml") {
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "toml")
+            {
                 report.lines.push(format!(
                     "warning: unfinished package transaction: {}",
                     path.display()

@@ -19,9 +19,9 @@ pub use manifest::{
 };
 pub use planning::{
     InstallReason, ManagedPackage, PackageAvailability, PackageBackend, PackagePlan,
-    PackagePlanPreview, PackageReference, PackageReplacement, Requirement, SystemDoctorReport, SystemPackageState, UserRecord,
-    aggregate_packages, aggregate_requirements, expand_exec, install_plan, packages_for_state,
-    prunable,
+    PackagePlanPreview, PackageReference, PackageReplacement, Requirement, SystemDoctorReport,
+    SystemPackageState, UserRecord, aggregate_packages, aggregate_requirements, expand_exec,
+    install_plan, packages_for_state, prunable,
 };
 pub use state::{
     UserState, atomic_write, managed_links_path, parse_state_text, read_state,
