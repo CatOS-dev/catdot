@@ -3,7 +3,8 @@
 Catdot is CatOS's Rust desktop Profile manager. Profiles installed beneath
 `/usr/share/catdot/profiles` define components, their safe user-configuration
 links, argv-based launch commands, and package requirements. This repository
-ships supported Niri and Sway profiles, plus a Graphite GTK/Qt theme profile.
+ships only the `catos-default` GTK/Qt appearance profile. Desktop profiles are
+provided by their respective CatOS profile packages.
 
 ```toml
 schema = 1
@@ -65,4 +66,6 @@ concrete component references; prune only attempts Catdot-installed,
 unreferenced dependency packages and lets libalpm validate the removal
 transaction.
 
-Build an installable local Arch package with `cd packaging && makepkg -fs`.
+Run `packaging/verify-local-source.sh` to build from a clean temporary source
+tree and verify the staged package contents. The release PKGBUILD consumes a
+tagged source archive.
