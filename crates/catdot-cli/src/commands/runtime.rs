@@ -103,7 +103,11 @@ pub(super) fn apply(
     let home = home()?;
     let registry = managed_links_path(&state_file()?)?;
     let xdg = xdg_config_home(&home);
+    if !xdg.exists() {
+        std::fs::create_dir_all(&xdg)?;
+    }
     let mut links = LinkTransaction::new(&registry)?;
+    links.confine_targets_to(&[home.clone(), xdg.clone()])?;
     let desired = if let Some(role) = adopt {
         let (profile, component, _) = component_for(profiles, state, role)?;
         component

@@ -655,6 +655,33 @@ fn reconciliation_keeps_unchanged_links_in_place() {
 }
 
 #[test]
+fn confined_link_targets_reject_symlink_escapes_but_allow_nested_directories() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().join("config");
+    let outside = directory.path().join("outside");
+    let source = directory.path().join("source");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(&source, "config").unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("escaped")).unwrap();
+
+    let registry = directory.path().join("managed-links.toml");
+    let mut escaped = LinkTransaction::new(&registry).unwrap();
+    escaped.confine_targets_to(std::slice::from_ref(&root)).unwrap();
+    assert!(escaped
+        .stage(&source, &root.join("escaped/config"), false)
+        .is_err());
+
+    let mut nested = LinkTransaction::new(&registry).unwrap();
+    nested.confine_targets_to(std::slice::from_ref(&root)).unwrap();
+    nested
+        .stage(&source, &root.join("normal/nested/config"), false)
+        .unwrap();
+    nested.commit().unwrap();
+    assert_eq!(fs::read_link(root.join("normal/nested/config")).unwrap(), source);
+}
+
+#[test]
 fn shipped_niri_and_sway_profiles_are_valid_and_selectable() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../profiles");
     let profiles = discover_profiles(&root).unwrap();

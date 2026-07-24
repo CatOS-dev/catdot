@@ -39,6 +39,7 @@ pub fn user_home(uid: u32) -> Result<PathBuf> {
 }
 
 pub fn read_trusted_user_state(uid: u32, path: &Path) -> Result<catdot_core::UserState> {
+    const MAX_STATE_BYTES: u64 = 1024 * 1024;
     if !path.is_absolute() {
         bail!("state path must be absolute")
     }
@@ -52,6 +53,9 @@ pub fn read_trusted_user_state(uid: u32, path: &Path) -> Result<catdot_core::Use
         .with_context(|| format!("inspect state file {}", path.display()))?;
     if !metadata.is_file() || metadata.uid() != uid {
         bail!("state path must be a regular file owned by uid {uid}")
+    }
+    if metadata.len() > MAX_STATE_BYTES {
+        bail!("state file exceeds the {MAX_STATE_BYTES}-byte limit")
     }
     let mut text = String::new();
     file.read_to_string(&mut text)
@@ -78,5 +82,14 @@ mod tests {
         let symlink = directory.path().join("state-link.toml");
         std::os::unix::fs::symlink(&state, &symlink).unwrap();
         assert!(read_trusted_user_state(uid, &symlink).is_err());
+    }
+
+    #[test]
+    fn state_file_has_a_size_limit() {
+        let directory = tempdir().unwrap();
+        let state = directory.path().join("state.toml");
+        fs::write(&state, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        let uid = fs::metadata(&state).unwrap().uid();
+        assert!(read_trusted_user_state(uid, &state).is_err());
     }
 }

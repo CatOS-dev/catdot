@@ -119,14 +119,20 @@ pub(super) fn finalize(uid: u32, generation: u64, state_path: &Path) -> Result<(
 
 fn prepare(uid: u32, generation: u64, state_path: &Path, optional: bool) -> Result<ResolveContext> {
     let profiles = discover_profile_registry(Path::new(DEFAULT_PROFILE_ROOT))?.valid_profiles;
+    let database = Path::new(DB);
+    let existing_records = load_records(database)?;
+    if let Some(record) = existing_records.iter().find(|record| record.uid == uid)
+        && record.state_path != state_path
+    {
+        bail!("state path does not match the path registered for uid {uid}")
+    }
     let state = read_trusted_user_state(uid, state_path)?;
     validate_user_state(&state, &profiles)?;
     if state.generation != generation {
         bail!("state changed; run catdot resolve again")
     }
     let record = UserRecord::from_state(uid, state_path, &state, &profiles, optional)?;
-    let database = Path::new(DB);
-    let mut records = valid_records(load_records(database)?, |record_uid| {
+    let mut records = valid_records(existing_records, |record_uid| {
         user_home(record_uid).is_ok()
     });
     replace_record(&mut records, record.clone());

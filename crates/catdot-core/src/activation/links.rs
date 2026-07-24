@@ -2,7 +2,9 @@ use crate::{Error, Result, atomic_write, error::io};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
+    ffi::CString,
     fs,
+    os::{fd::{AsRawFd, FromRawFd, OwnedFd}, unix::ffi::OsStrExt},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -53,6 +55,7 @@ pub struct LinkTransaction {
     desired: BTreeMap<String, DesiredLink>,
     changes: Vec<LinkChange>,
     reconcile: bool,
+    trusted_roots: Vec<PathBuf>,
 }
 
 struct DesiredLink {
@@ -82,6 +85,7 @@ impl LinkTransaction {
             desired: BTreeMap::new(),
             changes: vec![],
             reconcile: false,
+            trusted_roots: vec![],
         })
     }
 
@@ -97,6 +101,9 @@ impl LinkTransaction {
                 "link target must be absolute: {}",
                 target.display()
             )));
+        }
+        if !self.trusted_roots.is_empty() {
+            validate_confined_parent(target, &self.trusted_roots)?;
         }
         let key = target.display().to_string();
         if self.desired.contains_key(&key) {
@@ -118,6 +125,14 @@ impl LinkTransaction {
 
     pub fn reconcile(&mut self) {
         self.reconcile = true;
+    }
+
+    pub fn confine_targets_to(&mut self, roots: &[PathBuf]) -> Result<()> {
+        if roots.is_empty() || roots.iter().any(|root| !root.is_absolute() || !root.is_dir()) {
+            return Err(Error::Message("trusted link roots must be existing absolute directories".into()));
+        }
+        self.trusted_roots = roots.to_vec();
+        Ok(())
     }
 
     pub fn expected_registry_contents(&self) -> Result<String> {
@@ -321,4 +336,91 @@ fn backup_path(target: &Path) -> Result<PathBuf> {
         "{name}.catdot-backup-{stamp}-{}",
         std::process::id()
     )))
+}
+
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+const RESOLVE_BENEATH: u64 = 0x08;
+
+fn validate_confined_parent(target: &Path, roots: &[PathBuf]) -> Result<()> {
+    let root = roots
+        .iter()
+        .filter(|root| target.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .ok_or_else(|| Error::Message(format!("link target escapes trusted roots: {}", target.display())))?;
+    let relative = target.strip_prefix(root).map_err(|_| Error::Message("invalid link target".into()))?;
+    let parent = relative.parent().ok_or_else(|| Error::Message("link target has no parent".into()))?;
+    let mut directory = open_root(root)?;
+    for component in parent.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(Error::Message("link target contains an unsafe path component".into()));
+        };
+        directory = open_or_create_directory(directory, name)?;
+    }
+    Ok(())
+}
+
+fn open_root(path: &Path) -> Result<OwnedFd> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| Error::Message("trusted root contains NUL".into()))?;
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(Error::Io {
+            path: path.to_string_lossy().into_owned(),
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn open_or_create_directory(parent: OwnedFd, name: &std::ffi::OsStr) -> Result<OwnedFd> {
+    match open_beneath(&parent, name) {
+        Ok(directory) => Ok(directory),
+        Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            let c_name = CString::new(name.as_bytes())
+                .map_err(|_| Error::Message("link target contains NUL".into()))?;
+            if unsafe { libc::mkdirat(parent.as_raw_fd(), c_name.as_ptr(), 0o700) } != 0
+                && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
+            {
+                return Err(Error::Io {
+                    path: c_name.to_string_lossy().into_owned(),
+                    source: std::io::Error::last_os_error(),
+                });
+            }
+            open_beneath(&parent, name)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn open_beneath(parent: &OwnedFd, name: &std::ffi::OsStr) -> Result<OwnedFd> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| Error::Message("link target contains NUL".into()))?;
+    let how = OpenHow {
+        flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+    };
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &how,
+            std::mem::size_of::<OpenHow>(),
+        )
+    } as i32;
+    if fd < 0 {
+        return Err(Error::Io {
+            path: name.to_string_lossy().into_owned(),
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }

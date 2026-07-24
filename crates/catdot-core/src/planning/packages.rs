@@ -51,6 +51,14 @@ pub fn expand_exec(
                 .replace("{xdg_config_home}", xdg_config_home)
         })
         .collect::<Vec<_>>();
+    let executable = argv
+        .first()
+        .ok_or_else(|| Error::Message(format!("component {id} has no exec command")))?;
+    if executable.is_empty() || executable.contains('\0') {
+        return Err(Error::Message(format!(
+            "component {id} has an invalid executable"
+        )));
+    }
     argv.extend_from_slice(extra);
     Ok(argv)
 }
