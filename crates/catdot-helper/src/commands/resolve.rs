@@ -56,7 +56,6 @@ pub(super) fn apply(
     if context.plan.digest() != digest {
         bail!("plan changed; run catdot resolve again")
     }
-    let expected_packages = planned_package_state(database, &context.records, &context.plan)?;
     let transaction_packages = context.plan.install.iter().cloned().collect();
     let previously_present = context
         .plan
@@ -64,7 +63,9 @@ pub(super) fn apply(
         .iter()
         .filter(|name| handle.localdb().pkg(name.as_str()).is_ok())
         .cloned()
-        .collect();
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected_packages =
+        planned_package_state(database, &context.records, &context.plan, &handle)?;
     let mut journal = PackageJournal::prepared(
         database,
         &context.plan,
@@ -73,13 +74,13 @@ pub(super) fn apply(
             generation,
             direct_requirements: context.record.pending_requirements.clone(),
             transaction_packages,
-            previously_present,
+            previously_present: previously_present.clone(),
             expected_record: context.record.clone(),
             expected_packages,
         },
     )?;
     journal.verify(uid, generation, digest)?;
-    install_with_alpm(&mut handle, &context.plan)?;
+    install_with_alpm(&mut handle, &context.plan, &previously_present)?;
     journal.mark_alpm_committed()?;
     commit_records(
         database,
@@ -185,6 +186,7 @@ fn planned_package_state(
     database: &Path,
     records: &[UserRecord],
     plan: &PackagePlan,
+    handle: &alpm::Alpm,
 ) -> Result<SystemPackageState> {
     let mut state = read_system_packages(&database.join("packages.toml"))?;
     let requirements = aggregate_requirements(records);
@@ -192,17 +194,20 @@ fn planned_package_state(
     let mut packages = BTreeMap::new();
     for (name, requirement) in requirements {
         let prior = previous.get(&name);
+        let existing = handle.localdb().pkg(name.as_str()).ok();
+        let newly_introduced = plan.install.contains(&name) && existing.is_none();
         packages.insert(
             name.clone(),
             ManagedPackage {
                 name: name.clone(),
                 catdot_installed: prior.is_some_and(|package| package.catdot_installed)
-                    || plan.install.contains(&name),
+                    || newly_introduced,
                 was_missing_before_catdot: prior
                     .is_some_and(|package| package.was_missing_before_catdot)
-                    || plan.install.contains(&name),
+                    || newly_introduced,
                 install_reason: prior
                     .map(|package| package.install_reason.clone())
+                    .or_else(|| existing.map(package_reason))
                     .unwrap_or(InstallReason::Dependency),
                 introduced_by_transaction: prior
                     .and_then(|package| package.introduced_by_transaction.clone()),
@@ -211,13 +216,17 @@ fn planned_package_state(
         );
     }
     for name in &plan.install {
+        let existing = handle.localdb().pkg(name.as_str()).ok();
+        let newly_introduced = existing.is_none();
         packages
             .entry(name.clone())
             .or_insert_with(|| ManagedPackage {
                 name: name.clone(),
-                catdot_installed: true,
-                was_missing_before_catdot: true,
-                install_reason: InstallReason::Dependency,
+                catdot_installed: newly_introduced,
+                was_missing_before_catdot: newly_introduced,
+                install_reason: existing
+                    .map(package_reason)
+                    .unwrap_or(InstallReason::Dependency),
                 introduced_by_transaction: None,
                 references: vec![],
             });
@@ -232,4 +241,11 @@ fn planned_package_state(
     }
     state.packages = packages;
     Ok(state)
+}
+
+fn package_reason(package: &alpm::Package) -> InstallReason {
+    match package.reason() {
+        alpm::PackageReason::Explicit => InstallReason::Explicit,
+        alpm::PackageReason::Depend => InstallReason::Dependency,
+    }
 }

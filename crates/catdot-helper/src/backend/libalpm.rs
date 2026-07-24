@@ -398,7 +398,11 @@ impl PackageBackend for AlpmQuery<'_> {
         Ok(removable_with_alpm(self.0, package))
     }
 }
-pub fn install_with_alpm(handle: &mut Alpm, plan: &PackagePlan) -> Result<()> {
+pub fn install_with_alpm(
+    handle: &mut Alpm,
+    plan: &PackagePlan,
+    previously_present: &BTreeSet<String>,
+) -> Result<()> {
     if plan.install.is_empty() {
         return Ok(());
     }
@@ -413,6 +417,9 @@ pub fn install_with_alpm(handle: &mut Alpm, plan: &PackagePlan) -> Result<()> {
         return Err(commit_error(error));
     }
     for name in &plan.install {
+        if previously_present.contains(name) {
+            continue;
+        }
         handle
             .localdb()
             .pkg(name.as_str())
