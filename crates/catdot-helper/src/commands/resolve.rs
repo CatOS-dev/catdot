@@ -1,10 +1,10 @@
+use super::package_journal::{
+    PackageJournal, PreparedTransaction, commit_records, recover_pending,
+};
 use crate::{
     auth::{caller_uid, read_trusted_user_state, user_home},
     backend::{install_with_alpm, open_handle, prepared_install_plan, satisfier_name},
     system::{load_records, replace_record, user_record_path, valid_records},
-};
-use super::package_journal::{
-    PackageJournal, PreparedTransaction, commit_records, recover_pending,
 };
 use anyhow::{Result, bail};
 use catdot_core::*;
@@ -79,7 +79,11 @@ pub(super) fn apply(
     journal.verify(uid, generation, digest)?;
     install_with_alpm(&mut handle, &context.plan.install)?;
     journal.mark_alpm_committed()?;
-    commit_records(database, journal.expected_packages(), journal.expected_record())?;
+    commit_records(
+        database,
+        journal.expected_packages(),
+        journal.expected_record(),
+    )?;
     journal.mark_records_committed()?;
     journal.complete()?;
     Ok(())
@@ -188,14 +192,16 @@ fn planned_package_state(
         );
     }
     for name in &plan.install {
-        packages.entry(name.clone()).or_insert_with(|| ManagedPackage {
-            name: name.clone(),
-            catdot_installed: true,
-            was_missing_before_catdot: true,
-            install_reason: InstallReason::Dependency,
-            introduced_by_transaction: None,
-            references: vec![],
-        });
+        packages
+            .entry(name.clone())
+            .or_insert_with(|| ManagedPackage {
+                name: name.clone(),
+                catdot_installed: true,
+                was_missing_before_catdot: true,
+                install_reason: InstallReason::Dependency,
+                introduced_by_transaction: None,
+                references: vec![],
+            });
     }
     for (name, package) in previous {
         if package.catdot_installed && !packages.contains_key(&name) {

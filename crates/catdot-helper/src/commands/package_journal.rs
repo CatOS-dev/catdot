@@ -130,7 +130,9 @@ where
     if !directory.exists() {
         return Ok(());
     }
-    for entry in fs::read_dir(&directory).with_context(|| format!("read {}", directory.display()))? {
+    for entry in
+        fs::read_dir(&directory).with_context(|| format!("read {}", directory.display()))?
+    {
         let path = entry?.path();
         if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
             continue;
@@ -142,11 +144,9 @@ where
         journal.path = path;
         match journal.stage {
             JournalStage::Prepared => {
-                if journal
-                    .transaction_packages
-                    .iter()
-                    .any(|package| !journal.previously_present.contains(package) && package_present(package))
-                {
+                if journal.transaction_packages.iter().any(|package| {
+                    !journal.previously_present.contains(package) && package_present(package)
+                }) {
                     bail!(
                         "prepared package journal {} has an uncertain ALPM result",
                         journal.id
@@ -160,9 +160,16 @@ where
                     .iter()
                     .any(|package| !package_present(package))
                 {
-                    bail!("committed package journal {} is missing installed packages", journal.id)
+                    bail!(
+                        "committed package journal {} is missing installed packages",
+                        journal.id
+                    )
                 }
-                commit_records(database, &journal.expected_packages, &journal.expected_record)?;
+                commit_records(
+                    database,
+                    &journal.expected_packages,
+                    &journal.expected_record,
+                )?;
                 journal.mark_records_committed()?;
                 journal.complete()?;
             }
@@ -206,10 +213,12 @@ fn sync_directory(directory: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{PackageJournal, PreparedTransaction, recover_pending};
-    use catdot_core::{
-        InstallReason, ManagedPackage, PackagePlan, SystemPackageState, UserRecord,
+    use catdot_core::{InstallReason, ManagedPackage, PackagePlan, SystemPackageState, UserRecord};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs,
+        path::PathBuf,
     };
-    use std::{collections::{BTreeMap, BTreeSet}, fs, path::PathBuf};
     use tempfile::tempdir;
 
     fn record() -> UserRecord {
@@ -274,7 +283,12 @@ mod tests {
 
         assert!(directory.path().join("packages.toml").exists());
         assert!(directory.path().join("users/1000.toml").exists());
-        assert_eq!(fs::read_dir(directory.path().join("transactions")).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(directory.path().join("transactions"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -297,7 +311,12 @@ mod tests {
 
         recover_pending(directory.path(), |_| false).unwrap();
 
-        assert_eq!(fs::read_dir(directory.path().join("transactions")).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(directory.path().join("transactions"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]

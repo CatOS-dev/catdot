@@ -6,8 +6,8 @@ use catdot_core::*;
 use clap::{Parser, Subcommand};
 use std::{fs, path::PathBuf};
 
-mod resolve;
 mod package_journal;
+mod resolve;
 
 use package_journal::recover_pending;
 
