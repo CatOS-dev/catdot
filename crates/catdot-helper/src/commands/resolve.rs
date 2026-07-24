@@ -16,6 +16,7 @@ struct ResolveContext {
     record: UserRecord,
     records: Vec<UserRecord>,
     plan: PackagePlan,
+    system_update_required: bool,
 }
 
 pub(super) fn print_plan(
@@ -24,16 +25,11 @@ pub(super) fn print_plan(
     state_path: &Path,
     optional: bool,
 ) -> Result<()> {
-    ensure_system_database(Path::new(DB))?;
-    let _lock = if unsafe { libc::geteuid() } == 0 {
-        Some(lock(&Path::new(DB).join("lock"))?)
-    } else {
-        None
-    };
     let context = prepare(uid, generation, state_path, optional)?;
     let preview = PackagePlanPreview {
         plan: context.plan,
         requirements: aggregate_requirements(&context.records),
+        system_update_required: context.system_update_required,
     };
     print!("{}", toml::to_string(&preview)?);
     Ok(())
@@ -137,7 +133,8 @@ fn prepare(uid: u32, generation: u64, state_path: &Path, optional: bool) -> Resu
     let profiles = discover_profile_registry(Path::new(DEFAULT_PROFILE_ROOT))?.valid_profiles;
     let database = Path::new(DB);
     let existing_records = load_records(database)?;
-    if let Some(record) = existing_records.iter().find(|record| record.uid == uid)
+    let existing_record = existing_records.iter().find(|record| record.uid == uid).cloned();
+    if let Some(record) = existing_record.as_ref()
         && record.state_path != state_path
     {
         bail!("state path does not match the path registered for uid {uid}")
@@ -159,10 +156,12 @@ fn prepare(uid: u32, generation: u64, state_path: &Path, optional: bool) -> Resu
         .expect("current user record was inserted");
     let packages = aggregate_packages(&records);
     let plan = prepared_install_plan(&mut handle, &packages)?;
+    let system_update_required = existing_record.as_ref() != Some(&record);
     Ok(ResolveContext {
         record,
         records,
         plan,
+        system_update_required,
     })
 }
 

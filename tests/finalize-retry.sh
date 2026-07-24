@@ -10,6 +10,7 @@ podman run --rm --security-opt label=disable \
     pacman -Sy --noconfirm
     install -Dm755 /catdot-bin/catdot /usr/bin/catdot
     install -Dm755 /catdot-bin/catdot-helper /usr/lib/catdot/catdot-helper
+    install -Dm755 /catdot-bin/catdot-query-helper /usr/lib/catdot/catdot-query-helper
     install -d /usr/share/catdot/profiles/bash-test/component
     cat > /usr/share/catdot/profiles/bash-test/profile.toml <<"EOF"
 schema = 1

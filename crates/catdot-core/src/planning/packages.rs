@@ -77,7 +77,7 @@ pub fn packages_for_state(
     }
     Ok(packages)
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct UserRecord {
     pub uid: u32,
@@ -164,6 +164,8 @@ pub struct SystemDoctorReport {
 pub struct PackagePlanPreview {
     pub plan: PackagePlan,
     pub requirements: BTreeMap<String, Requirement>,
+    #[serde(default)]
+    pub system_update_required: bool,
 }
 pub fn aggregate_requirements(records: &[UserRecord]) -> BTreeMap<String, Requirement> {
     let mut requirements = BTreeMap::new();

@@ -10,6 +10,10 @@ repository.workspace = true
 name = "catdot-helper"
 path = "src/main.rs"
 
+[[bin]]
+name = "catdot-query-helper"
+path = "src/query_main.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

@@ -1,10 +1,8 @@
-use crate::auth::{caller_uid, read_trusted_user_state, user_home};
+use crate::{HelperMode, auth::{caller_uid, read_trusted_user_state, user_home}};
 use crate::backend::{
     hold_packages, open_handle, prepared_removal_plan, removable_with_alpm, remove_with_alpm,
 };
-use crate::system::{
-    ensure_system_database, load_records, user_record_path, valid_records, write_system_file,
-};
+use crate::system::{load_records, user_record_path, valid_records, write_system_file};
 use anyhow::{Result, bail};
 use catdot_core::*;
 use clap::{Parser, Subcommand};
@@ -82,11 +80,12 @@ enum Cmd {
         uid: u32,
     },
 }
-pub fn run() -> Result<()> {
+pub fn run(mode: HelperMode) -> Result<()> {
     if unsafe { libc::geteuid() } == 0 {
         unsafe { libc::umask(0o022) };
     }
     let cli = Cli::parse();
+    validate_mode(mode, &cli.command)?;
     match cli.command {
         Cmd::ResolvePlan {
             uid,
@@ -95,11 +94,13 @@ pub fn run() -> Result<()> {
             with_optional,
             ..
         } => {
-            authorize_plan_caller(uid)?;
+            require_root()?;
+            caller_uid(uid)?;
             resolve::print_plan(uid, generation, &state_path, with_optional)
         }
         Cmd::PrunePlan { uid } => {
-            authorize_plan_caller(uid)?;
+            require_root()?;
+            caller_uid(uid)?;
             print_prune_plan(uid)
         }
         Cmd::UsersPrune => {
@@ -149,26 +150,26 @@ pub fn run() -> Result<()> {
     }
 }
 
+
+fn validate_mode(mode: HelperMode, command: &Cmd) -> Result<()> {
+    let query = matches!(
+        command,
+        Cmd::ResolvePlan { .. }
+            | Cmd::PrunePlan { .. }
+            | Cmd::UsersPrunePlan
+            | Cmd::UsersList { .. }
+            | Cmd::DoctorSystem { .. }
+    );
+    match (mode, query) {
+        (HelperMode::Query, true) | (HelperMode::Manage, false) => Ok(()),
+        (HelperMode::Query, false) => bail!("query helper refuses mutating operations"),
+        (HelperMode::Manage, true) => bail!("manage helper refuses read-only operations"),
+    }
+}
+
 fn require_root() -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         bail!("catdot-helper must run as root for this operation")
-    }
-    Ok(())
-}
-
-fn authorize_plan_caller(uid: u32) -> Result<()> {
-    let effective_uid = unsafe { libc::geteuid() };
-    if effective_uid == 0 {
-        caller_uid(uid)?;
-    } else {
-        direct_plan_uid(effective_uid, uid)?;
-    }
-    Ok(())
-}
-
-fn direct_plan_uid(effective_uid: u32, uid: u32) -> Result<()> {
-    if effective_uid != uid {
-        bail!("read-only plan uid does not match the calling user")
     }
     Ok(())
 }
@@ -201,17 +202,37 @@ fn prune(uid: u32, _generation: u64, digest: &str) -> Result<()> {
 }
 
 fn print_prune_plan(_uid: u32) -> Result<()> {
-    let _lock = if unsafe { libc::geteuid() } == 0 {
-        Some(lock(&PathBuf::from(DB).join("lock"))?)
-    } else {
-        None
-    };
     let database = PathBuf::from(DB);
     let state = read_system_packages(&database.join("packages.toml"))?;
     let mut handle = open_handle()?;
     let plan = canonical_prune_plan(&mut handle, &state)?;
-    print!("{}", toml::to_string(&plan)?);
+    let preview = PackagePlanPreview {
+        plan,
+        requirements: std::collections::BTreeMap::new(),
+        system_update_required: has_pending_transactions(&database)?,
+    };
+    print!("{}", toml::to_string(&preview)?);
     Ok(())
+}
+
+fn has_pending_transactions(database: &std::path::Path) -> Result<bool> {
+    let directory = database.join("transactions");
+    match fs::read_dir(&directory) {
+        Ok(entries) => {
+            for entry in entries {
+                if entry?
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "toml")
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn canonical_prune_plan(
@@ -267,8 +288,6 @@ fn canonical_prune_plan(
 
 fn system_doctor(_caller: u32) -> Result<()> {
     let database = PathBuf::from(DB);
-    ensure_system_database(&database)?;
-    let _lock = lock(&database.join("lock"))?;
     let handle = open_handle()?;
     let records = load_records(&database)?;
     let mut report = SystemDoctorReport::default();
@@ -389,7 +408,6 @@ fn users_prune(_caller: u32) -> Result<()> {
 }
 
 fn users_prune_plan(_caller: u32) -> Result<()> {
-    let _lock = lock(&PathBuf::from(DB).join("lock"))?;
     let stale = stale_user_record_uids()?;
     if stale.is_empty() {
         println!("No stale user records.");
@@ -428,7 +446,12 @@ fn refresh_package_references(database: &std::path::Path) -> Result<()> {
     Ok(())
 }
 fn users_list(_caller: u32) -> Result<()> {
-    for record in load_records(std::path::Path::new(DB))? {
+    let records = load_records(std::path::Path::new(DB))?;
+    if records.is_empty() {
+        println!("No Catdot user records.");
+        return Ok(());
+    }
+    for record in records {
         let status = if user_home(record.uid).is_ok() {
             "valid"
         } else {
@@ -441,11 +464,31 @@ fn users_list(_caller: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::direct_plan_uid;
+    use super::{Cmd, validate_mode};
+    use crate::HelperMode;
+    use std::path::PathBuf;
 
     #[test]
-    fn nonprivileged_plan_requires_the_callers_own_uid() {
-        assert!(direct_plan_uid(1000, 1000).is_ok());
-        assert!(direct_plan_uid(1000, 1001).is_err());
+    fn query_and_manage_helpers_reject_the_other_mode() {
+        let query = Cmd::PrunePlan { uid: 1000 };
+        let manage = Cmd::Prune {
+            uid: 1000,
+            generation: 0,
+            digest: "digest".into(),
+            without_optional: true,
+        };
+        assert!(validate_mode(HelperMode::Query, &query).is_ok());
+        assert!(validate_mode(HelperMode::Manage, &manage).is_ok());
+        assert!(validate_mode(HelperMode::Manage, &query).is_err());
+        assert!(validate_mode(HelperMode::Query, &manage).is_err());
+
+        let resolve = Cmd::ResolvePlan {
+            uid: 1000,
+            generation: 1,
+            state_path: PathBuf::from("/home/test/state.toml"),
+            with_optional: false,
+            without_optional: true,
+        };
+        assert!(validate_mode(HelperMode::Query, &resolve).is_ok());
     }
 }

@@ -1,3 +1,3 @@
 fn main() -> anyhow::Result<()> {
-    catdot_helper::run_manage()
+    catdot_helper::run_query()
 }

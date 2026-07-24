@@ -8,6 +8,7 @@ podman run --rm --security-opt label=disable \
     pacman -Sy --noconfirm jq wget tree
     install -Dm755 /catdot-bin/catdot /usr/bin/catdot
     install -Dm755 /catdot-bin/catdot-helper /usr/lib/catdot/catdot-helper
+    install -Dm755 /catdot-bin/catdot-query-helper /usr/lib/catdot/catdot-query-helper
     install -d /usr/share/catdot/profiles/empty/component
     cat >/usr/share/catdot/profiles/empty/profile.toml <<"P"
 schema = 1

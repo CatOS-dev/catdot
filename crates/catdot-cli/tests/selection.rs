@@ -267,7 +267,7 @@ fn select_reports_missing_packages_and_the_resolve_command() {
     assert!(stdout.contains("Selected desired launcher: demo/launcher"));
     assert!(stdout.contains("Active launcher remains: none"));
     assert!(stdout.contains("Missing packages:\n  catdot-test-package-that-is-not-installed"));
-    assert!(stdout.contains("Run:\n  catdot resolve"));
+    assert_eq!(stdout.matches("catdot resolve").count(), 1);
 }
 
 #[test]
@@ -364,4 +364,59 @@ fn doctor_uses_zero_for_healthy_state_and_two_for_broken_state() {
         .unwrap();
     assert_eq!(broken.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&broken.stdout).contains("error: broken state"));
+}
+
+#[test]
+fn help_explains_commands_and_both_selection_forms() {
+    let binary = env!("CARGO_BIN_EXE_catdot");
+    let help = Command::new(binary).arg("--help").output().unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("List installed profiles"));
+    assert!(help.contains("Show selected and active components"));
+    assert!(help.contains("Diagnose user and system state"));
+
+    let select = Command::new(binary)
+        .args(["select", "--help"])
+        .output()
+        .unwrap();
+    assert!(select.status.success());
+    let select = String::from_utf8(select.stdout).unwrap();
+    assert!(select.contains("catdot select <PROFILE>"));
+    assert!(select.contains("catdot select <ROLE> <PROFILE/COMPONENT>"));
+    assert!(!select.contains("<FIRST>"));
+}
+
+#[test]
+fn empty_state_outputs_are_actionable() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    write_profile(root.path(), "demo", "terminal", "terminal");
+    let binary = env!("CARGO_BIN_EXE_catdot");
+
+    let current = Command::new(binary)
+        .arg("current")
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .unwrap();
+    assert!(current.status.success());
+    let current = String::from_utf8(current.stdout).unwrap();
+    assert!(current.contains("No profile components are selected."));
+    assert!(current.contains("catdot list"));
+
+    let doctor = Command::new(binary)
+        .arg("doctor")
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .unwrap();
+    assert_eq!(doctor.status.code(), Some(0));
+    assert!(
+        String::from_utf8(doctor.stdout)
+            .unwrap()
+            .contains("ok: Catdot is healthy; no profile components are selected")
+    );
 }

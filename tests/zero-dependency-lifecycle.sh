@@ -10,6 +10,7 @@ podman run --rm --security-opt label=disable \
     pacman -Sy --noconfirm
     install -Dm755 /catdot-bin/catdot /usr/bin/catdot
     install -Dm755 /catdot-bin/catdot-helper /usr/lib/catdot/catdot-helper
+    install -Dm755 /catdot-bin/catdot-query-helper /usr/lib/catdot/catdot-query-helper
     install -d /usr/share/catdot/profiles/lifecycle/{one,two,gtk,qt}
     cat > /usr/share/catdot/profiles/lifecycle/profile.toml <<"EOF"
 schema = 1
@@ -72,8 +73,15 @@ EOF
     alice="HOME=/home/alice XDG_STATE_HOME=/home/alice/.local/state XDG_CONFIG_HOME=/home/alice/.config"
     bob="HOME=/home/bob XDG_STATE_HOME=/home/bob/.local/state XDG_CONFIG_HOME=/home/bob/.config"
 
-    runuser -u alice -- env $alice catdot select lifecycle
-    runuser -u alice -- env $alice catdot resolve --yes
+    select_output=$(runuser -u alice -- env $alice catdot select lifecycle)
+    printf "%s\n" "$select_output"
+    test "$(printf "%s\n" "$select_output" | grep -c "catdot resolve")" -eq 1
+    resolve_output=$(runuser -u alice -- env $alice catdot resolve --yes)
+    printf "%s\n" "$resolve_output"
+    printf "%s\n" "$resolve_output" | grep -F "No package changes are required."
+    printf "%s\n" "$resolve_output" | grep -F "Activate:"
+    printf "%s\n" "$resolve_output" | grep -F "Profile changes applied successfully."
+    runuser -u alice -- env $alice catdot resolve --yes | grep -F "Catdot is already up to date."
     runuser -u alice -- env $alice catdot exec tool | grep -Fx one
     grep -F "gtk-theme-name=Test-Gtk" /home/alice/.config/gtk-3.0/settings.ini
     grep -F "style=kvantum" /home/alice/.config/qt5ct/qt5ct.conf
@@ -85,6 +93,7 @@ EOF
     runuser -u alice -- env $alice catdot resolve --yes
     ! runuser -u alice -- env $alice catdot exec tool
     runuser -u alice -- env $alice catdot doctor
+    runuser -u alice -- env $alice catdot prune --yes | grep -F "Nothing to prune."
     runuser -u alice -- env $alice catdot users list | grep -F "uid 1000: valid"
 
     userdel alice
