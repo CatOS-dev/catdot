@@ -354,24 +354,7 @@ fn print_activation_plan(
             println!("  xdg restore: {association}");
         }
     }
-    let configuration_changes = plan
-        .entries
-        .iter()
-        .any(|entry| match &entry.materialization {
-            Materialization::Generate { contents } => {
-                std::fs::read(&entry.target).map_or(true, |existing| existing != *contents)
-            }
-            Materialization::Symlink { source } => {
-                std::fs::read_link(&entry.target).map_or(true, |existing| existing != *source)
-            }
-            Materialization::File { .. } => !entry.target.exists(),
-            Materialization::User {
-                release_managed,
-                initialized,
-                ..
-            } => *release_managed || (!*initialized && !entry.target.exists()),
-        })
-        || plan.removals.iter().any(|target| target.exists());
+    let configuration_changes = plan.has_changes();
     let selection_changes = !activate.is_empty() || !change.is_empty() || !deactivate.is_empty();
     let xdg_changes = xdg_plan.has_changes();
     Ok(ActivationPreview {
@@ -885,6 +868,7 @@ pub fn run() -> Result<i32> {
                 let activation_inputs_changed = activation_inputs != state.activation_digests;
                 let package_inputs_changed = package_inputs != state.active_package_digests;
                 let state_commit_needed = selection_changes
+                    || preview.activation.changes
                     || activation_inputs_changed
                     || package_inputs_changed
                     || state.needs_resolve;
@@ -902,7 +886,7 @@ pub fn run() -> Result<i32> {
                     let mut journal =
                         ActivationJournal::begin(&path, old_state.clone(), new_state.clone())?;
                     journal.mark_applying()?;
-                    if selection_changes || activation_inputs_changed {
+                    if preview.activation.changes || activation_inputs_changed {
                         let applied = activate_configuration(
                             &configuration_plan,
                             &registry_path,
@@ -1069,25 +1053,50 @@ pub fn run() -> Result<i32> {
                     warnings = true;
                 }
             }
-            for role in state.components.keys() {
-                match component_for(ps, &state, role) {
-                    Ok((_p, c, r)) => {
-                        let m: Vec<_> = c
-                            .packages
-                            .iter()
-                            .filter(|x| !package_present(x))
-                            .map(|x| x.as_str())
-                            .collect();
-                        if m.is_empty() {
-                            println!("ok: {role} = {r}")
-                        } else {
-                            println!("error: unresolved: {role} = {r}; missing {}", m.join(", "));
+            let pending_components = state.components != state.active_components;
+            let mut inspected = Vec::new();
+            if pending_components {
+                let mut active = state.clone();
+                active.components = active.active_components.clone();
+                inspected.push(("active", active));
+                inspected.push(("desired", state.clone()));
+            } else {
+                inspected.push(("", state.clone()));
+            }
+            for (label, inspected_state) in inspected {
+                for role in inspected_state.components.keys() {
+                    match component_for(ps, &inspected_state, role) {
+                        Ok((_profile, component, reference)) => {
+                            let missing: Vec<_> = component
+                                .packages
+                                .iter()
+                                .filter(|package| !package_present(package))
+                                .map(String::as_str)
+                                .collect();
+                            let prefix = if label.is_empty() {
+                                String::new()
+                            } else {
+                                format!("{label} ")
+                            };
+                            if missing.is_empty() {
+                                println!("ok: {prefix}{role} = {reference}")
+                            } else {
+                                println!(
+                                    "error: unresolved {prefix}{role} = {reference}; missing {}",
+                                    missing.join(", ")
+                                );
+                                errors = true;
+                            }
+                        }
+                        Err(error) => {
+                            let prefix = if label.is_empty() {
+                                String::new()
+                            } else {
+                                format!("{label} ")
+                            };
+                            println!("error: broken {prefix}{role}: {error}");
                             errors = true;
                         }
-                    }
-                    Err(e) => {
-                        println!("error: broken: {role}: {e}");
-                        errors = true;
                     }
                 }
             }

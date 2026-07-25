@@ -986,3 +986,118 @@ fn resolve_clears_needs_resolve_without_a_selection_change() {
     assert!(state.contains("needs_resolve = false"));
     assert!(!state.contains("tool = \"old\""));
 }
+
+// Resolve is not only a selection transition: when it displays and confirms a
+// damaged active managed file, it must execute that configuration repair even
+// though desired and active component references are identical.
+#[test]
+fn resolve_repairs_a_damaged_active_overwrite_file() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let metadata = root.path().join("demo");
+    let source = root.path().join("share");
+    let bin = root.path().join("bin");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(source.join("config"), "managed").unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            "schema = 2\n[profile]\nid = \"demo\"\nname = \"Demo\"\ndescription = \"test\"\nsource_root = \"{}\"\n[[components]]\nid = \"main\"\nrole = \"tool\"\n[[components.configuration]]\ntarget = \".config/demo/config\"\nlifecycle = \"overwrite\"\nmode = \"file\"\nsource = \"config\"\n",
+            source.display()
+        ),
+    )
+    .unwrap();
+    let state = home.path().join(".local/state/catdot/state.toml");
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::write(
+        &state,
+        "schema = 1\ngeneration = 1\nactive_generation = 1\n[components]\ntool = \"demo/main\"\n[active_components]\ntool = \"demo/main\"\n",
+    )
+    .unwrap();
+    let marker = root.path().join("generation");
+    fs::write(&marker, "1\n").unwrap();
+    let first = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .arg("update")
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .env("CATDOT_SYSTEM_GENERATION", &marker)
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let target = home.path().join(".config/demo/config");
+    fs::write(&target, "damaged").unwrap();
+    let pkexec = bin.join("pkexec");
+    fs::write(
+        &pkexec,
+        "#!/bin/sh\ncase \"$2\" in\n  resolve-plan) printf '%s\\n' 'system_update_required = false' '[plan]' 'install = []' 'remove = []' 'replacements = []' 'satisfied = []' '[requirements]' ;;\n  resolve|finalize) exit 0 ;;\n  *) exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&pkexec, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .args(["resolve", "--yes"])
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .env("CATDOT_SYSTEM_GENERATION", &marker)
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(target).unwrap(), "managed");
+}
+
+// Doctor must inspect what the desktop is actually using, not only the next
+// desired selection. A healthy pending replacement cannot hide a missing
+// dependency of the still-active provider.
+#[test]
+fn doctor_reports_missing_active_dependencies_separately_from_desired() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let metadata = root.path().join("demo");
+    let bin = root.path().join("bin");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            "schema = 2\n[profile]\nid = \"demo\"\nname = \"Demo\"\ndescription = \"test\"\nsource_root = \"{}\"\n[[components]]\nid = \"old\"\nrole = \"terminal\"\npackages = [\"missing-active-package\"]\n[[components]]\nid = \"new\"\nrole = \"terminal\"\n",
+            root.path().join("share").display()
+        ),
+    )
+    .unwrap();
+    let state = home.path().join(".local/state/catdot/state.toml");
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::write(
+        &state,
+        "schema = 1\ngeneration = 2\nactive_generation = 1\n[components]\nterminal = \"demo/new\"\n[active_components]\nterminal = \"demo/old\"\n",
+    )
+    .unwrap();
+    let pacman = bin.join("pacman");
+    fs::write(&pacman, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&pacman, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .arg("doctor")
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("unresolved active"));
+    assert!(stdout.contains("demo/old"));
+    assert!(stdout.contains("missing-active-package"));
+}

@@ -58,9 +58,16 @@ pub struct ActivationPlan {
     pub entries: Vec<PlannedTarget>,
     pub removals: Vec<PathBuf>,
     registry: ManagedRegistry,
+    registry_changed: bool,
 }
 
 impl ActivationPlan {
+    pub fn has_changes(&self) -> bool {
+        self.registry_changed
+            || self.removals.iter().any(|target| target.exists())
+            || self.entries.iter().any(entry_has_changes)
+    }
+
     pub fn identity_digest(&self) -> String {
         let mut digest = Sha256::new();
         for entry in &self.entries {
@@ -101,6 +108,7 @@ impl ActivationPlan {
             digest.update(removal.as_os_str().as_encoded_bytes());
             digest.update([0xff]);
         }
+        digest.update([self.registry_changed as u8]);
         digest.update(
             toml::to_string(&self.registry)
                 .unwrap_or_default()
@@ -245,10 +253,12 @@ fn build_activation_plan_with_sources(
             },
         );
     }
+    let registry_changed = registry != previous;
     Ok(ActivationPlan {
         entries,
         removals,
         registry,
+        registry_changed,
     })
 }
 
@@ -357,6 +367,72 @@ fn validate_conflicts(entries: &[PlannedTarget], home: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn entry_has_changes(entry: &PlannedTarget) -> bool {
+    match &entry.materialization {
+        Materialization::Generate { contents } => {
+            fs::read(&entry.target).map_or(true, |existing| existing != *contents)
+                || fs::metadata(&entry.target).map_or(true, |metadata| {
+                    metadata.permissions().mode() & 0o777 != 0o644
+                })
+        }
+        Materialization::Symlink { source } => {
+            fs::read_link(&entry.target).map_or(true, |existing| existing != *source)
+        }
+        Materialization::File { source } => !paths_equal(source, &entry.target),
+        Materialization::User {
+            release_managed,
+            initialized,
+            ..
+        } => *release_managed || (!*initialized && !entry.target.exists()),
+    }
+}
+
+fn paths_equal(source: &Path, target: &Path) -> bool {
+    let Ok(source_metadata) = fs::symlink_metadata(source) else {
+        return false;
+    };
+    let Ok(target_metadata) = fs::symlink_metadata(target) else {
+        return false;
+    };
+    if source_metadata.file_type().is_symlink() || target_metadata.file_type().is_symlink() {
+        return source_metadata.file_type().is_symlink()
+            && target_metadata.file_type().is_symlink()
+            && fs::read_link(source).ok() == fs::read_link(target).ok();
+    }
+    if source_metadata.is_file() || target_metadata.is_file() {
+        return source_metadata.is_file()
+            && target_metadata.is_file()
+            && source_metadata.permissions().mode() & 0o777
+                == target_metadata.permissions().mode() & 0o777
+            && fs::read(source).ok() == fs::read(target).ok();
+    }
+    if !source_metadata.is_dir() || !target_metadata.is_dir() {
+        return false;
+    }
+    if source_metadata.permissions().mode() & 0o777 != target_metadata.permissions().mode() & 0o777
+    {
+        return false;
+    }
+    let Ok(source_entries) = fs::read_dir(source) else {
+        return false;
+    };
+    let Ok(target_entries) = fs::read_dir(target) else {
+        return false;
+    };
+    let mut source_names = source_entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+        .collect::<Vec<_>>();
+    let mut target_names = target_entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+        .collect::<Vec<_>>();
+    source_names.sort();
+    target_names.sort();
+    source_names == target_names
+        && source_names
+            .iter()
+            .all(|name| paths_equal(&source.join(name), &target.join(name)))
 }
 
 pub fn forget_user_initialization(
