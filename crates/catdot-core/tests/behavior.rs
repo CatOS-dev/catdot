@@ -2040,3 +2040,52 @@ fn discovery_rejects_reserved_xdg_configuration_targets() {
         assert!(error.to_string().contains("reserved Catdot target"));
     }
 }
+
+// A merge result is part of the confirmed activation plan. Editing either the
+// local file or packaged upstream after preview must change the plan identity
+// so resolve cannot silently apply different merge inputs.
+#[test]
+fn merge_plan_identity_tracks_local_and_upstream_inputs() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    let source = temp.path().join("share/demo");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::create_dir_all(&source).unwrap();
+    let upstream = source.join("binds.kdl");
+    fs::write(&upstream, "base\n").unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            "schema = 3\n[profile]\nid = \"demo\"\nname = \"Demo\"\ndescription = \"test\"\nsource_root = \"{}\"\n[defaults]\ndesktop = \"desktop\"\n[[components]]\nid = \"desktop\"\nrole = \"desktop\"\n[[components.configuration]]\ntarget = \".config/demo/binds.kdl\"\nlifecycle = \"merge\"\nsource = \"binds.kdl\"\n",
+            source.display()
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    let home = temp.path().join("home");
+    let registry = home.join(".local/state/catdot/managed.toml");
+    apply_configuration(
+        &build_activation_plan(&profiles, &state, &home, &registry).unwrap(),
+        &registry,
+        &home,
+    )
+    .unwrap();
+    let target = home.join(".config/demo/binds.kdl");
+    let original = build_activation_plan(&profiles, &state, &home, &registry)
+        .unwrap()
+        .identity_digest();
+
+    fs::write(&target, "local\n").unwrap();
+    let local_changed = build_activation_plan(&profiles, &state, &home, &registry)
+        .unwrap()
+        .identity_digest();
+    assert_ne!(original, local_changed);
+
+    fs::write(&target, "base\n").unwrap();
+    fs::write(&upstream, "upstream\n").unwrap();
+    let upstream_changed = build_activation_plan(&profiles, &state, &home, &registry)
+        .unwrap()
+        .identity_digest();
+    assert_ne!(original, upstream_changed);
+}

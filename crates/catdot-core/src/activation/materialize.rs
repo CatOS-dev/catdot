@@ -107,9 +107,31 @@ impl ActivationPlan {
                     digest.update(b"generate-source\0");
                     digest.update(source.as_os_str().as_encoded_bytes());
                 }
-                Materialization::Merge { source, .. } => {
+                Materialization::Merge {
+                    source,
+                    contents,
+                    base,
+                    ready,
+                    conflict,
+                } => {
                     digest.update(b"merge\0");
                     digest.update(source.as_os_str().as_encoded_bytes());
+                    digest.update([0, *ready as u8]);
+                    digest.update(base.as_bytes());
+                    digest.update([0]);
+                    digest.update(contents);
+                    if let Some(conflict) = conflict {
+                        digest.update(b"conflict\0");
+                        digest.update(conflict.directory.as_os_str().as_encoded_bytes());
+                        digest.update([0]);
+                        digest.update(conflict.base.as_bytes());
+                        digest.update([0]);
+                        digest.update(conflict.local.as_bytes());
+                        digest.update([0]);
+                        digest.update(conflict.upstream.as_bytes());
+                        digest.update([0]);
+                        digest.update(conflict.merged.as_bytes());
+                    }
                 }
                 Materialization::User {
                     seed,
@@ -140,6 +162,10 @@ impl ActivationPlan {
             digest.update([0]);
             if let Some(source) = &managed.source {
                 digest.update(source.as_os_str().as_encoded_bytes());
+            }
+            digest.update([0]);
+            if let Some(base) = &managed.merge_base {
+                digest.update(base.as_bytes());
             }
             digest.update([0xff]);
         }
