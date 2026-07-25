@@ -1,13 +1,15 @@
 # Catdot
 
-Catdot is CatOS's Rust desktop profile manager. Profiles installed below
-`/usr/share/catdot/profiles` define replaceable desktop components, safe
-user-configuration links, argv-based launch commands, theme settings, and
-package requirements.
+Catdot is CatOS's Rust desktop Profile and component manager. Profile metadata
+installed below `/usr/share/catdot/profiles` defines replaceable desktop
+components, configuration lifecycle, argv-based launch commands, XDG defaults,
+and package requirements.
 
-The `catdot` package ships only the `catos-default` GTK/Qt appearance profile.
-Desktop profiles such as Niri or Sway are supplied by their own CatOS profile
-packages.
+The `catdot` package always ships the GTK-only `catos-default` Profile and its
+new-user default declaration. The `catos-gtk-settings` package owns the GTK
+source files under `/etc/skel`. Selecting another complete Profile replaces
+`catos-default`; it is the guaranteed initial Profile, not a permanent layer.
+Desktop Profiles such as `catos-niri-dms` are supplied by their own packages.
 
 ## User workflow
 
@@ -36,10 +38,11 @@ catdot resolve
 ```
 
 `resolve` displays package installation, replacement, removal, and component
-activation changes before confirmation. A successful run installs required
-packages, applies user configuration, switches the active components, and
-finalizes the multi-user package records. Repeating it when nothing changed
-prints `Catdot is already up to date.`
+activation changes before confirmation. Profile `packages` accept normal Arch
+dependency expressions, including versions and virtual providers. A successful
+run installs required packages, applies user configuration, switches the active
+components, and finalizes the multi-user package records. Repeating it when
+nothing changed prints `Catdot is already up to date.`
 
 Inspect current state and launch the active provider for a role:
 
@@ -65,7 +68,11 @@ catdot users prune [--yes]         Remove records for deleted users
 ```
 
 Lifecycle-managed targets are backed up and replaced transactionally during
-`resolve`; there is no separate adoption workflow.
+`resolve`; there is no separate adoption workflow. `overwrite` content may be
+replaced, `generate` content comes from a manifest template, and `user` content
+is seeded only when missing. Changing a previously managed path to `user`
+releases it without deleting the current content; a managed symlink is detached
+into a user-owned copy.
 
 ## Reliability model
 
@@ -107,35 +114,44 @@ mutating plan unless `--yes` is supplied. Non-interactive mutation without
 ## Profile manifest example
 
 ```toml
-schema = 1
+schema = 2
+component_files = ["terminal.toml"]
 
 [profile]
-id = "catos-niri-default"
-name = "CatOS Niri Default"
-description = "Default CatOS Niri desktop profile"
+id = "catos-niri-dms"
+name = "CatOS Niri DMS"
+description = "Complete CatOS Niri desktop Profile"
+source_root = "/usr/share/catos-niri-dms"
 
 [defaults]
-wm = "niri"
-bar = "waybar"
+desktop = "niri"
+terminal = "ghostty"
 
-[components.niri]
-role = "wm"
-path = "niri"
-packages = ["niri"]
+[[components]]
+id = "niri"
+role = "desktop"
+packages = ["xdg-desktop-portal-gtk"]
 
-[[components.niri.links]]
-source = "config.kdl"
-target = "{xdg_config_home}/niri/config.kdl"
+[[components.configuration]]
+target = ".config/niri/config.kdl"
+lifecycle = "generate"
+template = "include \"default.kdl\"\ninclude \"custom/config.kdl\"\n"
 
-[components.waybar]
-role = "bar"
-path = "waybar"
-packages = ["waybar"]
-exec = ["waybar", "--config", "{component}/config.jsonc"]
+[[components.configuration]]
+target = ".config/niri/default.kdl"
+lifecycle = "overwrite"
+mode = "symlink"
+source = ".config/niri/default.kdl"
+
+[[components.configuration]]
+target = ".config/niri/custom"
+lifecycle = "user"
+seed = ".config/niri/custom"
 ```
 
-Manifest commands are argv arrays. Catdot does not invoke `/bin/sh -c`, and
-profile paths and placeholders are validated before use.
+External component files must be named explicitly in `component_files`;
+Catdot does not discover arbitrary TOML files. Manifest commands are argv
+arrays and never use `/bin/sh -c`.
 
 ## Development checks
 
@@ -157,8 +173,8 @@ inside disposable Podman containers:
 
 It covers zero-package activation, strict-umask multi-user state, real libalpm
 installation and pruning, explicit-package upgrades, transaction recovery,
-conflict replacement, stale users, privileged helper separation, and default
-theme resources. It never modifies host packages.
+conflict replacement, stale users, and privileged helper separation. It never
+modifies host packages.
 
 The release PKGBUILD intentionally references a future tagged source archive.
 A real tag and checksum are added only when the project is ready for release.

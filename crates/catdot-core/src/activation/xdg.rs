@@ -224,7 +224,6 @@ mod tests {
         let component = crate::ComponentDef {
             role: "browser".into(),
             packages: vec![],
-            optional_packages: vec![],
             exec: vec![],
             xdg: crate::XdgProvider {
                 desktop_entry: Some("browser.desktop".into()),
@@ -232,8 +231,6 @@ mod tests {
                 uri_schemes: vec!["http".into()],
             },
             configuration: vec![],
-            backend: None,
-            settings: BTreeMap::new(),
         };
         let mut profile = Profile {
             id: "demo".into(),
@@ -294,7 +291,6 @@ mod tests {
                 crate::ComponentDef {
                     role: "browser".into(),
                     packages: vec![],
-                    optional_packages: vec![],
                     exec: vec![],
                     xdg: crate::XdgProvider {
                         desktop_entry: Some(desktop.into()),
@@ -302,8 +298,6 @@ mod tests {
                         uri_schemes: vec![],
                     },
                     configuration: vec![],
-                    backend: None,
-                    settings: BTreeMap::new(),
                 },
             );
         }

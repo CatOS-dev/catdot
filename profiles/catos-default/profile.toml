@@ -1,35 +1,50 @@
-schema = 1
+schema = 2
 
 [profile]
 id = "catos-default"
 name = "CatOS Default"
-description = "Default CatOS GTK and Qt appearance profile"
+description = "Default CatOS GTK settings"
+source_root = "/etc/skel"
 
 [defaults]
 gtk-theme = "gtk"
-qt-theme = "qt"
 
-[components.gtk]
+[[components]]
+id = "gtk"
 role = "gtk-theme"
-path = "gtk"
-backend = "gtk"
-packages = ["catos-graphite-gtk-theme", "tela-icon-theme-git", "catos-bibata-cursor"]
+packages = [
+  "catos-gtk-settings",
+  "catos-graphite-gtk-theme>=1.0-3",
+  "catos-tela-icon-theme-blue",
+  "catos-bibata-cursor",
+]
 
-[components.gtk.settings]
-theme = "Graphite-Dark-nord"
-icon_theme = "Tela-blue-dark"
-cursor_theme = "Bibata-Modern-Ice"
-font = "Noto Sans 10"
-color_scheme = "prefer-dark"
+[[components.configuration]]
+target = ".gtkrc-2.0"
+lifecycle = "overwrite"
+mode = "file"
+source = ".gtkrc-2.0"
 
-[components.qt]
-role = "qt-theme"
-path = "qt"
-backend = "qtct-kvantum"
-packages = ["qt5ct", "qt6ct", "kvantum", "kvantum-qt5"]
+[[components.configuration]]
+target = ".config/gtk-3.0/settings.ini"
+lifecycle = "overwrite"
+mode = "file"
+source = ".config/gtk-3.0/settings.ini"
 
-[components.qt.settings]
-qt5_style = "kvantum"
-qt6_style = "kvantum"
-kvantum_theme = "KvantumAlt"
-icon_theme = "Tela-blue-dark"
+[[components.configuration]]
+target = ".config/gtk-4.0/settings.ini"
+lifecycle = "overwrite"
+mode = "file"
+source = ".config/gtk-4.0/settings.ini"
+
+[[components.configuration]]
+target = ".config/gtk-4.0/gtk.css"
+lifecycle = "overwrite"
+mode = "file"
+source = ".config/gtk-4.0/gtk.css"
+
+[[components.configuration]]
+target = ".config/gtk-4.0/assets"
+lifecycle = "overwrite"
+mode = "file"
+source = ".config/gtk-4.0/assets"

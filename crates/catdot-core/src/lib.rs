@@ -5,14 +5,13 @@ mod error;
 pub mod manifest;
 pub mod planning;
 pub mod state;
-pub mod theme;
 pub mod update;
 
 pub use activation::{
     ActivationJournal, ActivationPlan, ManagedRegistry, ManagedTarget, Materialization,
     PlannedTarget, XdgPlan, activate_configuration, activate_xdg, activation_transactions_path,
-    build_activation_plan, build_xdg_plan, lock, managed_targets_path, read_managed_registry,
-    recover_activation_journals,
+    build_activation_plan, build_activation_preview, build_xdg_plan, lock, managed_targets_path,
+    read_managed_registry, recover_activation_journals,
 };
 pub use error::{Error, Result};
 pub use manifest::{
@@ -32,7 +31,6 @@ pub use state::{
     read_user_records, select_component, select_profile, state_lock_path, state_path,
     validate_user_state, write_state, write_system_packages,
 };
-pub use theme::{apply_theme, merge_ini, theme_expected_files};
 pub use update::{
     activation_digests, package_digests, read_system_generation, system_generation_path,
 };

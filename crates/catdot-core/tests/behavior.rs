@@ -1,7 +1,7 @@
 use catdot_core::{
-    ActivationJournal, UserState, activate_configuration, build_activation_plan, discover_profiles,
-    initialize_state_from_default, read_state, recover_activation_journals, select_profile,
-    write_state,
+    ActivationJournal, UserState, activate_configuration, build_activation_plan,
+    build_activation_preview, discover_profiles, initialize_state_from_default, read_state,
+    recover_activation_journals, select_profile, write_state,
 };
 use std::fs;
 use tempfile::tempdir;
@@ -288,7 +288,7 @@ fn skel_default_initializes_desired_state_without_active_state() {
     );
 }
 
-// Protects a real application entry point: templates and adapters must create
+// Protects a real application entry point: templates must create
 // regular HOME files, while static profile fragments remain top-level links.
 // The old link-only activation path could not generate either entry point.
 #[test]
@@ -335,43 +335,6 @@ source = ".config/niri/default.kdl"
         fs::read_link(home.join(".config/niri/default.kdl")).unwrap(),
         source.join(".config/niri/default.kdl")
     );
-}
-
-// Protects Niri's native include entry point without executing shell text:
-// the named adapter must generate HOME-relative includes only.
-#[test]
-fn materialization_generates_niri_include_adapter() {
-    let temp = tempdir().unwrap();
-    let metadata = temp.path().join("profiles/demo");
-    let source = temp.path().join("share/demo");
-    fs::create_dir_all(&metadata).unwrap();
-    fs::write(
-        metadata.join("profile.toml"),
-        profile(
-            &source.display().to_string(),
-            r#"[[components]]
-id = "niri"
-role = "desktop"
-[[components.configuration]]
-target = ".config/niri/config.kdl"
-lifecycle = "generate"
-adapter = "niri-includes"
-"#,
-            "",
-            "desktop = \"niri\"\n",
-        ),
-    )
-    .unwrap();
-    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
-    let state = select_profile(&profiles["demo"]).unwrap();
-    let home = temp.path().join("home");
-    let registry = home.join(".local/state/catdot/managed.toml");
-    let plan = build_activation_plan(&profiles, &state, &home, &registry).unwrap();
-    apply_configuration(&plan, &registry, &home).unwrap();
-    let generated = fs::read_to_string(home.join(".config/niri/config.kdl")).unwrap();
-    assert!(generated.contains("include \"default.kdl\""));
-    assert!(generated.contains("include \"custom/config.kdl\""));
-    assert!(!generated.contains("/usr/share"));
 }
 
 // Protects applications whose prior config target is a non-empty directory:
@@ -1011,4 +974,230 @@ fn skel_default_desktop_override_replaces_the_profile_default() {
     unsafe { std::env::remove_var("XDG_CURRENT_DESKTOP") };
     assert_eq!(state.components["terminal"], "demo/kitty");
     assert!(state.active_components.is_empty());
+}
+
+// A Profile may name real Arch dependencies, not only Catdot-style IDs.
+// This protects auxiliary desktop packages and versioned/virtual requirements.
+#[test]
+fn discovery_accepts_arch_dependency_expressions() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    fs::create_dir_all(&metadata).unwrap();
+    let source = temp.path().join("share/demo");
+    fs::write(
+        metadata.join("profile.toml"),
+        profile(
+            &source.display().to_string(),
+            r#"[[components]]
+id = "desktop"
+role = "desktop"
+packages = [
+  "afl++",
+  "db5.3",
+  "lib32-lm_sensors",
+  "niri>=25.05",
+  "virtual-provider=2:1.0-1",
+]
+"#,
+            "",
+            "desktop = \"desktop\"\n",
+        ),
+    )
+    .unwrap();
+
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    assert_eq!(
+        profiles["demo"].components["desktop"].packages,
+        [
+            "afl++",
+            "db5.3",
+            "lib32-lm_sensors",
+            "niri>=25.05",
+            "virtual-provider=2:1.0-1",
+        ]
+    );
+}
+
+// A component package may provide its source tree. The reviewable dry-run must
+// therefore work before installation, while real activation must still verify it.
+#[test]
+fn activation_preview_defers_missing_component_sources() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    fs::create_dir_all(&metadata).unwrap();
+    let source = temp.path().join("not-installed-yet");
+    fs::write(
+        metadata.join("profile.toml"),
+        profile(
+            &source.display().to_string(),
+            r#"[[components]]
+id = "terminal"
+role = "terminal"
+packages = ["ghostty"]
+[[components.configuration]]
+target = ".config/ghostty/config"
+lifecycle = "overwrite"
+mode = "file"
+source = ".config/ghostty/config"
+"#,
+            "",
+            "terminal = \"terminal\"\n",
+        ),
+    )
+    .unwrap();
+
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    let home = temp.path().join("home");
+    let registry = home.join(".local/state/catdot/managed.toml");
+    assert!(build_activation_preview(&profiles, &state, &home, &registry).is_ok());
+    assert!(build_activation_plan(&profiles, &state, &home, &registry).is_err());
+}
+
+// Changing a path from Catdot-managed overwrite to user ownership must release
+// it without deleting the user's current writable content.
+#[test]
+fn materialization_releases_overwrite_file_to_user_without_deleting_it() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    let source = temp.path().join("share/demo");
+    fs::create_dir_all(source.join(".config/app")).unwrap();
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(source.join(".config/app/config"), "managed").unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        profile(
+            &source.display().to_string(),
+            r#"[[components]]
+id = "app"
+role = "app"
+[[components.configuration]]
+target = ".config/app/config"
+lifecycle = "overwrite"
+mode = "file"
+source = ".config/app/config"
+"#,
+            "",
+            "app = \"app\"\n",
+        ),
+    )
+    .unwrap();
+
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    let home = temp.path().join("home");
+    let registry = home.join(".local/state/catdot/managed.toml");
+    let plan = build_activation_plan(&profiles, &state, &home, &registry).unwrap();
+    apply_configuration(&plan, &registry, &home).unwrap();
+    let target = home.join(".config/app/config");
+    fs::write(&target, "mine").unwrap();
+
+    fs::write(
+        metadata.join("profile.toml"),
+        profile(
+            &source.display().to_string(),
+            r#"[[components]]
+id = "app"
+role = "app"
+[[components.configuration]]
+target = ".config/app/config"
+lifecycle = "user"
+"#,
+            "",
+            "app = \"app\"\n",
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    let plan = build_activation_plan(&profiles, &state, &home, &registry).unwrap();
+    apply_configuration(&plan, &registry, &home).unwrap();
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "mine");
+    assert!(
+        catdot_core::read_managed_registry(&registry)
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+}
+
+// Releasing a managed symlink to user ownership must detach it from the
+// package-owned source, otherwise an upgrade or uninstall can still change it.
+#[test]
+fn materialization_detaches_overwrite_symlink_when_released_to_user() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    let source = temp.path().join("share/demo");
+    fs::create_dir_all(source.join(".config/app")).unwrap();
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(source.join(".config/app/config"), "managed").unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        profile(
+            &source.display().to_string(),
+            r#"[[components]]
+id = "app"
+role = "app"
+[[components.configuration]]
+target = ".config/app/config"
+lifecycle = "overwrite"
+mode = "symlink"
+source = ".config/app/config"
+"#,
+            "",
+            "app = \"app\"\n",
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    let home = temp.path().join("home");
+    let registry = home.join(".local/state/catdot/managed.toml");
+    apply_configuration(
+        &build_activation_plan(&profiles, &state, &home, &registry).unwrap(),
+        &registry,
+        &home,
+    )
+    .unwrap();
+    let target = home.join(".config/app/config");
+    assert!(
+        fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    fs::write(
+        metadata.join("profile.toml"),
+        profile(
+            &source.display().to_string(),
+            r#"[[components]]
+id = "app"
+role = "app"
+[[components.configuration]]
+target = ".config/app/config"
+lifecycle = "user"
+"#,
+            "",
+            "app = \"app\"\n",
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    apply_configuration(
+        &build_activation_plan(&profiles, &state, &home, &registry).unwrap(),
+        &registry,
+        &home,
+    )
+    .unwrap();
+
+    assert!(
+        !fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "managed");
 }

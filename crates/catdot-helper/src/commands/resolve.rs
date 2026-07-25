@@ -19,13 +19,8 @@ struct ResolveContext {
     system_update_required: bool,
 }
 
-pub(super) fn print_plan(
-    uid: u32,
-    generation: u64,
-    state_path: &Path,
-    optional: bool,
-) -> Result<()> {
-    let context = prepare(uid, generation, state_path, optional, true)?;
+pub(super) fn print_plan(uid: u32, generation: u64, state_path: &Path) -> Result<()> {
+    let context = prepare(uid, generation, state_path, true)?;
     let preview = PackagePlanPreview {
         plan: context.plan,
         requirements: aggregate_requirements(&context.records),
@@ -35,20 +30,14 @@ pub(super) fn print_plan(
     Ok(())
 }
 
-pub(super) fn apply(
-    uid: u32,
-    generation: u64,
-    state_path: &Path,
-    digest: &str,
-    optional: bool,
-) -> Result<()> {
+pub(super) fn apply(uid: u32, generation: u64, state_path: &Path, digest: &str) -> Result<()> {
     caller_uid(uid)?;
     ensure_system_database(Path::new(DB))?;
     let _lock = lock(&Path::new(DB).join("lock"))?;
     let database = Path::new(DB);
     let mut handle = open_handle()?;
     recover_pending(database, |name| handle.localdb().pkg(name).is_ok())?;
-    let context = prepare(uid, generation, state_path, optional, false)?;
+    let context = prepare(uid, generation, state_path, false)?;
     if context.plan.digest() != digest {
         bail!("plan changed; run catdot resolve again")
     }
@@ -108,7 +97,7 @@ pub(super) fn finalize(uid: u32, generation: u64, state_path: &Path) -> Result<(
         bail!("pending record generation does not match active state")
     }
     let profiles = discover_profile_registry(Path::new(DEFAULT_PROFILE_ROOT))?.valid_profiles;
-    let mut finalized = UserRecord::from_state(uid, state_path, &state, &profiles, false)?;
+    let mut finalized = UserRecord::from_state(uid, state_path, &state, &profiles)?;
     normalize_requirement_providers(std::slice::from_mut(&mut finalized), &handle)?;
     replace_record(&mut records, finalized.clone());
     let requirements = aggregate_requirements(&records);
@@ -133,7 +122,6 @@ fn prepare(
     uid: u32,
     generation: u64,
     state_path: &Path,
-    optional: bool,
     default_preview: bool,
 ) -> Result<ResolveContext> {
     let profiles = discover_profile_registry(Path::new(DEFAULT_PROFILE_ROOT))?.valid_profiles;
@@ -160,7 +148,7 @@ fn prepare(
     if state.generation != generation {
         bail!("state changed; run catdot resolve again")
     }
-    let record = UserRecord::from_state(uid, state_path, &state, &profiles, optional)?;
+    let record = UserRecord::from_state(uid, state_path, &state, &profiles)?;
     let mut records = valid_records(existing_records, |record_uid| user_home(record_uid).is_ok());
     replace_record(&mut records, record.clone());
     let mut handle = open_handle()?;

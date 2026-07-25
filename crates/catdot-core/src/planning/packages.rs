@@ -65,15 +65,11 @@ pub fn expand_exec(
 pub fn packages_for_state(
     state: &UserState,
     profiles: &BTreeMap<String, Profile>,
-    optional: bool,
 ) -> Result<BTreeSet<String>> {
     let mut packages = BTreeSet::new();
     for reference in state.components.values() {
         let (_, component) = resolve(profiles, reference)?;
         packages.extend(component.packages.iter().cloned());
-        if optional {
-            packages.extend(component.optional_packages.iter().cloned())
-        }
     }
     Ok(packages)
 }
@@ -95,16 +91,14 @@ impl UserRecord {
         state_path: &Path,
         state: &UserState,
         profiles: &BTreeMap<String, Profile>,
-        optional: bool,
     ) -> Result<Self> {
-        let active_requirements =
-            requirements_for_components(&state.active_components, profiles, optional)?;
+        let active_requirements = requirements_for_components(&state.active_components, profiles)?;
         let pending_requirements = if state.active_generation == state.generation
             && state.active_components == state.components
         {
             BTreeMap::new()
         } else {
-            requirements_for_components(&state.components, profiles, optional)?
+            requirements_for_components(&state.components, profiles)?
         };
         Ok(Self {
             uid,
@@ -121,16 +115,11 @@ impl UserRecord {
 fn requirements_for_components(
     components: &BTreeMap<String, String>,
     profiles: &BTreeMap<String, Profile>,
-    optional: bool,
 ) -> Result<BTreeMap<String, BTreeSet<String>>> {
     let mut requirements = BTreeMap::new();
     for reference in components.values() {
         let (_, component) = resolve(profiles, reference)?;
-        for package in component.packages.iter().chain(if optional {
-            component.optional_packages.iter()
-        } else {
-            [].iter()
-        }) {
+        for package in &component.packages {
             requirements
                 .entry(package.clone())
                 .or_insert_with(BTreeSet::new)

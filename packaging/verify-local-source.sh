@@ -30,15 +30,31 @@ test -f "$stage/usr/lib/systemd/user/catdot-update.service"
 test -f "$stage/usr/lib/systemd/user/catdot-update.path"
 test -f "$stage/usr/share/licenses/catdot/LICENSE"
 test -f "$stage/usr/share/doc/catdot/README.md"
+
 test -f "$stage/usr/share/catdot/profiles/catos-default/profile.toml"
+test -f "$stage/etc/skel/.config/catdot/default.toml"
+test ! -e "$stage/etc/skel/.gtkrc-2.0"
+test ! -e "$stage/etc/skel/.config/gtk-3.0"
+test ! -e "$stage/etc/skel/.config/gtk-4.0"
+test ! -e "$stage/usr/share/catos-default"
 
 profile_root="$stage/usr/share/catdot/profiles"
 profile_count=$(find "$profile_root" -mindepth 1 -maxdepth 1 -type d | wc -l)
 test "$profile_count" -eq 1
-test ! -e "$profile_root/catos-niri-default"
-test ! -e "$profile_root/catos-sway-default"
-test ! -e "$profile_root/catos-graphite"
 
-HOME="$temporary/home" \
+home="$temporary/home"
+mkdir -p "$home"
+HOME="$home" \
+XDG_STATE_HOME="$home/.local/state" \
 CATDOT_PROFILE_ROOT="$profile_root" \
+CATDOT_DEFAULT_DECLARATION="$stage/etc/skel/.config/catdot/default.toml" \
   "$stage/usr/bin/catdot" list | grep -Fx 'catos-default — CatOS Default'
+
+current=$(HOME="$home" \
+  XDG_STATE_HOME="$home/.local/state" \
+  CATDOT_PROFILE_ROOT="$profile_root" \
+  CATDOT_DEFAULT_DECLARATION="$stage/etc/skel/.config/catdot/default.toml" \
+  "$stage/usr/bin/catdot" current)
+printf '%s\n' "$current" | grep -Fx 'Pending selection:'
+printf '%s\n' "$current" | grep -Fx '  gtk-theme: activate catos-default/gtk'
+! printf '%s\n' "$current" | grep -F 'qt-theme'

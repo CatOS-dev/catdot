@@ -29,6 +29,8 @@ install -Dm644 "$source_root/LICENSE" \
   "$destdir/usr/share/licenses/catdot/LICENSE"
 install -Dm644 "$source_root/README.md" \
   "$destdir/usr/share/doc/catdot/README.md"
-install -d "$destdir/usr/share/catdot/profiles"
-cp -a "$source_root/profiles/catos-default" \
-  "$destdir/usr/share/catdot/profiles/"
+install -Dm644 "$source_root/profiles/catos-default/profile.toml" \
+  "$destdir/usr/share/catdot/profiles/catos-default/profile.toml"
+install -Dm644 \
+  "$source_root/profiles/catos-default/skel/.config/catdot/default.toml" \
+  "$destdir/etc/skel/.config/catdot/default.toml"

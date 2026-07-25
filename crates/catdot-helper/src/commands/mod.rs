@@ -33,10 +33,6 @@ enum Cmd {
         digest: String,
         #[arg(long)]
         state_path: PathBuf,
-        #[arg(long, conflicts_with = "without_optional")]
-        with_optional: bool,
-        #[arg(long, conflicts_with = "with_optional")]
-        without_optional: bool,
     },
     ResolvePlan {
         #[arg(long)]
@@ -45,10 +41,6 @@ enum Cmd {
         generation: u64,
         #[arg(long)]
         state_path: PathBuf,
-        #[arg(long, conflicts_with = "without_optional")]
-        with_optional: bool,
-        #[arg(long, conflicts_with = "with_optional")]
-        without_optional: bool,
     },
     Finalize {
         #[arg(long)]
@@ -65,8 +57,6 @@ enum Cmd {
         generation: u64,
         #[arg(long)]
         digest: String,
-        #[arg(long)]
-        without_optional: bool,
     },
     PrunePlan {
         #[arg(long)]
@@ -94,12 +84,10 @@ pub fn run(mode: HelperMode) -> Result<()> {
             uid,
             generation,
             state_path,
-            with_optional,
-            ..
         } => {
             require_root()?;
             caller_uid(uid)?;
-            resolve::print_plan(uid, generation, &state_path, with_optional)
+            resolve::print_plan(uid, generation, &state_path)
         }
         Cmd::PrunePlan { uid } => {
             require_root()?;
@@ -127,11 +115,9 @@ pub fn run(mode: HelperMode) -> Result<()> {
             generation,
             digest,
             state_path,
-            with_optional,
-            ..
         } => {
             require_root()?;
-            resolve::apply(uid, generation, &state_path, &digest, with_optional)
+            resolve::apply(uid, generation, &state_path, &digest)
         }
         Cmd::Finalize {
             uid,
@@ -477,7 +463,6 @@ mod tests {
             uid: 1000,
             generation: 0,
             digest: "digest".into(),
-            without_optional: true,
         };
         assert!(validate_mode(HelperMode::Query, &query).is_ok());
         assert!(validate_mode(HelperMode::Manage, &manage).is_ok());
@@ -488,8 +473,6 @@ mod tests {
             uid: 1000,
             generation: 1,
             state_path: PathBuf::from("/home/test/state.toml"),
-            with_optional: false,
-            without_optional: true,
         };
         assert!(validate_mode(HelperMode::Query, &resolve).is_ok());
     }

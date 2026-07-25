@@ -1,4 +1,3 @@
-use crate::services::sync_gtk_settings;
 use anyhow::{Context, Result, bail};
 use catdot_core::*;
 use std::{
@@ -59,7 +58,7 @@ pub(super) fn component_for<'a>(
 
 pub(super) fn package_present(name: &str) -> bool {
     Command::new("pacman")
-        .args(["-Q", name])
+        .args(["-T", name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -96,28 +95,6 @@ pub(super) fn apply(
     activate_configuration(&plan, &registry, journal)?;
     let xdg_plan = build_xdg_plan(profiles, state, &xdg)?;
     activate_xdg(&xdg_plan, journal)?;
-    for role in state.components.keys() {
-        let (_profile, component, _) = component_for(profiles, state, role)?;
-        if component
-            .packages
-            .iter()
-            .any(|package| !package_present(package))
-        {
-            continue;
-        }
-        if component.backend.is_some() {
-            let desktop = env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-            let plasma = desktop.contains("KDE") || desktop.contains("Plasma");
-            {
-                for (path, contents) in theme_expected_files(component, &xdg, plasma)? {
-                    journal.track_file(&path, &contents)?;
-                }
-            }
-            if let Err(error) = apply_theme(component, &xdg, plasma) {
-                return Err(error.into());
-            }
-        }
-    }
     journal.mark_applied()?;
     Ok(())
 }
@@ -166,23 +143,6 @@ pub(super) fn clear_profile_custom(
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn sync_active_settings(
-    profiles: &std::collections::BTreeMap<String, Profile>,
-    state: &UserState,
-) -> Result<()> {
-    for role in state.components.keys() {
-        let (_, component, _) = component_for(profiles, state, role)?;
-        if component
-            .packages
-            .iter()
-            .all(|package| package_present(package))
-        {
-            sync_gtk_settings(component);
         }
     }
     Ok(())
@@ -259,69 +219,32 @@ fn binary_present(binary: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::{collections::BTreeMap, fs, sync::Mutex};
+    use super::package_present;
+    use std::{env, fs, os::unix::fs::PermissionsExt, sync::Mutex};
     use tempfile::tempdir;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    // Protects the activation ordering: if a later theme consumer rejects its
-    // input after XDG has been written, journal recovery restores mimeapps.
+    // Dependency checks must understand versions and virtual providers rather
+    // than treating the manifest expression as a literal installed package name.
     #[test]
-    fn apply_rolls_back_xdg_when_a_later_theme_step_fails() {
+    fn package_presence_uses_dependency_satisfaction() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let temp = tempdir().unwrap();
-        let config = temp.path().join(".config");
-        fs::create_dir_all(&config).unwrap();
-        let mimeapps = config.join("mimeapps.list");
+        let directory = tempdir().unwrap();
+        let pacman = directory.path().join("pacman");
         fs::write(
-            &mimeapps,
-            "[Default Applications]\ntext/html=outside.desktop;\n",
+            &pacman,
+            "#!/bin/sh\ntest \"$1\" = -T && test \"$2\" = 'virtual-provider>=2'\n",
         )
         .unwrap();
-        unsafe {
-            env::set_var("HOME", temp.path());
-            env::set_var("XDG_CONFIG_HOME", &config);
+        fs::set_permissions(&pacman, fs::Permissions::from_mode(0o755)).unwrap();
+        let old_path = env::var_os("PATH");
+        unsafe { env::set_var("PATH", directory.path()) };
+        assert!(package_present("virtual-provider>=2"));
+        assert!(!package_present("literal-package"));
+        match old_path {
+            Some(path) => unsafe { env::set_var("PATH", path) },
+            None => unsafe { env::remove_var("PATH") },
         }
-        let component = ComponentDef {
-            role: "browser".into(),
-            packages: vec![],
-            optional_packages: vec![],
-            exec: vec![],
-            xdg: XdgProvider {
-                desktop_entry: Some("browser.desktop".into()),
-                mime_types: vec!["text/html".into()],
-                uri_schemes: vec![],
-            },
-            configuration: vec![],
-            backend: Some("unsupported".into()),
-            settings: BTreeMap::new(),
-        };
-        let mut profile = Profile {
-            id: "demo".into(),
-            name: "Demo".into(),
-            description: "test".into(),
-            source_root: temp.path().join("share"),
-            defaults: BTreeMap::new(),
-            components: BTreeMap::new(),
-        };
-        profile.components.insert("browser".into(), component);
-        let mut profiles = BTreeMap::new();
-        profiles.insert("demo".into(), profile);
-        let mut state = UserState::default();
-        state
-            .components
-            .insert("browser".into(), "demo/browser".into());
-        let state_path = state_path(temp.path());
-        let mut journal =
-            ActivationJournal::begin(&state_path, UserState::default(), UserState::default())
-                .unwrap();
-        journal.mark_applying().unwrap();
-        assert!(apply(&profiles, &state, &mut journal).is_err());
-        recover_activation_journals(&state_path).unwrap();
-        assert_eq!(
-            fs::read_to_string(mimeapps).unwrap(),
-            "[Default Applications]\ntext/html=outside.desktop;\n"
-        );
     }
 }

@@ -1,5 +1,4 @@
 mod commands;
-mod services;
 
 fn main() {
     match commands::run() {

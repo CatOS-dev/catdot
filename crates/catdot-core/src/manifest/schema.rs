@@ -43,8 +43,6 @@ struct RawComponent {
     role: String,
     #[serde(default)]
     packages: Vec<String>,
-    #[serde(default)]
-    optional_packages: Vec<String>,
     exec: Option<RawExec>,
     xdg: Option<RawXdg>,
     #[serde(default)]
@@ -75,7 +73,6 @@ struct RawConfiguration {
     mode: Option<String>,
     source: Option<String>,
     template: Option<String>,
-    adapter: Option<String>,
     seed: Option<String>,
 }
 
@@ -98,7 +95,6 @@ pub struct ConfigurationEntry {
     pub lifecycle: Lifecycle,
     pub source: Option<PathBuf>,
     pub template: Option<String>,
-    pub adapter: Option<String>,
     pub seed: Option<PathBuf>,
 }
 
@@ -125,14 +121,9 @@ pub struct Profile {
 pub struct ComponentDef {
     pub role: String,
     pub packages: Vec<String>,
-    pub optional_packages: Vec<String>,
     pub exec: Vec<String>,
     pub xdg: XdgProvider,
     pub configuration: Vec<ConfigurationEntry>,
-    // Theme adapters are retained as an internal consumer until their profile
-    // declarations move to lifecycle entries; schema 2 does not parse them.
-    pub backend: Option<String>,
-    pub settings: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,7 +167,45 @@ fn safe_home_target(value: &str) -> bool {
 }
 
 fn valid_package(value: &str) -> bool {
-    valid_id(value)
+    if value.is_empty()
+        || value.len() > 255
+        || !value.is_ascii()
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte == 0 || byte == b'/')
+    {
+        return false;
+    }
+    let operator = value
+        .char_indices()
+        .find(|(_, character)| matches!(character, '<' | '>' | '='));
+    let (name, constraint) = match operator {
+        Some((index, _)) => (&value[..index], Some(&value[index..])),
+        None => (value, None),
+    };
+    let mut name_bytes = name.bytes();
+    if !name_bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || !name_bytes.all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'@' | b'.' | b'_' | b'+' | b'-')
+        })
+    {
+        return false;
+    }
+    let Some(constraint) = constraint else {
+        return true;
+    };
+    let version = [">=", "<=", "=", ">", "<"]
+        .into_iter()
+        .find_map(|operator| constraint.strip_prefix(operator));
+    version.is_some_and(|version| {
+        !version.is_empty()
+            && version.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'@' | b'.' | b'_' | b'+' | b'~' | b':' | b'-')
+            })
+    })
 }
 
 fn valid_exec(argv: &[String]) -> bool {
@@ -331,7 +360,6 @@ fn load_profile(
             || component
                 .packages
                 .iter()
-                .chain(&component.optional_packages)
                 .any(|package| !valid_package(package))
         {
             return Err(Error::Message(format!(
@@ -378,7 +406,6 @@ fn load_profile(
             ComponentDef {
                 role: component.role,
                 packages: component.packages,
-                optional_packages: component.optional_packages,
                 exec,
                 xdg: XdgProvider {
                     desktop_entry: xdg.desktop_entry,
@@ -386,8 +413,6 @@ fn load_profile(
                     uri_schemes: xdg.uri_schemes,
                 },
                 configuration,
-                backend: None,
-                settings: BTreeMap::new(),
             },
         );
     }
@@ -439,41 +464,20 @@ fn parse_configuration(
         )));
     }
     let lifecycle = match (raw.lifecycle.as_str(), raw.mode.as_deref()) {
-        ("generate", None)
-            if raw.template.is_some()
-                && raw.adapter.is_none()
-                && source.is_none()
-                && seed.is_none() =>
-        {
-            Lifecycle::Generate
-        }
-        ("generate", None)
-            if raw.template.is_none()
-                && raw.adapter.is_some()
-                && source.is_none()
-                && seed.is_none() =>
-        {
+        ("generate", None) if raw.template.is_some() && source.is_none() && seed.is_none() => {
             Lifecycle::Generate
         }
         ("overwrite", Some("symlink"))
-            if source.is_some()
-                && raw.template.is_none()
-                && raw.adapter.is_none()
-                && seed.is_none() =>
+            if source.is_some() && raw.template.is_none() && seed.is_none() =>
         {
             Lifecycle::Overwrite(OverwriteMode::Symlink)
         }
         ("overwrite", Some("file"))
-            if source.is_some()
-                && raw.template.is_none()
-                && raw.adapter.is_none()
-                && seed.is_none() =>
+            if source.is_some() && raw.template.is_none() && seed.is_none() =>
         {
             Lifecycle::Overwrite(OverwriteMode::File)
         }
-        ("user", None) if raw.template.is_none() && raw.adapter.is_none() && source.is_none() => {
-            Lifecycle::User
-        }
+        ("user", None) if raw.template.is_none() && source.is_none() => Lifecycle::User,
         _ => {
             return Err(Error::Message(format!(
                 "{}: invalid configuration lifecycle for {component}",
@@ -486,7 +490,6 @@ fn parse_configuration(
         lifecycle,
         source,
         template: raw.template,
-        adapter: raw.adapter,
         seed,
     })
 }

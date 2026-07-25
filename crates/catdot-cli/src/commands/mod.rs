@@ -11,7 +11,7 @@ mod runtime;
 
 use runtime::{
     apply, clear_profile_custom, component_for, exec_role, package_present, profiles, state_file,
-    sync_active_settings, unresolved_packages,
+    unresolved_packages,
 };
 
 const MANAGE_HELPER: &str = "/usr/lib/catdot/catdot-helper";
@@ -95,9 +95,6 @@ enum Cmd {
         /// Accept the displayed plan without an interactive prompt.
         #[arg(long)]
         yes: bool,
-        /// Include optional component packages.
-        #[arg(long)]
-        with_optional: bool,
     },
     /// Remove unreferenced packages originally installed by Catdot.
     #[command(about = "Remove unused Catdot-managed packages")]
@@ -300,7 +297,7 @@ fn print_activation_plan(
     }
     let home = runtime::home()?;
     let registry_path = managed_targets_path(state_path)?;
-    let plan = build_activation_plan(profiles, state, &home, &registry_path)?;
+    let plan = build_activation_preview(profiles, state, &home, &registry_path)?;
     for entry in &plan.entries {
         match &entry.materialization {
             Materialization::Generate { .. } => {
@@ -348,7 +345,10 @@ fn print_activation_plan(
                 std::fs::read_link(&entry.target).map_or(true, |existing| existing != *source)
             }
             Materialization::File { .. } => !entry.target.exists(),
-            Materialization::User { seed } => seed.is_some() && !entry.target.exists(),
+            Materialization::User {
+                seed,
+                release_managed,
+            } => *release_managed || (seed.is_some() && !entry.target.exists()),
         })
         || plan.removals.iter().any(|target| target.exists());
     let selection_changes = !activate.is_empty() || !change.is_empty() || !deactivate.is_empty();
@@ -360,7 +360,6 @@ fn resolve_helper(
     profiles: &std::collections::BTreeMap<String, Profile>,
     state: &UserState,
     state_path: &std::path::Path,
-    optional: bool,
     dry_run: bool,
     yes: bool,
 ) -> Result<Option<PackagePlanPreview>> {
@@ -380,11 +379,6 @@ fn resolve_helper(
             &generation,
             "--state-path",
             state_path_text,
-            if optional {
-                "--with-optional"
-            } else {
-                "--without-optional"
-            },
         ],
         "helper could not create package plan",
     )?;
@@ -427,11 +421,6 @@ fn resolve_helper(
             "--digest",
             &digest,
         ])
-        .arg(if optional {
-            "--with-optional"
-        } else {
-            "--without-optional"
-        })
         .status()
         .context("start Catdot package transaction")?;
     if !status.success() {
@@ -487,7 +476,6 @@ fn prune_helper(dry_run: bool, yes: bool) -> Result<()> {
             "0",
             "--digest",
             &digest,
-            "--without-optional",
         ])
         .status()
         .context("start Catdot prune transaction")?;
@@ -714,9 +702,8 @@ pub fn run() -> Result<i32> {
                 return Ok(0);
             }
             let declares_packages = active.components.keys().any(|role| {
-                component_for(ps, &active, role).is_ok_and(|(_, component, _)| {
-                    !component.packages.is_empty() || !component.optional_packages.is_empty()
-                })
+                component_for(ps, &active, role)
+                    .is_ok_and(|(_, component, _)| !component.packages.is_empty())
             });
             let package_declaration_changed = package_inputs != state.active_package_digests
                 && (!state.active_package_digests.is_empty() || declares_packages);
@@ -748,7 +735,6 @@ pub fn run() -> Result<i32> {
             write_state(&path, &new_state)?;
             journal.mark_state_written()?;
             journal.complete()?;
-            sync_active_settings(ps, &active)?;
             println!("Reapplied active configuration");
         }
         Cmd::Reset { profile } => {
@@ -769,13 +755,8 @@ pub fn run() -> Result<i32> {
             exec_role(ps, &state, &role, &arguments)?;
             return Ok(0);
         }
-        Cmd::Resolve {
-            dry_run,
-            yes,
-            with_optional,
-        } => {
-            let Some(preview) = resolve_helper(ps, &state, &path, with_optional, dry_run, yes)?
-            else {
+        Cmd::Resolve { dry_run, yes } => {
+            let Some(preview) = resolve_helper(ps, &state, &path, dry_run, yes)? else {
                 return Ok(0);
             };
             if !dry_run {
@@ -856,7 +837,6 @@ pub fn run() -> Result<i32> {
                         bail!("helper finalize failed; activation was rolled back")
                     }
                     journal.complete()?;
-                    sync_active_settings(refreshed_profiles, &state)?;
                 } else {
                     println!("Finalizing system records...");
                     io::stdout().flush()?;

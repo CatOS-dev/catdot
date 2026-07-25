@@ -11,4 +11,10 @@ fi
 case $generation in
   *[!0-9]*|'') generation=0 ;;
 esac
-printf '%s\n' "$((generation + 1))" >"$marker"
+temporary=$(mktemp "$state_dir/.generation.XXXXXX")
+cleanup() { rm -f "$temporary"; }
+trap cleanup EXIT HUP INT TERM
+printf '%s\n' "$((generation + 1))" >"$temporary"
+chmod 0644 "$temporary"
+mv -f "$temporary" "$marker"
+trap - EXIT HUP INT TERM

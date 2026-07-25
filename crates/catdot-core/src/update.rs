@@ -52,11 +52,7 @@ pub fn activation_digests(
         digest.update(profile.id.as_bytes());
         digest.update(reference.as_bytes());
         digest.update(component.role.as_bytes());
-        for package in component
-            .packages
-            .iter()
-            .chain(component.optional_packages.iter())
-        {
+        for package in &component.packages {
             digest.update(package.as_bytes());
             digest.update([0]);
         }
@@ -83,9 +79,6 @@ pub fn activation_digests(
                     digest.update(b"generate");
                     if let Some(template) = &entry.template {
                         digest.update(template.as_bytes());
-                    }
-                    if let Some(adapter) = &entry.adapter {
-                        digest.update(adapter.as_bytes());
                     }
                 }
                 crate::Lifecycle::Overwrite(crate::OverwriteMode::File) => {
@@ -130,11 +123,7 @@ pub fn package_digests(
             .and_then(|profile| profile.components.get(component_id))
             .ok_or_else(|| Error::Message(format!("component {reference} is not installed")))?;
         let mut digest = Sha256::new();
-        for package in component
-            .packages
-            .iter()
-            .chain(component.optional_packages.iter())
-        {
+        for package in &component.packages {
             digest.update(package.as_bytes());
             digest.update([0]);
         }
@@ -210,17 +199,13 @@ mod tests {
         let component = ComponentDef {
             role: "wm".into(),
             packages: vec![],
-            optional_packages: vec![],
             exec: vec![],
             xdg: XdgProvider::default(),
-            backend: None,
-            settings: BTreeMap::new(),
             configuration: vec![ConfigurationEntry {
                 target: ".config/niri/default.kdl".into(),
                 lifecycle: Lifecycle::Overwrite(OverwriteMode::Symlink),
                 source: Some("default.kdl".into()),
                 template: None,
-                adapter: None,
                 seed: None,
             }],
         };

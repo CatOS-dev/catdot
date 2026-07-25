@@ -27,10 +27,19 @@ pub struct ManagedRegistry {
 
 #[derive(Debug, Clone)]
 pub enum Materialization {
-    Generate { contents: Vec<u8> },
-    Symlink { source: PathBuf },
-    File { source: PathBuf },
-    User { seed: Option<PathBuf> },
+    Generate {
+        contents: Vec<u8>,
+    },
+    Symlink {
+        source: PathBuf,
+    },
+    File {
+        source: PathBuf,
+    },
+    User {
+        seed: Option<PathBuf>,
+        release_managed: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +83,25 @@ pub fn build_activation_plan(
     home: &Path,
     registry_path: &Path,
 ) -> Result<ActivationPlan> {
+    build_activation_plan_with_sources(profiles, state, home, registry_path, true)
+}
+
+pub fn build_activation_preview(
+    profiles: &BTreeMap<String, Profile>,
+    state: &UserState,
+    home: &Path,
+    registry_path: &Path,
+) -> Result<ActivationPlan> {
+    build_activation_plan_with_sources(profiles, state, home, registry_path, false)
+}
+
+fn build_activation_plan_with_sources(
+    profiles: &BTreeMap<String, Profile>,
+    state: &UserState,
+    home: &Path,
+    registry_path: &Path,
+    verify_sources: bool,
+) -> Result<ActivationPlan> {
     let previous = read_managed_registry(registry_path)?;
     let mut entries = Vec::new();
     for (role, reference) in &state.components {
@@ -92,9 +120,26 @@ pub fn build_activation_plan(
                 "{reference} does not provide role {role}"
             )));
         }
-        add_component_entries(&mut entries, profile, component, reference, home)?;
+        add_component_entries(
+            &mut entries,
+            profile,
+            component,
+            reference,
+            home,
+            verify_sources,
+        )?;
     }
     validate_conflicts(&entries, home)?;
+    for entry in &mut entries {
+        if let Materialization::User {
+            release_managed, ..
+        } = &mut entry.materialization
+        {
+            *release_managed = previous
+                .entries
+                .contains_key(&entry.target.display().to_string());
+        }
+    }
     if let Some(target) = previous
         .entries
         .keys()
@@ -108,7 +153,6 @@ pub fn build_activation_plan(
     }
     let current: BTreeSet<_> = entries
         .iter()
-        .filter(|entry| !matches!(entry.materialization, Materialization::User { .. }))
         .map(|entry| entry.target.display().to_string())
         .collect();
     let removals = previous
@@ -152,34 +196,40 @@ fn add_component_entries(
     component: &ComponentDef,
     owner: &str,
     home: &Path,
+    verify_sources: bool,
 ) -> Result<()> {
     for configuration in &component.configuration {
         let target = home.join(&configuration.target);
         let materialization = match &configuration.lifecycle {
             Lifecycle::Generate => Materialization::Generate {
-                contents: generated_contents(
-                    configuration.template.as_deref(),
-                    configuration.adapter.as_deref(),
-                )?,
+                contents: configuration
+                    .template
+                    .as_ref()
+                    .expect("validated template")
+                    .as_bytes()
+                    .to_vec(),
             },
             Lifecycle::Overwrite(OverwriteMode::Symlink) => Materialization::Symlink {
                 source: source(
                     profile,
                     configuration.source.as_ref().expect("validated source"),
+                    verify_sources,
                 )?,
             },
             Lifecycle::Overwrite(OverwriteMode::File) => Materialization::File {
                 source: source(
                     profile,
                     configuration.source.as_ref().expect("validated source"),
+                    verify_sources,
                 )?,
             },
             Lifecycle::User => Materialization::User {
                 seed: configuration
                     .seed
                     .as_ref()
-                    .map(|seed| source(profile, seed))
+                    .map(|seed| source(profile, seed, verify_sources))
                     .transpose()?,
+                release_managed: false,
             },
         };
         entries.push(PlannedTarget {
@@ -191,26 +241,15 @@ fn add_component_entries(
     Ok(())
 }
 
-fn source(profile: &Profile, relative: &Path) -> Result<PathBuf> {
+fn source(profile: &Profile, relative: &Path, verify_sources: bool) -> Result<PathBuf> {
     let path = profile.source_root.join(relative);
-    if fs::symlink_metadata(&path).is_err() {
+    if verify_sources && fs::symlink_metadata(&path).is_err() {
         return Err(Error::Message(format!(
             "configuration source {} does not exist",
             path.display()
         )));
     }
     Ok(path)
-}
-
-fn generated_contents(template: Option<&str>, adapter: Option<&str>) -> Result<Vec<u8>> {
-    if let Some(template) = template {
-        return Ok(template.as_bytes().to_vec());
-    }
-    match adapter {
-        Some("niri-includes") => Ok(b"include \"default.kdl\"\ninclude \"binds.kdl\"\ninclude \"layout.kdl\"\ninclude \"rules.kdl\"\ninclude \"custom/config.kdl\"\ninclude \"custom/binds.kdl\"\ninclude \"custom/layout.kdl\"\ninclude \"custom/rules.kdl\"\n".to_vec()),
-        Some(adapter) => Err(Error::Message(format!("unknown configuration adapter {adapter}"))),
-        None => Err(Error::Message("generate entry has no generator".into())),
-    }
 }
 
 fn validate_conflicts(entries: &[PlannedTarget], home: &Path) -> Result<()> {
@@ -305,17 +344,33 @@ fn apply_entry(entry: &PlannedTarget) -> Result<()> {
             rename_staged(&temporary, &entry.target)
         }
         Materialization::File { source } => replace_from(source, &entry.target),
-        Materialization::User { seed } if fs::symlink_metadata(&entry.target).is_err() => {
-            if let Some(seed) = seed {
-                copy_tree(seed, &entry.target)
-            } else {
-                fs::create_dir_all(&entry.target).map_err(|source| Error::Io {
+        Materialization::User {
+            seed,
+            release_managed,
+        } => match fs::symlink_metadata(&entry.target) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(seed) = seed {
+                    copy_tree(seed, &entry.target)
+                } else {
+                    fs::create_dir_all(&entry.target).map_err(|source| Error::Io {
+                        path: entry.target.display().to_string(),
+                        source,
+                    })
+                }
+            }
+            Ok(metadata) if *release_managed && metadata.file_type().is_symlink() => {
+                let resolved = fs::canonicalize(&entry.target).map_err(|source| Error::Io {
                     path: entry.target.display().to_string(),
                     source,
-                })
+                })?;
+                replace_from(&resolved, &entry.target)
             }
-        }
-        Materialization::User { .. } => Ok(()),
+            Ok(_) => Ok(()),
+            Err(source) => Err(Error::Io {
+                path: entry.target.display().to_string(),
+                source,
+            }),
+        },
     }
 }
 

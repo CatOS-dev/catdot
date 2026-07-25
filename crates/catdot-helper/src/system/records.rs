@@ -11,7 +11,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const SYSTEM_DIRECTORY_MODE: u32 = 0o700;
+const SYSTEM_DATABASE_MODE: u32 = 0o755;
+const SYSTEM_PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const SYSTEM_FILE_MODE: u32 = 0o600;
 
 pub fn user_record_path(database: &Path, uid: u32) -> PathBuf {
@@ -19,23 +20,30 @@ pub fn user_record_path(database: &Path, uid: u32) -> PathBuf {
 }
 
 pub fn ensure_system_database(database: &Path) -> Result<()> {
-    ensure_system_directory(database)?;
-    ensure_system_directory(&database.join("users"))?;
-    ensure_system_directory(&database.join("transactions"))
+    ensure_system_directory(database, SYSTEM_DATABASE_MODE)?;
+    ensure_system_directory(&database.join("users"), SYSTEM_PRIVATE_DIRECTORY_MODE)?;
+    ensure_system_directory(
+        &database.join("transactions"),
+        SYSTEM_PRIVATE_DIRECTORY_MODE,
+    )
 }
 
 pub fn write_system_file(path: &Path, contents: &str) -> Result<()> {
     let parent = path
         .parent()
         .context("system file has no parent directory")?;
-    ensure_system_directory(parent)?;
+    let mode = match parent.file_name().and_then(|name| name.to_str()) {
+        Some("users" | "transactions") => SYSTEM_PRIVATE_DIRECTORY_MODE,
+        _ => SYSTEM_DATABASE_MODE,
+    };
+    ensure_system_directory(parent, mode)?;
     catdot_core::atomic_write(path, contents)?;
     secure_path(path, SYSTEM_FILE_MODE)
 }
 
-fn ensure_system_directory(path: &Path) -> Result<()> {
+fn ensure_system_directory(path: &Path, mode: u32) -> Result<()> {
     fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
-    secure_path(path, SYSTEM_DIRECTORY_MODE)
+    secure_path(path, mode)
 }
 
 fn secure_path(path: &Path, mode: u32) -> Result<()> {
@@ -127,10 +135,49 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{load_records_for_owner, valid_records};
+    use super::{ensure_system_database, load_records_for_owner, valid_records, write_system_file};
     use catdot_core::UserRecord;
     use std::{collections::BTreeMap, fs, os::unix::fs::MetadataExt, path::PathBuf};
     use tempfile::tempdir;
+
+    #[test]
+    fn system_database_root_is_searchable_but_records_stay_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("catdot");
+        ensure_system_database(&database).unwrap();
+        write_system_file(&database.join("packages.toml"), "").unwrap();
+
+        assert_eq!(
+            fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(database.join("users"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(database.join("transactions"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(database.join("packages.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
 
     #[test]
     fn invalid_uid_records_are_not_aggregated() {

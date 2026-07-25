@@ -68,8 +68,10 @@ EOF
       HOME=/home/alice XDG_STATE_HOME=/home/alice/.local/state catdot select jq-test
       HOME=/home/alice XDG_STATE_HOME=/home/alice/.local/state catdot resolve --yes
     "
-    test "$(stat -c %a /var/lib/catdot)" = 700
+    test "$(stat -c %a /var/lib/catdot)" = 755
     test "$(stat -c %U:%G /var/lib/catdot)" = root:root
+    runuser -u alice -- test -x /var/lib/catdot
+    ! runuser -u alice -- test -r /var/lib/catdot/users/1000.toml
     test "$(stat -c %a /var/lib/catdot/users)" = 700
     test "$(stat -c %U:%G /var/lib/catdot/users/1000.toml)" = root:root
     test "$(stat -c %a /var/lib/catdot/users/1000.toml)" = 600
