@@ -1321,3 +1321,73 @@ environment = ["TERMINAL"]
     assert!(!state.contains("bar = \"demo/panel\""));
     assert!(state.contains("active_generation"));
 }
+
+// Profile packages need a state-free release check. Validation must operate on
+// an explicit profile root, report invalid default closures, and never create
+// user state or configuration as a side effect.
+#[test]
+fn validate_command_checks_profile_roots_without_touching_home() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let metadata = root.path().join("demo");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            "schema = 3\n[profile]\nid = \"demo\"\nname = \"Demo\"\ndescription = \"test\"\nsource_root = \"{}\"\n[defaults]\nterminal = \"terminal\"\n[[components]]\nid = \"terminal\"\nrole = \"terminal\"\n[components.exec]\nargv = [\"ghostty\"]\n",
+            root.path().join("share").display()
+        ),
+    )
+    .unwrap();
+    let valid = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .args(["validate", root.path().to_str().unwrap()])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    assert!(String::from_utf8_lossy(&valid.stdout).contains("validated profile demo"));
+    assert!(!home.path().join(".local/state/catdot").exists());
+    assert!(!home.path().join(".config").exists());
+
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            r#"schema = 3
+[profile]
+id = "demo"
+name = "Demo"
+description = "test"
+source_root = "{}"
+[defaults]
+browser = "browser"
+editor = "editor"
+[[components]]
+id = "browser"
+role = "browser"
+[components.xdg]
+command = "browser-editor"
+environment = ["EDITOR"]
+[[components]]
+id = "editor"
+role = "editor"
+[components.xdg]
+command = "nvim"
+environment = ["EDITOR"]
+"#,
+            root.path().join("share").display()
+        ),
+    )
+    .unwrap();
+    let invalid = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .args(["validate", root.path().to_str().unwrap()])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("default xdg conflict"));
+    assert!(!home.path().join(".local/state/catdot").exists());
+}

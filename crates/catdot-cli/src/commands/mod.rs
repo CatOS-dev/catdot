@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use std::{
     collections::BTreeSet,
     io::{self, Write},
+    path::{Path, PathBuf},
     process::Command,
 };
 
@@ -30,6 +31,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Validate all profile declarations under an explicit root.
+    #[command(about = "Validate profile packages without changing user state")]
+    Validate {
+        /// Directory containing one subdirectory per profile.
+        #[arg(value_name = "PROFILE_ROOT")]
+        profile_root: PathBuf,
+    },
     /// List installed profiles or inspect one profile.
     #[command(about = "List installed profiles")]
     List {
@@ -151,6 +159,29 @@ enum UsersCmd {
         #[arg(long)]
         yes: bool,
     },
+}
+
+fn validate_profile_root(root: &Path) -> Result<i32> {
+    let registry = discover_profile_registry(root)?;
+    for profile in registry.valid_profiles.values() {
+        println!("validated profile {}", profile.id);
+    }
+    for diagnostic in &registry.diagnostics {
+        eprintln!(
+            "invalid profile {}: {}",
+            diagnostic.manifest_path.display(),
+            diagnostic.message
+        );
+    }
+    if registry.valid_profiles.is_empty() && registry.diagnostics.is_empty() {
+        eprintln!("no profiles found under {}", root.display());
+        return Ok(2);
+    }
+    Ok(if registry.diagnostics.is_empty() {
+        0
+    } else {
+        2
+    })
 }
 
 fn confirm(yes: bool) -> Result<()> {
@@ -668,6 +699,9 @@ fn retain_available_active_components(
 
 pub fn run() -> Result<i32> {
     let cli = Cli::parse();
+    if let Cmd::Validate { profile_root } = &cli.command {
+        return validate_profile_root(profile_root);
+    }
     let registry = profiles()?;
     let ps = &registry.valid_profiles;
     let path = state_file()?;
@@ -733,6 +767,7 @@ pub fn run() -> Result<i32> {
         }
     }
     match cli.command {
+        Cmd::Validate { .. } => unreachable!("handled before user state initialization"),
         Cmd::List { profile } => {
             if let Some(id) = profile {
                 let p = match ps.get(&id) {
