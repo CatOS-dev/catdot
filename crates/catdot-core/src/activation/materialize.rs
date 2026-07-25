@@ -30,6 +30,15 @@ pub struct ManagedRegistry {
 }
 
 #[derive(Debug, Clone)]
+pub struct MergeConflict {
+    directory: PathBuf,
+    base: String,
+    local: String,
+    upstream: String,
+    merged: String,
+}
+
+#[derive(Debug, Clone)]
 pub enum Materialization {
     Generate {
         contents: Vec<u8>,
@@ -45,6 +54,7 @@ pub enum Materialization {
         contents: Vec<u8>,
         base: String,
         ready: bool,
+        conflict: Option<MergeConflict>,
     },
     User {
         seed: Option<PathBuf>,
@@ -181,6 +191,13 @@ pub fn build_activation_preview(
     build_activation_plan_with_sources(profiles, state, home, registry_path, false)
 }
 
+struct PlanningContext<'a> {
+    home: &'a Path,
+    previous: &'a ManagedRegistry,
+    conflict_root: PathBuf,
+    verify_sources: bool,
+}
+
 fn build_activation_plan_with_sources(
     profiles: &BTreeMap<String, Profile>,
     state: &UserState,
@@ -189,6 +206,15 @@ fn build_activation_plan_with_sources(
     verify_sources: bool,
 ) -> Result<ActivationPlan> {
     let previous = read_managed_registry(registry_path)?;
+    let context = PlanningContext {
+        home,
+        previous: &previous,
+        conflict_root: registry_path
+            .parent()
+            .ok_or_else(|| Error::Message("managed registry has no parent".into()))?
+            .join("conflicts"),
+        verify_sources,
+    };
     let mut entries = Vec::new();
     for (role, reference) in &state.components {
         let (profile_id, component_id) = reference
@@ -206,15 +232,7 @@ fn build_activation_plan_with_sources(
                 "{reference} does not provide role {role}"
             )));
         }
-        add_component_entries(
-            &mut entries,
-            profile,
-            component,
-            reference,
-            home,
-            &previous,
-            verify_sources,
-        )?;
+        add_component_entries(&mut entries, profile, component, reference, &context)?;
     }
     validate_conflicts(&entries, home)?;
     for entry in &mut entries {
@@ -294,12 +312,10 @@ fn add_component_entries(
     profile: &Profile,
     component: &ComponentDef,
     owner: &str,
-    home: &Path,
-    previous: &ManagedRegistry,
-    verify_sources: bool,
+    context: &PlanningContext<'_>,
 ) -> Result<()> {
     for configuration in &component.configuration {
-        let target = home.join(&configuration.target);
+        let target = context.home.join(&configuration.target);
         let materialization = match &configuration.lifecycle {
             Lifecycle::Generate => {
                 if let Some(template) = &configuration.template {
@@ -311,7 +327,7 @@ fn add_component_entries(
                         source: source(
                             profile,
                             configuration.source.as_ref().expect("validated source"),
-                            verify_sources,
+                            context.verify_sources,
                         )?,
                     }
                 }
@@ -320,21 +336,22 @@ fn add_component_entries(
                 source: source(
                     profile,
                     configuration.source.as_ref().expect("validated source"),
-                    verify_sources,
+                    context.verify_sources,
                 )?,
             },
             Lifecycle::Merge => build_merge_materialization(
                 profile,
                 configuration.source.as_ref().expect("validated source"),
                 &target,
-                previous,
-                verify_sources,
+                context.previous,
+                &context.conflict_root,
+                context.verify_sources,
             )?,
             Lifecycle::User => Materialization::User {
                 seed: configuration
                     .seed
                     .as_ref()
-                    .map(|seed| source(profile, seed, verify_sources))
+                    .map(|seed| source(profile, seed, context.verify_sources))
                     .transpose()?,
                 release_managed: false,
                 initialized: false,
@@ -354,6 +371,7 @@ fn build_merge_materialization(
     relative: &Path,
     target: &Path,
     previous: &ManagedRegistry,
+    conflict_root: &Path,
     verify_sources: bool,
 ) -> Result<Materialization> {
     let source = source(profile, relative, verify_sources)?;
@@ -367,6 +385,7 @@ fn build_merge_materialization(
                 .and_then(|entry| entry.merge_base.clone())
                 .unwrap_or_default(),
             ready: false,
+            conflict: None,
         });
     }
     let upstream = fs::read_to_string(&source).map_err(|source_error| Error::Io {
@@ -392,11 +411,24 @@ fn build_merge_materialization(
         (None, _) | (_, None) => upstream.clone(),
         (Some(base), Some(local)) if local == base => upstream.clone(),
         (Some(base), Some(local)) if upstream == base || local == upstream => local.to_owned(),
-        (Some(_), Some(_)) => {
-            return Err(Error::Message(format!(
-                "merge conflict for {}; current configuration was preserved",
-                target.display()
-            )));
+        (Some(base), Some(local)) => {
+            let mut digest = Sha256::new();
+            digest.update(target.as_os_str().as_encoded_bytes());
+            let directory = conflict_root.join(format!("{:x}", digest.finalize()));
+            let conflict = MergeConflict {
+                directory,
+                base: base.to_owned(),
+                local: local.to_owned(),
+                upstream: upstream.clone(),
+                merged: format!("<<<<<<< local\n{local}=======\n{upstream}>>>>>>> upstream\n"),
+            };
+            return Ok(Materialization::Merge {
+                source,
+                contents: local.as_bytes().to_vec(),
+                base: upstream,
+                ready: true,
+                conflict: Some(conflict),
+            });
         }
     };
     Ok(Materialization::Merge {
@@ -404,6 +436,7 @@ fn build_merge_materialization(
         contents: merged.into_bytes(),
         base: upstream,
         ready: true,
+        conflict: None,
     })
 }
 
@@ -602,12 +635,23 @@ fn apply_entry(entry: &PlannedTarget) -> Result<()> {
         }
         Materialization::File { source } => replace_from(source, &entry.target),
         Materialization::Merge {
-            contents, ready, ..
+            contents,
+            ready,
+            conflict,
+            ..
         } => {
             if !ready {
                 return Err(Error::Message(format!(
                     "merge source for {} is not available",
                     entry.target.display()
+                )));
+            }
+            if let Some(conflict) = conflict {
+                write_merge_conflict(conflict)?;
+                return Err(Error::Message(format!(
+                    "merge conflict for {}; current configuration was preserved; recovery inputs: {}",
+                    entry.target.display(),
+                    conflict.directory.display()
                 )));
             }
             replace_file(&entry.target, contents, 0o644)
@@ -644,6 +688,17 @@ fn apply_entry(entry: &PlannedTarget) -> Result<()> {
             }),
         },
     }
+}
+
+fn write_merge_conflict(conflict: &MergeConflict) -> Result<()> {
+    fs::create_dir_all(&conflict.directory).map_err(|source| Error::Io {
+        path: conflict.directory.display().to_string(),
+        source,
+    })?;
+    atomic_write(&conflict.directory.join("base"), &conflict.base)?;
+    atomic_write(&conflict.directory.join("local"), &conflict.local)?;
+    atomic_write(&conflict.directory.join("upstream"), &conflict.upstream)?;
+    atomic_write(&conflict.directory.join("merged"), &conflict.merged)
 }
 
 fn replace_file(target: &Path, contents: &[u8], mode: u32) -> Result<()> {

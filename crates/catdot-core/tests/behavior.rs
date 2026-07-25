@@ -1509,3 +1509,65 @@ fn switching_away_from_merge_backs_up_then_reinstalls_fresh() {
     .unwrap();
     assert_eq!(fs::read_to_string(target).unwrap(), "fresh\n");
 }
+
+// Protects a user's working desktop when both the packaged default and local
+// merge file changed: no conflict markers may enter the live configuration,
+// and all three inputs must be available for manual recovery.
+#[test]
+fn merge_conflict_preserves_live_file_and_writes_recovery_inputs() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    let source = temp.path().join("share/demo");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::create_dir_all(&source).unwrap();
+    let upstream = source.join("binds.kdl");
+    fs::write(&upstream, "base\n").unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            "schema = 3\n[profile]\nid = \"demo\"\nname = \"Demo\"\ndescription = \"test\"\nsource_root = \"{}\"\n[defaults]\ndesktop = \"desktop\"\n[[components]]\nid = \"desktop\"\nrole = \"desktop\"\n[[components.configuration]]\ntarget = \".config/demo/binds.kdl\"\nlifecycle = \"merge\"\nsource = \"binds.kdl\"\n",
+            source.display()
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    let home = temp.path().join("home");
+    let registry = home.join(".local/state/catdot/managed.toml");
+    apply_configuration(
+        &build_activation_plan(&profiles, &state, &home, &registry).unwrap(),
+        &registry,
+        &home,
+    )
+    .unwrap();
+    let target = home.join(".config/demo/binds.kdl");
+    fs::write(&target, "local\n").unwrap();
+    fs::write(&upstream, "upstream\n").unwrap();
+
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let plan = build_activation_plan(&profiles, &state, &home, &registry).unwrap();
+    assert!(apply_configuration(&plan, &registry, &home).is_err());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "local\n");
+
+    let conflicts = home.join(".local/state/catdot/conflicts");
+    let conflict = fs::read_dir(conflicts)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(fs::read_to_string(conflict.join("base")).unwrap(), "base\n");
+    assert_eq!(
+        fs::read_to_string(conflict.join("local")).unwrap(),
+        "local\n"
+    );
+    assert_eq!(
+        fs::read_to_string(conflict.join("upstream")).unwrap(),
+        "upstream\n"
+    );
+    assert!(
+        fs::read_to_string(conflict.join("merged"))
+            .unwrap()
+            .contains("<<<<<<< local")
+    );
+}
