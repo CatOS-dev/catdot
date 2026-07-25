@@ -1,5 +1,6 @@
 use crate::{ActivationJournal, ComponentDef, Error, Result, UserState};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -100,6 +101,38 @@ pub fn build_xdg_plan(
 impl XdgPlan {
     pub fn has_changes(&self) -> bool {
         self.changed
+    }
+
+    pub fn identity_digest(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(self.path.as_os_str().as_encoded_bytes());
+        digest.update([0]);
+        digest.update(self.registry_path.as_os_str().as_encoded_bytes());
+        digest.update([0]);
+        for (association, desktop) in &self.defaults {
+            digest.update(b"default\0");
+            digest.update(association.as_bytes());
+            digest.update([0]);
+            digest.update(desktop.as_bytes());
+            digest.update([0xff]);
+        }
+        for (association, desktop) in &self.restore {
+            digest.update(b"restore\0");
+            digest.update(association.as_bytes());
+            digest.update([0]);
+            if let Some(desktop) = desktop {
+                digest.update(desktop.as_bytes());
+            }
+            digest.update([0xff]);
+        }
+        digest.update(self.rendered.as_bytes());
+        digest.update([0]);
+        digest.update(
+            toml::to_string(&self.registry)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        format!("{:x}", digest.finalize())
     }
 }
 

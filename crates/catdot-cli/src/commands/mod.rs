@@ -250,11 +250,29 @@ fn print_package_plan(preview: &PackagePlanPreview) {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActivationIdentity {
+    configuration: String,
+    xdg: String,
+}
+
+#[derive(Debug, Clone)]
+struct ActivationPreview {
+    changes: bool,
+    identity: ActivationIdentity,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvePreview {
+    package: PackagePlanPreview,
+    activation: ActivationPreview,
+}
+
 fn print_activation_plan(
     profiles: &std::collections::BTreeMap<String, Profile>,
     state: &UserState,
     state_path: &std::path::Path,
-) -> Result<bool> {
+) -> Result<ActivationPreview> {
     let roles = state
         .components
         .keys()
@@ -356,7 +374,13 @@ fn print_activation_plan(
         || plan.removals.iter().any(|target| target.exists());
     let selection_changes = !activate.is_empty() || !change.is_empty() || !deactivate.is_empty();
     let xdg_changes = xdg_plan.has_changes();
-    Ok(selection_changes || configuration_changes || xdg_changes)
+    Ok(ActivationPreview {
+        changes: selection_changes || configuration_changes || xdg_changes,
+        identity: ActivationIdentity {
+            configuration: plan.identity_digest(),
+            xdg: xdg_plan.identity_digest(),
+        },
+    })
 }
 
 fn resolve_helper(
@@ -365,7 +389,7 @@ fn resolve_helper(
     state_path: &std::path::Path,
     dry_run: bool,
     yes: bool,
-) -> Result<Option<PackagePlanPreview>> {
+) -> Result<Option<ResolvePreview>> {
     let uid = unsafe { libc::geteuid() }.to_string();
     let generation = state.generation.to_string();
     let state_path_text = state_path
@@ -388,20 +412,23 @@ fn resolve_helper(
     let preview: PackagePlanPreview = toml::from_str(&String::from_utf8_lossy(&output.stdout))
         .context("parse canonical package plan from helper")?;
     print_package_plan(&preview);
-    let activation_changes = print_activation_plan(profiles, state, state_path)?;
+    let activation = print_activation_plan(profiles, state, state_path)?;
     let needs_work =
-        package_changes(&preview.plan) || activation_changes || preview.system_update_required;
+        package_changes(&preview.plan) || activation.changes || preview.system_update_required;
     if !needs_work {
         println!("Catdot is already up to date.");
         return Ok(None);
     }
-    if preview.system_update_required && !package_changes(&preview.plan) && !activation_changes {
+    if preview.system_update_required && !package_changes(&preview.plan) && !activation.changes {
         println!("System records need synchronization.");
     }
     if dry_run {
-        return Ok(Some(preview));
+        return Ok(Some(ResolvePreview {
+            package: preview,
+            activation,
+        }));
     }
-    if package_changes(&preview.plan) || activation_changes {
+    if package_changes(&preview.plan) || activation.changes {
         confirm(yes)?;
     }
     if package_changes(&preview.plan) {
@@ -429,7 +456,10 @@ fn resolve_helper(
     if !status.success() {
         bail!("helper transaction failed")
     }
-    Ok(Some(preview))
+    Ok(Some(ResolvePreview {
+        package: preview,
+        activation,
+    }))
 }
 
 fn prune_helper(dry_run: bool, yes: bool) -> Result<()> {
@@ -836,30 +866,54 @@ pub fn run() -> Result<i32> {
                 }
                 let home = runtime::home()?;
                 let registry_path = managed_targets_path(&path)?;
-                // This validates all post-install sources before any HOME
-                // target is touched. `apply` builds the same plan again while
-                // holding the activation journal.
-                build_activation_plan(refreshed_profiles, &state, &home, &registry_path)?;
-                let activation_changes = state.active_components != state.components
+                let configuration_plan =
+                    build_activation_plan(refreshed_profiles, &state, &home, &registry_path)?;
+                let xdg_plan =
+                    build_xdg_plan(refreshed_profiles, &state, &runtime::xdg_config_home(&home))?;
+                let actual_identity = ActivationIdentity {
+                    configuration: configuration_plan.identity_digest(),
+                    xdg: xdg_plan.identity_digest(),
+                };
+                if actual_identity != preview.activation.identity {
+                    bail!("activation plan changed after confirmation; run catdot resolve again")
+                }
+
+                let selection_changes = state.active_components != state.components
                     || state.active_generation != state.generation;
-                if activation_changes {
+                let activation_inputs = activation_digests(refreshed_profiles, &state)?;
+                let package_inputs = package_digests(refreshed_profiles, &state)?;
+                let activation_inputs_changed = activation_inputs != state.activation_digests;
+                let package_inputs_changed = package_inputs != state.active_package_digests;
+                let state_commit_needed = selection_changes
+                    || activation_inputs_changed
+                    || package_inputs_changed
+                    || state.needs_resolve;
+
+                if state_commit_needed {
                     println!("Applying user configuration...");
                     io::stdout().flush()?;
                     let mut new_state = state.clone();
                     new_state.active_components = new_state.components.clone();
                     new_state.active_generation = new_state.generation;
-                    new_state.activation_digests =
-                        activation_digests(refreshed_profiles, &new_state)?;
-                    new_state.active_package_digests =
-                        package_digests(refreshed_profiles, &new_state)?;
+                    new_state.activation_digests = activation_inputs;
+                    new_state.active_package_digests = package_inputs;
                     new_state.active_system_generation = read_system_generation()?;
                     new_state.needs_resolve = false;
                     let mut journal =
                         ActivationJournal::begin(&path, old_state.clone(), new_state.clone())?;
                     journal.mark_applying()?;
-                    if let Err(error) = apply(refreshed_profiles, &state, &mut journal) {
-                        recover_activation_journals(&path)?;
-                        return Err(error);
+                    if selection_changes || activation_inputs_changed {
+                        let applied = activate_configuration(
+                            &configuration_plan,
+                            &registry_path,
+                            &mut journal,
+                        )
+                        .and_then(|_| activate_xdg(&xdg_plan, &mut journal))
+                        .and_then(|_| journal.mark_applied());
+                        if let Err(error) = applied {
+                            recover_activation_journals(&path)?;
+                            return Err(error.into());
+                        }
                     }
                     if let Err(error) = write_state(&path, &new_state) {
                         recover_activation_journals(&path)?;
@@ -920,7 +974,7 @@ pub fn run() -> Result<i32> {
                         bail!("helper finalize failed; pending requirements were retained")
                     }
                 }
-                print_success_summary(&old_state, &state, &preview.plan);
+                print_success_summary(&old_state, &state, &preview.package.plan);
             }
         }
         Cmd::Prune { dry_run, yes } => prune_helper(dry_run, yes)?,

@@ -865,3 +865,124 @@ fn generation_only_update_does_not_rewrite_managed_configuration() {
     assert_eq!(fs::metadata(target).unwrap().ino(), inode);
     assert!(String::from_utf8_lossy(&second.stdout).contains("Active profile is current"));
 }
+
+// The configuration/XDG plan shown before confirmation is part of the
+// transaction identity. A package or concurrent system update may refresh a
+// Profile, but changed targets must be shown in a new resolve rather than
+// silently applied under the old confirmation.
+#[test]
+fn resolve_rejects_an_activation_plan_changed_after_confirmation() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let metadata = root.path().join("demo");
+    let source = root.path().join("share");
+    let bin = root.path().join("bin");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(source.join("old"), "old-source").unwrap();
+    fs::write(source.join("new"), "new-source").unwrap();
+    let manifest = metadata.join("profile.toml");
+    let manifest_text = |target: &str| {
+        format!(
+            "schema = 2\n[profile]\nid = \"demo\"\nname = \"Demo\"\ndescription = \"test\"\nsource_root = \"{}\"\n[[components]]\nid = \"main\"\nrole = \"tool\"\n[[components.configuration]]\ntarget = \".config/demo/{target}\"\nlifecycle = \"overwrite\"\nmode = \"file\"\nsource = \"{target}\"\n",
+            source.display()
+        )
+    };
+    fs::write(&manifest, manifest_text("old")).unwrap();
+    let replacement = root.path().join("replacement.toml");
+    fs::write(&replacement, manifest_text("new")).unwrap();
+    let state = home.path().join(".local/state/catdot/state.toml");
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::write(
+        &state,
+        "schema = 1\ngeneration = 1\n[components]\ntool = \"demo/main\"\n",
+    )
+    .unwrap();
+    let pkexec = bin.join("pkexec");
+    fs::write(
+        &pkexec,
+        format!(
+            "#!/bin/sh\ncase \"$2\" in\n  resolve-plan) printf '%s\\n' 'system_update_required = false' '[plan]' 'install = []' 'remove = []' 'replacements = []' 'satisfied = []' '[requirements]' ;;\n  resolve) /usr/bin/cp '{}' '{}' ;;\n  finalize) exit 0 ;;\n  *) exit 1 ;;\nesac\n",
+            replacement.display(),
+            manifest.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&pkexec, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .args(["resolve", "--yes"])
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("activation plan changed"));
+    assert!(!home.path().join(".config/demo/old").exists());
+    assert!(!home.path().join(".config/demo/new").exists());
+}
+
+// Resolve is also the acknowledgement boundary for changed dependency
+// declarations. Even when desired and active components are identical, a
+// successful resolve must refresh digests and clear needs_resolve.
+#[test]
+fn resolve_clears_needs_resolve_without_a_selection_change() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let metadata = root.path().join("demo");
+    let source = root.path().join("share");
+    let bin = root.path().join("bin");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            "schema = 2\n[profile]\nid = \"demo\"\nname = \"Demo\"\ndescription = \"test\"\nsource_root = \"{}\"\n[[components]]\nid = \"main\"\nrole = \"tool\"\n[[components.configuration]]\ntarget = \".config/demo/config\"\nlifecycle = \"generate\"\ntemplate = \"managed\"\n",
+            source.display()
+        ),
+    )
+    .unwrap();
+    let target = home.path().join(".config/demo/config");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "managed").unwrap();
+    let state = home.path().join(".local/state/catdot/state.toml");
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::write(
+        &state,
+        "schema = 1\ngeneration = 1\nactive_generation = 1\nneeds_resolve = true\n[components]\ntool = \"demo/main\"\n[active_components]\ntool = \"demo/main\"\n[active_package_digests]\ntool = \"old\"\n",
+    )
+    .unwrap();
+    let pkexec = bin.join("pkexec");
+    fs::write(
+        &pkexec,
+        "#!/bin/sh\ncase \"$2\" in\n  resolve-plan) printf '%s\\n' 'system_update_required = true' '[plan]' 'install = []' 'remove = []' 'replacements = []' 'satisfied = []' '[requirements]' ;;\n  resolve|finalize) exit 0 ;;\n  *) exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&pkexec, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .args(["resolve", "--yes"])
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let state = fs::read_to_string(state).unwrap();
+    assert!(state.contains("needs_resolve = false"));
+    assert!(!state.contains("tool = \"old\""));
+}

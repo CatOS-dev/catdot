@@ -3,6 +3,7 @@ use crate::{
     atomic_write,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -57,6 +58,56 @@ pub struct ActivationPlan {
     pub entries: Vec<PlannedTarget>,
     pub removals: Vec<PathBuf>,
     registry: ManagedRegistry,
+}
+
+impl ActivationPlan {
+    pub fn identity_digest(&self) -> String {
+        let mut digest = Sha256::new();
+        for entry in &self.entries {
+            digest.update(b"entry\0");
+            digest.update(entry.target.as_os_str().as_encoded_bytes());
+            digest.update([0]);
+            digest.update(entry.owner.as_bytes());
+            digest.update([0]);
+            match &entry.materialization {
+                Materialization::Generate { contents } => {
+                    digest.update(b"generate\0");
+                    digest.update(contents);
+                }
+                Materialization::Symlink { source } => {
+                    digest.update(b"symlink\0");
+                    digest.update(source.as_os_str().as_encoded_bytes());
+                }
+                Materialization::File { source } => {
+                    digest.update(b"file\0");
+                    digest.update(source.as_os_str().as_encoded_bytes());
+                }
+                Materialization::User {
+                    seed,
+                    release_managed,
+                    initialized,
+                } => {
+                    digest.update(b"user\0");
+                    if let Some(seed) = seed {
+                        digest.update(seed.as_os_str().as_encoded_bytes());
+                    }
+                    digest.update([0, *release_managed as u8, *initialized as u8]);
+                }
+            }
+            digest.update([0xff]);
+        }
+        for removal in &self.removals {
+            digest.update(b"remove\0");
+            digest.update(removal.as_os_str().as_encoded_bytes());
+            digest.update([0xff]);
+        }
+        digest.update(
+            toml::to_string(&self.registry)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        format!("{:x}", digest.finalize())
+    }
 }
 
 pub fn managed_targets_path(state_path: &Path) -> Result<PathBuf> {
