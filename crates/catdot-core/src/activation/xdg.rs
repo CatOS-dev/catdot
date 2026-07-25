@@ -17,13 +17,16 @@ pub struct XdgPlan {
     pub restore: BTreeMap<String, Option<String>>,
     pub environment_path: PathBuf,
     pub environment: BTreeMap<String, String>,
+    pub environment_restore: bool,
+    pub environment_remove: bool,
     pub warnings: Vec<String>,
     registry_path: PathBuf,
     registry: XdgRegistry,
     rendered: String,
-    environment_rendered: String,
+    environment_output: Option<String>,
     mime_changed: bool,
     environment_changed: bool,
+    registry_changed: bool,
     changed: bool,
 }
 
@@ -32,6 +35,10 @@ struct XdgRegistry {
     previous: BTreeMap<String, String>,
     #[serde(default)]
     absent: BTreeSet<String>,
+    #[serde(default)]
+    environment_previous: Option<String>,
+    #[serde(default)]
+    environment_absent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,41 +106,66 @@ pub fn build_xdg_plan(
     }
     let restore = old
         .previous
-        .into_iter()
-        .map(|(association, desktop)| (association, Some(desktop)))
+        .iter()
+        .map(|(association, desktop)| (association.clone(), Some(desktop.clone())))
         .chain(
             old.absent
-                .into_iter()
-                .map(|association| (association, None)),
+                .iter()
+                .map(|association| (association.clone(), None)),
         )
         .filter(|(association, _)| !defaults.contains_key(association))
         .collect();
     let rendered = render_mimeapps(&existing_text, &defaults, &restore);
-    let mime_changed = (!defaults.is_empty() || !restore.is_empty())
-        && (rendered != existing_text || registry != previous_registry);
+    let mime_changed = (!defaults.is_empty() || !restore.is_empty()) && rendered != existing_text;
 
     let environment_path = config_home.join("environment.d/90-catdot.conf");
+    let environment_exists = environment_path.exists();
     let existing_environment = read_text(&environment_path)?;
-    let environment_rendered = render_environment(&environment);
-    let environment_changed = if environment.is_empty() {
-        environment_path.exists()
+    let old_environment_owned = old.environment_previous.is_some() || old.environment_absent;
+    let (environment_output, environment_changed) = if environment.is_empty() {
+        if old_environment_owned {
+            let output = old.environment_previous.clone();
+            let changed = match &output {
+                Some(previous) => !environment_exists || existing_environment != *previous,
+                None => environment_exists,
+            };
+            (output, changed)
+        } else {
+            (None, false)
+        }
     } else {
-        environment_rendered != existing_environment
+        if old_environment_owned {
+            registry.environment_previous = old.environment_previous.clone();
+            registry.environment_absent = old.environment_absent;
+        } else if environment_exists {
+            registry.environment_previous = Some(existing_environment.clone());
+        } else {
+            registry.environment_absent = true;
+        }
+        let output = render_environment(&environment);
+        let changed = !environment_exists || output != existing_environment;
+        (Some(output), changed)
     };
-    let changed = mime_changed || environment_changed;
+    let environment_restore = environment.is_empty() && old.environment_previous.is_some();
+    let environment_remove = environment.is_empty() && old.environment_absent;
+    let registry_changed = registry != previous_registry;
+    let changed = mime_changed || environment_changed || registry_changed;
     Ok(XdgPlan {
         path,
         defaults,
         restore,
         environment_path,
         environment,
+        environment_restore,
+        environment_remove,
         warnings,
         registry_path,
         registry,
         rendered,
-        environment_rendered,
+        environment_output,
         mime_changed,
         environment_changed,
+        registry_changed,
         changed,
     })
 }
@@ -176,7 +208,13 @@ impl XdgPlan {
         }
         digest.update(self.rendered.as_bytes());
         digest.update([0]);
-        digest.update(self.environment_rendered.as_bytes());
+        match &self.environment_output {
+            Some(output) => {
+                digest.update(b"environment-output\0");
+                digest.update(output.as_bytes());
+            }
+            None => digest.update(b"environment-remove\0"),
+        }
         digest.update([0]);
         digest.update(
             toml::to_string(&self.registry)
@@ -284,17 +322,13 @@ pub fn activate_xdg(plan: &XdgPlan, journal: &mut ActivationJournal) -> Result<(
     }
     if plan.mime_changed {
         journal.track_path(&plan.path)?;
-        journal.track_path(&plan.registry_path)?;
         crate::atomic_write(&plan.path, &plan.rendered)?;
-        crate::atomic_write(
-            &plan.registry_path,
-            &toml::to_string_pretty(&plan.registry)
-                .map_err(|error| Error::Message(error.to_string()))?,
-        )?;
     }
     if plan.environment_changed {
         journal.track_path(&plan.environment_path)?;
-        if plan.environment.is_empty() {
+        if let Some(output) = &plan.environment_output {
+            crate::atomic_write(&plan.environment_path, output)?;
+        } else {
             match fs::remove_file(&plan.environment_path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -305,9 +339,15 @@ pub fn activate_xdg(plan: &XdgPlan, journal: &mut ActivationJournal) -> Result<(
                     });
                 }
             }
-        } else {
-            crate::atomic_write(&plan.environment_path, &plan.environment_rendered)?;
         }
+    }
+    if plan.registry_changed {
+        journal.track_path(&plan.registry_path)?;
+        crate::atomic_write(
+            &plan.registry_path,
+            &toml::to_string_pretty(&plan.registry)
+                .map_err(|error| Error::Message(error.to_string()))?,
+        )?;
     }
     journal.mark_applied()
 }

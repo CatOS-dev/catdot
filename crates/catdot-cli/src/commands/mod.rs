@@ -389,7 +389,12 @@ fn print_activation_plan(
         for (key, command) in &xdg_plan.environment {
             println!("  xdg environment: {key}={command}");
         }
-        if xdg_plan.environment.is_empty() && xdg_plan.environment_path.exists() {
+        if xdg_plan.environment_restore {
+            println!(
+                "  restore xdg environment: {}",
+                xdg_plan.environment_path.display()
+            );
+        } else if xdg_plan.environment_remove {
             println!(
                 "  remove xdg environment: {}",
                 xdg_plan.environment_path.display()

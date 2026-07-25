@@ -1819,3 +1819,63 @@ role = "two"
     assert!(error.to_string().contains("autostart cycle"));
     assert!(!temp.path().join("home").exists());
 }
+
+// Protects an existing user environment file across Catdot ownership. The
+// first provider switch may replace it transactionally, but disabling the last
+// provider must restore the exact pre-Catdot contents rather than deleting it.
+#[test]
+fn xdg_environment_restores_the_preexisting_file_after_disable() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    fs::create_dir_all(&metadata).unwrap();
+    let source = temp.path().join("share/demo");
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            r#"schema = 3
+[profile]
+id = "demo"
+name = "Demo"
+description = "test"
+source_root = "{}"
+[defaults]
+terminal = "terminal"
+[[components]]
+id = "terminal"
+role = "terminal"
+[components.xdg]
+command = "ghostty"
+environment = ["TERMINAL"]
+"#,
+            source.display()
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let mut state = select_profile(&profiles["demo"]).unwrap();
+    let config = temp.path().join("home/.config");
+    let state_path = temp.path().join("home/.local/state/catdot/state.toml");
+    let environment = config.join("environment.d/90-catdot.conf");
+    fs::create_dir_all(environment.parent().unwrap()).unwrap();
+    fs::write(&environment, "CUSTOM=value\n").unwrap();
+
+    let plan = build_xdg_plan(&profiles, &state, &config).unwrap();
+    let mut journal =
+        ActivationJournal::begin(&state_path, UserState::default(), UserState::default()).unwrap();
+    journal.mark_applying().unwrap();
+    activate_xdg(&plan, &mut journal).unwrap();
+    journal.complete().unwrap();
+    assert_eq!(
+        fs::read_to_string(&environment).unwrap(),
+        "TERMINAL=ghostty\n"
+    );
+
+    state.components.clear();
+    let plan = build_xdg_plan(&profiles, &state, &config).unwrap();
+    let mut journal =
+        ActivationJournal::begin(&state_path, UserState::default(), UserState::default()).unwrap();
+    journal.mark_applying().unwrap();
+    activate_xdg(&plan, &mut journal).unwrap();
+    journal.complete().unwrap();
+    assert_eq!(fs::read_to_string(environment).unwrap(), "CUSTOM=value\n");
+}
