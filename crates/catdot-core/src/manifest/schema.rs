@@ -45,6 +45,7 @@ struct RawComponent {
     packages: Vec<String>,
     exec: Option<RawExec>,
     xdg: Option<RawXdg>,
+    wm: Option<RawWm>,
     #[serde(default)]
     configuration: Vec<RawConfiguration>,
 }
@@ -66,6 +67,25 @@ struct RawXdg {
     mime_types: Vec<String>,
     #[serde(default)]
     uri_schemes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWm {
+    autostart_target: String,
+    autostart_template: String,
+    #[serde(default)]
+    autostart: Vec<RawWmAutostart>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWmAutostart {
+    role: String,
+    #[serde(default)]
+    before: Vec<String>,
+    #[serde(default)]
+    after: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -106,6 +126,20 @@ pub struct XdgProvider {
 }
 
 #[derive(Debug, Clone)]
+pub struct WmConfig {
+    pub autostart_target: PathBuf,
+    pub autostart_template: String,
+    pub autostart: Vec<WmAutostart>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WmAutostart {
+    pub role: String,
+    pub before: Vec<String>,
+    pub after: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Profile {
     pub id: String,
     pub name: String,
@@ -123,6 +157,7 @@ pub struct ComponentDef {
     pub packages: Vec<String>,
     pub exec: Vec<String>,
     pub xdg: XdgProvider,
+    pub wm: Option<WmConfig>,
     pub configuration: Vec<ConfigurationEntry>,
 }
 
@@ -304,6 +339,130 @@ fn read_toml<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<T> {
     })
 }
 
+fn parse_wm(
+    manifest: &Path,
+    schema: u32,
+    component: &str,
+    raw: Option<RawWm>,
+) -> Result<Option<WmConfig>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if schema != 3
+        || !safe_home_target(&raw.autostart_target)
+        || raw.autostart_template.matches("{role}").count() != 1
+        || raw.autostart_template.contains(['\0', '\n', '\r'])
+    {
+        return Err(Error::Message(format!(
+            "{}: invalid wm declaration for {component}",
+            manifest.display()
+        )));
+    }
+    let mut roles = BTreeSet::new();
+    for entry in &raw.autostart {
+        if !valid_id(&entry.role)
+            || !roles.insert(entry.role.clone())
+            || entry
+                .before
+                .iter()
+                .chain(&entry.after)
+                .any(|role| !valid_id(role))
+            || entry.before.iter().any(|role| role == &entry.role)
+            || entry.after.iter().any(|role| role == &entry.role)
+        {
+            return Err(Error::Message(format!(
+                "{}: invalid wm autostart declaration for {component}",
+                manifest.display()
+            )));
+        }
+    }
+    for entry in &raw.autostart {
+        if entry
+            .before
+            .iter()
+            .chain(&entry.after)
+            .any(|role| !roles.contains(role))
+        {
+            return Err(Error::Message(format!(
+                "{}: wm autostart references an undeclared role for {component}",
+                manifest.display()
+            )));
+        }
+    }
+    validate_wm_autostart_graph(manifest, component, &raw.autostart)?;
+    Ok(Some(WmConfig {
+        autostart_target: PathBuf::from(raw.autostart_target),
+        autostart_template: raw.autostart_template,
+        autostart: raw
+            .autostart
+            .into_iter()
+            .map(|entry| WmAutostart {
+                role: entry.role,
+                before: entry.before,
+                after: entry.after,
+            })
+            .collect(),
+    }))
+}
+
+fn validate_wm_autostart_graph(
+    manifest: &Path,
+    component: &str,
+    entries: &[RawWmAutostart],
+) -> Result<()> {
+    let mut outgoing = entries
+        .iter()
+        .map(|entry| (entry.role.clone(), BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut indegree = entries
+        .iter()
+        .map(|entry| (entry.role.clone(), 0_usize))
+        .collect::<BTreeMap<_, _>>();
+    for entry in entries {
+        for before in &entry.before {
+            if outgoing
+                .get_mut(&entry.role)
+                .expect("declared role")
+                .insert(before.clone())
+            {
+                *indegree.get_mut(before).expect("declared role") += 1;
+            }
+        }
+        for after in &entry.after {
+            if outgoing
+                .get_mut(after)
+                .expect("declared role")
+                .insert(entry.role.clone())
+            {
+                *indegree.get_mut(&entry.role).expect("declared role") += 1;
+            }
+        }
+    }
+    let mut ready = indegree
+        .iter()
+        .filter(|(_, degree)| **degree == 0)
+        .map(|(role, _)| role.clone())
+        .collect::<BTreeSet<_>>();
+    let mut visited = 0;
+    while let Some(role) = ready.pop_first() {
+        visited += 1;
+        for next in outgoing.get(&role).expect("declared role") {
+            let degree = indegree.get_mut(next).expect("declared role");
+            *degree -= 1;
+            if *degree == 0 {
+                ready.insert(next.clone());
+            }
+        }
+    }
+    if visited != entries.len() {
+        return Err(Error::Message(format!(
+            "{}: wm autostart cycle for {component}",
+            manifest.display()
+        )));
+    }
+    Ok(())
+}
+
 fn load_profile(
     canonical_root: &Path,
     entry: &fs::DirEntry,
@@ -407,6 +566,7 @@ fn load_profile(
             .into_iter()
             .map(|entry| parse_configuration(manifest_path, raw.schema, &component.id, entry))
             .collect::<Result<Vec<_>>>()?;
+        let wm = parse_wm(manifest_path, raw.schema, &component.id, component.wm)?;
         let xdg = component.xdg.unwrap_or_default();
         if xdg.desktop_entry.as_deref().is_some_and(|value| {
             value.is_empty() || value.contains('/') || !value.ends_with(".desktop")
@@ -439,6 +599,7 @@ fn load_profile(
                     mime_types: xdg.mime_types,
                     uri_schemes: xdg.uri_schemes,
                 },
+                wm,
                 configuration,
             },
         );

@@ -432,6 +432,7 @@ mod tests {
                 mime_types: vec!["text/html".into()],
                 uri_schemes: vec!["http".into()],
             },
+            wm: None,
             configuration: vec![],
         };
         let mut profile = Profile {
@@ -501,6 +502,7 @@ mod tests {
                         mime_types: vec!["text/html".into()],
                         uri_schemes: vec![],
                     },
+                    wm: None,
                     configuration: vec![],
                 },
             );

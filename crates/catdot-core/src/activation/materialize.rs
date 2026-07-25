@@ -1,5 +1,6 @@
 use crate::{
-    ActivationJournal, ComponentDef, Error, Lifecycle, Profile, Result, UserState, atomic_write,
+    ActivationJournal, ComponentDef, Error, Lifecycle, Profile, Result, UserState, WmConfig,
+    atomic_write,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -234,6 +235,7 @@ fn build_activation_plan_with_sources(
         }
         add_component_entries(&mut entries, profile, component, reference, &context)?;
     }
+    add_wm_entries(&mut entries, profiles, state, home)?;
     validate_conflicts(&entries, home)?;
     for entry in &mut entries {
         if let Materialization::User {
@@ -305,6 +307,136 @@ fn build_activation_plan_with_sources(
         registry,
         registry_changed,
     })
+}
+
+fn add_wm_entries(
+    entries: &mut Vec<PlannedTarget>,
+    profiles: &BTreeMap<String, Profile>,
+    state: &UserState,
+    home: &Path,
+) -> Result<()> {
+    let mut owners = Vec::new();
+    for (role, reference) in &state.components {
+        let (profile_id, component_id) = reference
+            .split_once('/')
+            .ok_or_else(|| Error::Message(format!("invalid component reference {reference}")))?;
+        let component = profiles
+            .get(profile_id)
+            .and_then(|profile| profile.components.get(component_id))
+            .ok_or_else(|| Error::Message(format!("component {reference} is not installed")))?;
+        if component.role != *role {
+            return Err(Error::Message(format!(
+                "{reference} does not provide role {role}"
+            )));
+        }
+        if let Some(wm) = &component.wm {
+            owners.push((reference.as_str(), wm));
+        }
+    }
+    let Some((owner, wm)) = owners.first().copied() else {
+        return Ok(());
+    };
+    if owners.len() > 1 {
+        return Err(Error::Message(format!(
+            "multiple active wm configuration owners: {}",
+            owners
+                .iter()
+                .map(|(owner, _)| *owner)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    let contents = render_wm_autostart(wm, profiles, state)?;
+    entries.push(PlannedTarget {
+        target: home.join(&wm.autostart_target),
+        owner: owner.into(),
+        materialization: Materialization::Generate { contents },
+    });
+    Ok(())
+}
+
+fn render_wm_autostart(
+    wm: &WmConfig,
+    profiles: &BTreeMap<String, Profile>,
+    state: &UserState,
+) -> Result<Vec<u8>> {
+    let active = wm
+        .autostart
+        .iter()
+        .filter(|entry| state.components.contains_key(&entry.role))
+        .map(|entry| (entry.role.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+    for role in active.keys() {
+        let reference = state.components.get(role).expect("active role");
+        let (profile_id, component_id) = reference
+            .split_once('/')
+            .ok_or_else(|| Error::Message(format!("invalid component reference {reference}")))?;
+        let component = profiles
+            .get(profile_id)
+            .and_then(|profile| profile.components.get(component_id))
+            .ok_or_else(|| Error::Message(format!("component {reference} is not installed")))?;
+        if component.exec.is_empty() {
+            return Err(Error::Message(format!(
+                "wm autostart role {role} uses {reference}, which has no exec provider"
+            )));
+        }
+    }
+
+    let mut outgoing = active
+        .keys()
+        .map(|role| (role.clone(), BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut indegree = active
+        .keys()
+        .map(|role| (role.clone(), 0_usize))
+        .collect::<BTreeMap<_, _>>();
+    for (role, entry) in &active {
+        for before in &entry.before {
+            if active.contains_key(before)
+                && outgoing
+                    .get_mut(role)
+                    .expect("active role")
+                    .insert(before.clone())
+            {
+                *indegree.get_mut(before).expect("active role") += 1;
+            }
+        }
+        for after in &entry.after {
+            if active.contains_key(after)
+                && outgoing
+                    .get_mut(after)
+                    .expect("active role")
+                    .insert(role.clone())
+            {
+                *indegree.get_mut(role).expect("active role") += 1;
+            }
+        }
+    }
+    let mut ready = indegree
+        .iter()
+        .filter(|(_, degree)| **degree == 0)
+        .map(|(role, _)| role.clone())
+        .collect::<BTreeSet<_>>();
+    let mut ordered = Vec::new();
+    while let Some(role) = ready.pop_first() {
+        ordered.push(role.clone());
+        for next in outgoing.get(&role).expect("active role") {
+            let degree = indegree.get_mut(next).expect("active role");
+            *degree -= 1;
+            if *degree == 0 {
+                ready.insert(next.clone());
+            }
+        }
+    }
+    if ordered.len() != active.len() {
+        return Err(Error::Message("wm autostart cycle in active roles".into()));
+    }
+    let mut rendered = String::new();
+    for role in ordered {
+        rendered.push_str(&wm.autostart_template.replace("{role}", &role));
+        rendered.push('\n');
+    }
+    Ok(rendered.into_bytes())
 }
 
 fn add_component_entries(

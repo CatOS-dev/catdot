@@ -79,6 +79,27 @@ pub fn activation_digests(
             digest.update(association.as_bytes());
             digest.update([0]);
         }
+        if let Some(wm) = &component.wm {
+            digest.update(b"wm");
+            digest.update(wm.autostart_target.as_os_str().as_encoded_bytes());
+            digest.update([0]);
+            digest.update(wm.autostart_template.as_bytes());
+            digest.update([0]);
+            for entry in &wm.autostart {
+                digest.update(entry.role.as_bytes());
+                digest.update([0]);
+                for role in &entry.before {
+                    digest.update(b"before");
+                    digest.update(role.as_bytes());
+                    digest.update([0]);
+                }
+                for role in &entry.after {
+                    digest.update(b"after");
+                    digest.update(role.as_bytes());
+                    digest.update([0]);
+                }
+            }
+        }
         for entry in &component.configuration {
             digest.update(entry.target.as_os_str().as_encoded_bytes());
             match &entry.lifecycle {
@@ -213,6 +234,7 @@ mod tests {
             packages: vec![],
             exec: vec![],
             xdg: XdgProvider::default(),
+            wm: None,
             configuration: vec![ConfigurationEntry {
                 target: ".config/niri/default.kdl".into(),
                 lifecycle: Lifecycle::Symlink,

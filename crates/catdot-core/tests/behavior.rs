@@ -1274,6 +1274,7 @@ fn xdg_activation_is_idempotent_when_defaults_are_already_satisfied() {
                 mime_types: vec!["text/html".into()],
                 uri_schemes: vec![],
             },
+            wm: None,
             configuration: vec![],
         },
     );
@@ -1690,4 +1691,131 @@ environment = ["EDITOR", "VISUAL"]
     assert_eq!(plan.environment["VISUAL"], "nvim");
     assert_eq!(plan.warnings.len(), 1);
     assert!(plan.warnings[0].contains("EDITOR"));
+}
+
+// Protects the primary WM installation and switch path: the compositor owns a
+// generated autostart fragment whose arbitrary selected roles are emitted in
+// declared dependency order and removed when a provider is disabled.
+#[test]
+fn wm_autostart_is_compiled_from_selected_roles_across_switches() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    fs::create_dir_all(&metadata).unwrap();
+    let source = temp.path().join("share/demo");
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            r#"schema = 3
+[profile]
+id = "demo"
+name = "Demo"
+description = "test"
+source_root = "{}"
+[defaults]
+desktop = "niri"
+bar = "panel"
+xwayland = "satellite"
+[[components]]
+id = "niri"
+role = "desktop"
+[components.wm]
+autostart_target = ".config/niri/autostart.kdl"
+autostart_template = 'spawn-at-startup "catdot" "exec" "{{role}}"'
+[[components.wm.autostart]]
+role = "xwayland"
+[[components.wm.autostart]]
+role = "bar"
+after = ["xwayland"]
+[[components]]
+id = "panel"
+role = "bar"
+[components.exec]
+argv = ["panel"]
+[[components]]
+id = "satellite"
+role = "xwayland"
+[components.exec]
+argv = ["xwayland-satellite"]
+"#,
+            source.display()
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let mut state = select_profile(&profiles["demo"]).unwrap();
+    let home = temp.path().join("home");
+    let registry = home.join(".local/state/catdot/managed.toml");
+    let target = home.join(".config/niri/autostart.kdl");
+
+    apply_configuration(
+        &build_activation_plan(&profiles, &state, &home, &registry).unwrap(),
+        &registry,
+        &home,
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "spawn-at-startup \"catdot\" \"exec\" \"xwayland\"\nspawn-at-startup \"catdot\" \"exec\" \"bar\"\n"
+    );
+
+    state.components.remove("bar");
+    apply_configuration(
+        &build_activation_plan(&profiles, &state, &home, &registry).unwrap(),
+        &registry,
+        &home,
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(target).unwrap(),
+        "spawn-at-startup \"catdot\" \"exec\" \"xwayland\"\n"
+    );
+}
+
+// A cyclic startup declaration cannot provide a stable switch result. It must
+// be rejected by the planner before a fresh HOME receives any profile files.
+#[test]
+fn wm_autostart_cycle_is_rejected_before_materialization() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    fs::create_dir_all(&metadata).unwrap();
+    let source = temp.path().join("share/demo");
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            r#"schema = 3
+[profile]
+id = "demo"
+name = "Demo"
+description = "test"
+source_root = "{}"
+[defaults]
+desktop = "wm"
+one = "one"
+two = "two"
+[[components]]
+id = "wm"
+role = "desktop"
+[components.wm]
+autostart_target = ".config/wm/autostart.conf"
+autostart_template = "exec catdot exec {{role}}"
+[[components.wm.autostart]]
+role = "one"
+after = ["two"]
+[[components.wm.autostart]]
+role = "two"
+after = ["one"]
+[[components]]
+id = "one"
+role = "one"
+[[components]]
+id = "two"
+role = "two"
+"#,
+            source.display()
+        ),
+    )
+    .unwrap();
+    let error = discover_profiles(&temp.path().join("profiles")).unwrap_err();
+    assert!(error.to_string().contains("autostart cycle"));
+    assert!(!temp.path().join("home").exists());
 }
