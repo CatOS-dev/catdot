@@ -10,8 +10,8 @@ pub mod update;
 pub use activation::{
     ActivationJournal, ActivationPlan, ManagedRegistry, ManagedTarget, Materialization,
     PlannedTarget, XdgPlan, activate_configuration, activate_xdg, activation_transactions_path,
-    build_activation_plan, build_activation_preview, build_xdg_plan, lock, managed_targets_path,
-    read_managed_registry, recover_activation_journals,
+    build_activation_plan, build_activation_preview, build_xdg_plan, forget_user_initialization,
+    lock, managed_targets_path, read_managed_registry, recover_activation_journals,
 };
 pub use error::{Error, Result};
 pub use manifest::{

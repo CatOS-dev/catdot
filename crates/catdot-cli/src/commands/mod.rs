@@ -328,11 +328,13 @@ fn print_activation_plan(
         println!("  delete managed target: {}", target.display());
     }
     let xdg_plan = build_xdg_plan(profiles, state, &runtime::xdg_config_home(&home))?;
-    for (association, desktop) in &xdg_plan.defaults {
-        println!("  xdg default: {association} -> {desktop}");
-    }
-    for association in xdg_plan.restore.keys() {
-        println!("  xdg restore: {association}");
+    if xdg_plan.has_changes() {
+        for (association, desktop) in &xdg_plan.defaults {
+            println!("  xdg default: {association} -> {desktop}");
+        }
+        for association in xdg_plan.restore.keys() {
+            println!("  xdg restore: {association}");
+        }
     }
     let configuration_changes = plan
         .entries
@@ -346,13 +348,14 @@ fn print_activation_plan(
             }
             Materialization::File { .. } => !entry.target.exists(),
             Materialization::User {
-                seed,
                 release_managed,
-            } => *release_managed || (seed.is_some() && !entry.target.exists()),
+                initialized,
+                ..
+            } => *release_managed || (!*initialized && !entry.target.exists()),
         })
         || plan.removals.iter().any(|target| target.exists());
     let selection_changes = !activate.is_empty() || !change.is_empty() || !deactivate.is_empty();
-    let xdg_changes = !xdg_plan.defaults.is_empty() || !xdg_plan.restore.is_empty();
+    let xdg_changes = xdg_plan.has_changes();
     Ok(selection_changes || configuration_changes || xdg_changes)
 }
 
@@ -543,6 +546,29 @@ fn print_success_summary(old: &UserState, new: &UserState, plan: &PackagePlan) {
     }
 }
 
+fn retain_available_active_components(
+    state: &mut UserState,
+    profiles: &std::collections::BTreeMap<String, Profile>,
+) -> bool {
+    let before = state.active_components.clone();
+    state.active_components.retain(|role, reference| {
+        let Some((profile_id, component_id)) = reference.split_once('/') else {
+            return false;
+        };
+        profiles
+            .get(profile_id)
+            .and_then(|profile| profile.components.get(component_id))
+            .is_some_and(|component| component.role == *role)
+    });
+    state
+        .activation_digests
+        .retain(|role, _| state.active_components.contains_key(role));
+    state
+        .active_package_digests
+        .retain(|role, _| state.active_components.contains_key(role));
+    before != state.active_components
+}
+
 pub fn run() -> Result<i32> {
     let cli = Cli::parse();
     let registry = profiles()?;
@@ -551,16 +577,15 @@ pub fn run() -> Result<i32> {
     let is_doctor = matches!(&cli.command, Cmd::Doctor);
     let dry_run = matches!(&cli.command, Cmd::Resolve { dry_run: true, .. });
     let mutates_state = !dry_run
-        && (!path.exists()
-            || matches!(
-                &cli.command,
-                Cmd::Select { .. }
-                    | Cmd::Disable { .. }
-                    | Cmd::Apply
-                    | Cmd::Update
-                    | Cmd::Reset { .. }
-                    | Cmd::Resolve { .. }
-            ));
+        && matches!(
+            &cli.command,
+            Cmd::Select { .. }
+                | Cmd::Disable { .. }
+                | Cmd::Apply
+                | Cmd::Update
+                | Cmd::Reset { .. }
+                | Cmd::Resolve { .. }
+        );
     let _state_lock = if mutates_state {
         Some(lock(&state_lock_path(&path)?)?)
     } else {
@@ -570,10 +595,10 @@ pub fn run() -> Result<i32> {
         recover_activation_journals(&path)?;
     }
     let mut state_read_broken = false;
-    let mut state = match if dry_run {
-        preview_state_from_default(&path, &default_declaration_path(), ps)
-    } else {
+    let mut state = match if mutates_state {
         initialize_state_from_default(&path, &default_declaration_path(), ps)
+    } else {
+        preview_state_from_default(&path, &default_declaration_path(), ps)
     } {
         Ok(state) => state,
         Err(error) if is_doctor => {
@@ -584,29 +609,30 @@ pub fn run() -> Result<i32> {
         Err(error) => return Err(error.into()),
     };
     if !is_doctor {
-        if let Cmd::Disable { role } = &cli.command {
-            let mut remaining = state.clone();
-            remaining.components.remove(role);
-            validate_user_state(&remaining, ps)?;
-        } else {
-            if let Err(error) = validate_user_state(&state, ps) {
-                if let Cmd::Exec { role, .. } = &cli.command
-                    && let Some(reference) = state.active_components.get(role)
-                    && let Some((profile_id, _)) = reference.split_once('/')
-                    && let Some(diagnostic) = registry.diagnostics.iter().find(|diagnostic| {
-                        diagnostic
-                            .profile_directory
-                            .file_name()
-                            .is_some_and(|name| name == std::ffi::OsStr::new(profile_id))
-                    })
-                {
-                    bail!(
-                        "active component {reference} has an invalid provider declaration: {}",
-                        diagnostic.message
-                    );
-                }
-                return Err(error.into());
+        match &cli.command {
+            Cmd::Apply | Cmd::Update | Cmd::Reset { .. } | Cmd::Resolve { .. } => {
+                validate_user_state(&state, ps)?;
             }
+            Cmd::Exec { role, .. } => {
+                if let Err(error) = validate_user_state(&state, ps) {
+                    if let Some(reference) = state.active_components.get(role)
+                        && let Some((profile_id, _)) = reference.split_once('/')
+                        && let Some(diagnostic) = registry.diagnostics.iter().find(|diagnostic| {
+                            diagnostic
+                                .profile_directory
+                                .file_name()
+                                .is_some_and(|name| name == std::ffi::OsStr::new(profile_id))
+                        })
+                    {
+                        bail!(
+                            "active component {reference} has an invalid provider declaration: {}",
+                            diagnostic.message
+                        );
+                    }
+                    return Err(error.into());
+                }
+            }
+            _ => {}
         }
     }
     match cli.command {
@@ -661,30 +687,49 @@ pub fn run() -> Result<i32> {
             profile_or_role,
             component,
         } => {
+            let before = state.clone();
+            retain_available_active_components(&mut state, ps);
             if let Some(reference) = component {
                 select_component(&mut state, ps, &profile_or_role, &reference)?;
             } else {
                 let p = ps.get(&profile_or_role).context("unknown profile")?;
                 let desired = select_profile(p)?;
-                state.components = desired.components;
-                state.generation += 1;
-            }
-            write_state(&path, &state)?;
-            for (role, reference) in &state.components {
-                println!("Selected desired {role}: {reference}");
-                match state.active_components.get(role) {
-                    Some(active) => println!("Active {role} remains: {active}"),
-                    None => println!("Active {role} remains: none"),
+                if state.components != desired.components {
+                    state.components = desired.components;
+                    state.generation += 1;
                 }
             }
-            print_missing_packages(ps, &state)?;
-            println!("Next: catdot resolve");
+            if state != before {
+                write_state(&path, &state)?;
+            }
+            if state.components == before.components {
+                println!("Desired selection is unchanged.");
+            } else {
+                for (role, reference) in &state.components {
+                    println!("Selected desired {role}: {reference}");
+                    match state.active_components.get(role) {
+                        Some(active) => println!("Active {role} remains: {active}"),
+                        None => println!("Active {role} remains: none"),
+                    }
+                }
+                print_missing_packages(ps, &state)?;
+                println!("Next: catdot resolve");
+            }
         }
         Cmd::Disable { role } => {
-            state.components.remove(&role);
-            state.generation += 1;
-            write_state(&path, &state)?;
-            println!("Disabled desired {role}; run: catdot resolve");
+            let before = state.clone();
+            retain_available_active_components(&mut state, ps);
+            if state.components.remove(&role).is_some() {
+                state.generation += 1;
+            }
+            if state != before {
+                write_state(&path, &state)?;
+            }
+            if before.components.contains_key(&role) {
+                println!("Disabled desired {role}; run: catdot resolve");
+            } else {
+                println!("Desired role {role} is already disabled.");
+            }
         }
         Cmd::Apply | Cmd::Update => {
             let system_generation = read_system_generation()?;
@@ -721,6 +766,16 @@ pub fn run() -> Result<i32> {
                     missing.into_iter().collect::<Vec<_>>().join(", ")
                 );
             }
+            if matches!(cli.command, Cmd::Update)
+                && activation_inputs == state.activation_digests
+                && package_inputs == state.active_package_digests
+                && !state.needs_resolve
+            {
+                state.active_system_generation = system_generation;
+                write_state(&path, &state)?;
+                println!("Active profile is current.");
+                return Ok(0);
+            }
             let mut new_state = state.clone();
             new_state.activation_digests = activation_inputs;
             new_state.active_package_digests = package_inputs;
@@ -742,9 +797,14 @@ pub fn run() -> Result<i32> {
             active.components = active.active_components.clone();
             let mut journal = ActivationJournal::begin(&path, state.clone(), state.clone())?;
             journal.mark_applying()?;
-            if let Err(error) = clear_profile_custom(ps, &state, &profile, &mut journal)
-                .and_then(|_| apply(ps, &active, &mut journal))
-            {
+            let reset =
+                clear_profile_custom(ps, &state, &profile, &mut journal).and_then(|targets| {
+                    let registry = managed_targets_path(&path)?;
+                    journal.track_path(&registry)?;
+                    forget_user_initialization(&registry, targets)?;
+                    apply(ps, &active, &mut journal)
+                });
+            if let Err(error) = reset {
                 recover_activation_journals(&path)?;
                 return Err(error);
             }

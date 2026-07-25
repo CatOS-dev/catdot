@@ -107,7 +107,7 @@ pub(super) fn clear_profile_custom(
     state: &UserState,
     profile_id: &str,
     journal: &mut ActivationJournal,
-) -> Result<()> {
+) -> Result<Vec<std::path::PathBuf>> {
     let home = home()?;
     let active_components: Vec<_> = state
         .active_components
@@ -117,6 +117,7 @@ pub(super) fn clear_profile_custom(
     if active_components.is_empty() {
         bail!("refusing to reset {profile_id}: it is not the current active profile");
     }
+    let mut cleared = Vec::new();
     for reference in active_components {
         let (_, component_id) = reference
             .split_once('/')
@@ -134,6 +135,7 @@ pub(super) fn clear_profile_custom(
             }
             let target = home.join(&entry.target);
             journal.track_path(&target)?;
+            cleared.push(target.clone());
             match fs::symlink_metadata(&target) {
                 Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
                     fs::remove_file(&target)?
@@ -145,7 +147,7 @@ pub(super) fn clear_profile_custom(
             }
         }
     }
-    Ok(())
+    Ok(cleared)
 }
 
 pub(super) fn exec_role(

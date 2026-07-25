@@ -693,3 +693,175 @@ fn generation_marker_hook_only_writes_the_redirected_system_marker() {
     }
     assert_eq!(fs::read_to_string(sentinel).unwrap(), "user data");
 }
+
+// Read-only inspection must not turn the built-in first-run declaration into
+// persistent user state. A user should be able to inspect Catdot before making
+// any selection or activation decision.
+#[test]
+fn read_only_commands_do_not_initialize_user_state() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let metadata = root.path().join("default");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            "schema = 2\n[profile]\nid = \"default\"\nname = \"Default\"\ndescription = \"test\"\nsource_root = \"{}\"\n[defaults]\ntool = \"main\"\n[[components]]\nid = \"main\"\nrole = \"tool\"\n",
+            root.path().join("share").display()
+        ),
+    )
+    .unwrap();
+    let declaration = root.path().join("default.toml");
+    fs::write(&declaration, "schema = 1\nprofile = \"default\"\n").unwrap();
+    for arguments in [vec!["list"], vec!["current"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_catdot"))
+            .args(arguments)
+            .env("CATDOT_PROFILE_ROOT", root.path())
+            .env("CATDOT_DEFAULT_DECLARATION", &declaration)
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !home.path().join(".local/state/catdot/state.toml").exists(),
+            "read-only command created persistent state"
+        );
+    }
+}
+
+// Desired-state generations identify real changes. Repeating the same profile
+// selection or disabling an absent role must not create fake pending work.
+#[test]
+fn repeated_selection_and_absent_disable_are_noops() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let metadata = root.path().join("demo");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            "schema = 2\n[profile]\nid = \"demo\"\nname = \"Demo\"\ndescription = \"test\"\nsource_root = \"{}\"\n[defaults]\ntool = \"main\"\n[[components]]\nid = \"main\"\nrole = \"tool\"\n",
+            root.path().join("share").display()
+        ),
+    )
+    .unwrap();
+    let run = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_catdot"))
+            .args(arguments)
+            .env("CATDOT_PROFILE_ROOT", root.path())
+            .env("HOME", home.path())
+            .env_remove("CATDOT_DEFAULT_DECLARATION")
+            .output()
+            .unwrap()
+    };
+    assert!(run(&["select", "demo"]).status.success());
+    let state_path = home.path().join(".local/state/catdot/state.toml");
+    let first = fs::read_to_string(&state_path).unwrap();
+    assert!(first.contains("generation = 1"));
+    assert!(run(&["select", "demo"]).status.success());
+    assert!(run(&["disable", "missing"]).status.success());
+    let final_state = fs::read_to_string(state_path).unwrap();
+    assert!(final_state.contains("generation = 1"));
+}
+
+// Removing a profile package must not trap the user in references that can no
+// longer be validated. A complete selection replaces broken desired state and
+// drops unavailable active providers so the next resolve can recover normally.
+#[test]
+fn complete_selection_recovers_from_uninstalled_profiles() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let metadata = root.path().join("good");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            "schema = 2\n[profile]\nid = \"good\"\nname = \"Good\"\ndescription = \"test\"\nsource_root = \"{}\"\n[defaults]\ntool = \"main\"\n[[components]]\nid = \"main\"\nrole = \"tool\"\n",
+            root.path().join("share").display()
+        ),
+    )
+    .unwrap();
+    let state = home.path().join(".local/state/catdot/state.toml");
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::write(
+        &state,
+        "schema = 1\ngeneration = 4\nactive_generation = 3\n[components]\ndesktop = \"gone-a/main\"\nterminal = \"gone-b/main\"\n[active_components]\ndesktop = \"gone-a/main\"\nterminal = \"gone-b/main\"\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .args(["select", "good"])
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recovered = fs::read_to_string(state).unwrap();
+    assert!(recovered.contains("tool = \"good/main\""));
+    assert!(!recovered.contains("gone-a"));
+    assert!(!recovered.contains("gone-b"));
+}
+
+// A package transaction that does not change any active Profile input should
+// only acknowledge the new system generation; it must not rewrite HOME.
+#[test]
+fn generation_only_update_does_not_rewrite_managed_configuration() {
+    use std::os::unix::fs::MetadataExt;
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let metadata = root.path().join("demo");
+    let source = root.path().join("share");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("config"), "managed").unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            "schema = 2\n[profile]\nid = \"demo\"\nname = \"Demo\"\ndescription = \"test\"\nsource_root = \"{}\"\n[[components]]\nid = \"main\"\nrole = \"tool\"\n[[components.configuration]]\ntarget = \".config/demo/config\"\nlifecycle = \"overwrite\"\nmode = \"file\"\nsource = \"config\"\n",
+            source.display()
+        ),
+    )
+    .unwrap();
+    let state = home.path().join(".local/state/catdot/state.toml");
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::write(
+        &state,
+        "schema = 1\ngeneration = 1\nactive_generation = 1\n[components]\ntool = \"demo/main\"\n[active_components]\ntool = \"demo/main\"\n",
+    )
+    .unwrap();
+    let marker = root.path().join("generation");
+    fs::write(&marker, "1\n").unwrap();
+    let first = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .arg("update")
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .env("CATDOT_SYSTEM_GENERATION", &marker)
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let target = home.path().join(".config/demo/config");
+    let inode = fs::metadata(&target).unwrap().ino();
+    fs::write(&marker, "2\n").unwrap();
+    let second = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .arg("update")
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .env("CATDOT_SYSTEM_GENERATION", &marker)
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(fs::metadata(target).unwrap().ino(), inode);
+    assert!(String::from_utf8_lossy(&second.stdout).contains("Active profile is current"));
+}

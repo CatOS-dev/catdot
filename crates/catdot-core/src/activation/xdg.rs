@@ -1,7 +1,7 @@
 use crate::{ActivationJournal, ComponentDef, Error, Result, UserState};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -16,11 +16,15 @@ pub struct XdgPlan {
     pub restore: BTreeMap<String, Option<String>>,
     registry_path: PathBuf,
     registry: XdgRegistry,
+    rendered: String,
+    changed: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct XdgRegistry {
-    previous: BTreeMap<String, Option<String>>,
+    previous: BTreeMap<String, String>,
+    #[serde(default)]
+    absent: BTreeSet<String>,
 }
 
 pub fn build_xdg_plan(
@@ -46,30 +50,57 @@ pub fn build_xdg_plan(
     }
     let path = config_home.join("mimeapps.list");
     let registry_path = config_home.join("catdot/xdg.toml");
-    let existing = read_mimeapps(&path)?;
+    let existing_text = read_text(&path)?;
+    let existing = read_mimeapps_text(&existing_text);
     let old = read_registry(&registry_path)?;
+    let previous_registry = old.clone();
     let mut registry = XdgRegistry::default();
     for association in defaults.keys() {
-        registry.previous.insert(
-            association.clone(),
-            old.previous
-                .get(association)
-                .cloned()
-                .unwrap_or_else(|| existing.get(association).cloned()),
-        );
+        let previous = old
+            .previous
+            .get(association)
+            .cloned()
+            .map(Some)
+            .or_else(|| old.absent.contains(association).then_some(None))
+            .unwrap_or_else(|| existing.get(association).cloned());
+        match previous {
+            Some(desktop) => {
+                registry.previous.insert(association.clone(), desktop);
+            }
+            None => {
+                registry.absent.insert(association.clone());
+            }
+        }
     }
     let restore = old
         .previous
         .into_iter()
+        .map(|(association, desktop)| (association, Some(desktop)))
+        .chain(
+            old.absent
+                .into_iter()
+                .map(|association| (association, None)),
+        )
         .filter(|(association, _)| !defaults.contains_key(association))
         .collect();
+    let rendered = render_mimeapps(&existing_text, &defaults, &restore);
+    let changed = (!defaults.is_empty() || !restore.is_empty())
+        && (rendered != existing_text || registry != previous_registry);
     Ok(XdgPlan {
         path,
         defaults,
         restore,
         registry_path,
         registry,
+        rendered,
+        changed,
     })
+}
+
+impl XdgPlan {
+    pub fn has_changes(&self) -> bool {
+        self.changed
+    }
 }
 
 fn add_component(defaults: &mut BTreeMap<String, String>, component: &ComponentDef) -> Result<()> {
@@ -96,14 +127,12 @@ fn add_component(defaults: &mut BTreeMap<String, String>, component: &ComponentD
 }
 
 pub fn activate_xdg(plan: &XdgPlan, journal: &mut ActivationJournal) -> Result<()> {
-    if plan.defaults.is_empty() && plan.restore.is_empty() {
+    if !plan.changed {
         return Ok(());
     }
     journal.track_path(&plan.path)?;
     journal.track_path(&plan.registry_path)?;
-    let existing = read_text(&plan.path)?;
-    let rendered = render_mimeapps(&existing, &plan.defaults, &plan.restore);
-    crate::atomic_write(&plan.path, &rendered)?;
+    crate::atomic_write(&plan.path, &plan.rendered)?;
     crate::atomic_write(
         &plan.registry_path,
         &toml::to_string_pretty(&plan.registry)
@@ -133,10 +162,10 @@ fn read_text(path: &Path) -> Result<String> {
     }
 }
 
-fn read_mimeapps(path: &Path) -> Result<BTreeMap<String, String>> {
+fn read_mimeapps_text(text: &str) -> BTreeMap<String, String> {
     let mut values = BTreeMap::new();
     let mut in_defaults = false;
-    for line in read_text(path)?.lines() {
+    for line in text.lines() {
         if line.trim() == "[Default Applications]" {
             in_defaults = true;
             continue;
@@ -148,7 +177,7 @@ fn read_mimeapps(path: &Path) -> Result<BTreeMap<String, String>> {
             values.insert(key.trim().into(), value.trim().trim_end_matches(';').into());
         }
     }
-    Ok(values)
+    values
 }
 
 fn render_mimeapps(

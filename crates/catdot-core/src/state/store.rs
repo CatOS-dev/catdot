@@ -396,6 +396,13 @@ pub fn select_component(
             component.role
         )));
     }
+    if state
+        .components
+        .get(role)
+        .is_some_and(|current| current == reference)
+    {
+        return Ok(());
+    }
     state.components.insert(role.into(), reference.into());
     state.generation += 1;
     Ok(())

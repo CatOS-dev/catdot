@@ -20,9 +20,11 @@ pub struct ManagedTarget {
     pub source: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManagedRegistry {
     pub entries: BTreeMap<String, ManagedTarget>,
+    #[serde(default)]
+    pub user_initialized: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +41,7 @@ pub enum Materialization {
     User {
         seed: Option<PathBuf>,
         release_managed: bool,
+        initialized: bool,
     },
 }
 
@@ -132,12 +135,14 @@ fn build_activation_plan_with_sources(
     validate_conflicts(&entries, home)?;
     for entry in &mut entries {
         if let Materialization::User {
-            release_managed, ..
+            release_managed,
+            initialized,
+            ..
         } = &mut entry.materialization
         {
-            *release_managed = previous
-                .entries
-                .contains_key(&entry.target.display().to_string());
+            let target = entry.target.display().to_string();
+            *release_managed = previous.entries.contains_key(&target);
+            *initialized = previous.user_initialized.contains_key(&target);
         }
     }
     if let Some(target) = previous
@@ -161,9 +166,15 @@ fn build_activation_plan_with_sources(
         .filter(|target| !current.contains(*target))
         .map(PathBuf::from)
         .collect();
-    let mut registry = ManagedRegistry::default();
+    let mut registry = ManagedRegistry {
+        entries: BTreeMap::new(),
+        user_initialized: previous.user_initialized.clone(),
+    };
     for entry in &entries {
         if let Materialization::User { .. } = entry.materialization {
+            registry
+                .user_initialized
+                .insert(entry.target.display().to_string(), entry.owner.clone());
             continue;
         }
         let (lifecycle, source) = match &entry.materialization {
@@ -230,6 +241,7 @@ fn add_component_entries(
                     .map(|seed| source(profile, seed, verify_sources))
                     .transpose()?,
                 release_managed: false,
+                initialized: false,
             },
         };
         entries.push(PlannedTarget {
@@ -296,6 +308,22 @@ fn validate_conflicts(entries: &[PlannedTarget], home: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn forget_user_initialization(
+    registry_path: &Path,
+    targets: impl IntoIterator<Item = PathBuf>,
+) -> Result<()> {
+    let mut registry = read_managed_registry(registry_path)?;
+    for target in targets {
+        registry
+            .user_initialized
+            .remove(&target.display().to_string());
+    }
+    atomic_write(
+        registry_path,
+        &toml::to_string_pretty(&registry).map_err(|error| Error::Message(error.to_string()))?,
+    )
+}
+
 pub fn activate_configuration(
     plan: &ActivationPlan,
     registry_path: &Path,
@@ -347,8 +375,12 @@ fn apply_entry(entry: &PlannedTarget) -> Result<()> {
         Materialization::User {
             seed,
             release_managed,
+            initialized,
         } => match fs::symlink_metadata(&entry.target) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if *initialized && !*release_managed {
+                    return Ok(());
+                }
                 if let Some(seed) = seed {
                     copy_tree(seed, &entry.target)
                 } else {

@@ -1,9 +1,10 @@
 use catdot_core::{
-    ActivationJournal, UserState, activate_configuration, build_activation_plan,
-    build_activation_preview, discover_profiles, initialize_state_from_default, read_state,
-    recover_activation_journals, select_profile, write_state,
+    ActivationJournal, ComponentDef, Profile, UserState, XdgProvider, activate_configuration,
+    activate_xdg, build_activation_plan, build_activation_preview, build_xdg_plan,
+    discover_profiles, initialize_state_from_default, read_state, recover_activation_journals,
+    select_profile, write_state,
 };
-use std::fs;
+use std::{collections::BTreeMap, fs};
 use tempfile::tempdir;
 
 fn apply_configuration(
@@ -1200,4 +1201,99 @@ lifecycle = "user"
             .is_symlink()
     );
     assert_eq!(fs::read_to_string(&target).unwrap(), "managed");
+}
+
+// A user-owned target is initialized once, not whenever it happens to be
+// absent. Deleting it is itself a user decision and normal apply/update must
+// preserve that absence until an explicit reset.
+#[test]
+fn materialization_does_not_reseed_a_deleted_user_target() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    let source = temp.path().join("share/demo");
+    fs::create_dir_all(source.join("custom")).unwrap();
+    fs::write(source.join("custom/seed"), "seed").unwrap();
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        profile(
+            &source.display().to_string(),
+            r#"[[components]]
+id = "app"
+role = "app"
+[[components.configuration]]
+target = ".config/app/custom"
+lifecycle = "user"
+seed = "custom"
+"#,
+            "",
+            "app = \"app\"\n",
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    let home = temp.path().join("home");
+    let registry = home.join(".local/state/catdot/managed.toml");
+    let first = build_activation_plan(&profiles, &state, &home, &registry).unwrap();
+    apply_configuration(&first, &registry, &home).unwrap();
+    let target = home.join(".config/app/custom");
+    assert!(target.join("seed").is_file());
+    fs::remove_dir_all(&target).unwrap();
+    let second = build_activation_plan(&profiles, &state, &home, &registry).unwrap();
+    apply_configuration(&second, &registry, &home).unwrap();
+    assert!(!target.exists());
+}
+
+// Reapplying an already-satisfied XDG declaration is a no-op. This keeps
+// resolve idempotent and avoids replacing mimeapps.list on every invocation.
+#[test]
+fn xdg_activation_is_idempotent_when_defaults_are_already_satisfied() {
+    use std::os::unix::fs::MetadataExt;
+    let temp = tempdir().unwrap();
+    let config = temp.path().join(".config");
+    fs::create_dir_all(&config).unwrap();
+    let mut profile = Profile {
+        id: "demo".into(),
+        name: "Demo".into(),
+        description: "test".into(),
+        source_root: temp.path().join("share"),
+        defaults: BTreeMap::new(),
+        components: BTreeMap::new(),
+    };
+    profile.components.insert(
+        "browser".into(),
+        ComponentDef {
+            role: "browser".into(),
+            packages: vec![],
+            exec: vec![],
+            xdg: XdgProvider {
+                desktop_entry: Some("demo.desktop".into()),
+                mime_types: vec!["text/html".into()],
+                uri_schemes: vec![],
+            },
+            configuration: vec![],
+        },
+    );
+    let profiles = [("demo".into(), profile)].into_iter().collect();
+    let mut state = UserState::default();
+    state
+        .components
+        .insert("browser".into(), "demo/browser".into());
+    let state_path = temp.path().join("state/catdot/state.toml");
+    let first = build_xdg_plan(&profiles, &state, &config).unwrap();
+    let mut journal =
+        ActivationJournal::begin(&state_path, UserState::default(), UserState::default()).unwrap();
+    journal.mark_applying().unwrap();
+    activate_xdg(&first, &mut journal).unwrap();
+    journal.complete().unwrap();
+    let mimeapps = config.join("mimeapps.list");
+    let inode = fs::metadata(&mimeapps).unwrap().ino();
+    let second = build_xdg_plan(&profiles, &state, &config).unwrap();
+    let mut journal =
+        ActivationJournal::begin(&state_path, UserState::default(), UserState::default()).unwrap();
+    journal.mark_applying().unwrap();
+    activate_xdg(&second, &mut journal).unwrap();
+    journal.complete().unwrap();
+    assert_eq!(fs::metadata(mimeapps).unwrap().ino(), inode);
 }
