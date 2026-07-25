@@ -14,8 +14,9 @@ pub use activation::{
 };
 pub use error::{Error, Result};
 pub use manifest::{
-    ComponentDef, DEFAULT_PROFILE_ROOT, Link, Profile, ProfileDiagnostic, ProfileDiagnosticKind,
-    ProfileRegistry, discover_profile_registry, discover_profiles, profile_root,
+    ComponentDef, ConfigurationEntry, DEFAULT_PROFILE_ROOT, Lifecycle, OverwriteMode, Profile,
+    ProfileDiagnostic, ProfileDiagnosticKind, ProfileRegistry, XdgProvider,
+    discover_profile_registry, discover_profiles, profile_root,
 };
 pub use planning::{
     InstallReason, ManagedPackage, PackageAvailability, PackageBackend, PackagePlan,
@@ -24,8 +25,9 @@ pub use planning::{
     install_plan, packages_for_state, prunable,
 };
 pub use state::{
-    UserState, atomic_write, managed_links_path, parse_state_text, read_state,
-    read_system_packages, read_user_records, select_component, select_profile, state_lock_path,
-    state_path, validate_user_state, write_state, write_system_packages,
+    UserState, atomic_write, default_declaration_path, initialize_state_from_default,
+    managed_links_path, parse_state_text, read_state, read_system_packages, read_user_records,
+    select_component, select_profile, state_lock_path, state_path, validate_user_state,
+    write_state, write_system_packages,
 };
 pub use theme::{apply_theme, merge_ini, theme_expected_files};

@@ -54,6 +54,84 @@ pub fn state_path(home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join(".local/state"))
         .join("catdot/state.toml")
 }
+pub fn default_declaration_path() -> PathBuf {
+    std::env::var_os("CATDOT_DEFAULT_DECLARATION")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/etc/skel/.config/catdot/default.toml"))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDefaultDeclaration {
+    schema: u32,
+    profile: String,
+    #[serde(default)]
+    components: BTreeMap<String, String>,
+    #[serde(default)]
+    desktop: BTreeMap<String, RawDesktopOverride>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDesktopOverride {
+    #[serde(default)]
+    components: BTreeMap<String, String>,
+}
+
+/// Initializes desired state from the system new-user declaration only when
+/// the user's state file does not exist. It never performs package work.
+pub fn initialize_state_from_default(
+    state_file: &Path,
+    declaration_file: &Path,
+    profiles: &BTreeMap<String, Profile>,
+) -> Result<UserState> {
+    if state_file.exists() {
+        return read_state(state_file);
+    }
+    if !declaration_file.exists() {
+        return Ok(UserState::default());
+    }
+    let declaration: RawDefaultDeclaration =
+        toml::from_str(&io(declaration_file, fs::read_to_string(declaration_file))?).map_err(
+            |source| Error::Toml {
+                path: declaration_file.display().to_string(),
+                source,
+            },
+        )?;
+    if declaration.schema != 1 {
+        return Err(Error::Message(format!(
+            "{}: unsupported default declaration schema {}",
+            declaration_file.display(),
+            declaration.schema
+        )));
+    }
+    let profile = profiles.get(&declaration.profile).ok_or_else(|| {
+        Error::Message(format!(
+            "default profile {} is not installed",
+            declaration.profile
+        ))
+    })?;
+    let mut state = select_profile(profile)?;
+    let mut components = declaration.components;
+    for desktop in std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|desktop| !desktop.is_empty())
+    {
+        if let Some(override_) = declaration.desktop.get(desktop) {
+            components.extend(override_.components.clone());
+        }
+    }
+    for (role, component) in components {
+        let reference = if component.contains('/') {
+            component
+        } else {
+            format!("{}/{}", profile.id, component)
+        };
+        select_component(&mut state, profiles, &role, &reference)?;
+    }
+    write_state(state_file, &state)?;
+    Ok(state)
+}
 pub fn managed_links_path(state_path: &Path) -> Result<PathBuf> {
     let parent = state_path
         .parent()

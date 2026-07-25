@@ -484,14 +484,15 @@ pub fn run() -> Result<i32> {
     let ps = &registry.valid_profiles;
     let path = state_file()?;
     let is_doctor = matches!(&cli.command, Cmd::Doctor);
-    let mutates_state = matches!(
-        &cli.command,
-        Cmd::Select { .. }
-            | Cmd::Disable { .. }
-            | Cmd::Apply
-            | Cmd::Adopt { .. }
-            | Cmd::Resolve { .. }
-    );
+    let mutates_state = !path.exists()
+        || matches!(
+            &cli.command,
+            Cmd::Select { .. }
+                | Cmd::Disable { .. }
+                | Cmd::Apply
+                | Cmd::Adopt { .. }
+                | Cmd::Resolve { .. }
+        );
     let _state_lock = if mutates_state {
         Some(lock(&state_lock_path(&path)?)?)
     } else {
@@ -501,7 +502,7 @@ pub fn run() -> Result<i32> {
         recover_activation_journals(&path)?;
     }
     let mut state_read_broken = false;
-    let mut state = match read_state(&path) {
+    let mut state = match initialize_state_from_default(&path, &default_declaration_path(), ps) {
         Ok(state) => state,
         Err(error) if is_doctor => {
             println!("error: broken state: {error}");

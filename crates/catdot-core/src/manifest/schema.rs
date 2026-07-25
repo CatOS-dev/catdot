@@ -1,7 +1,7 @@
 use crate::{Error, Result, error::io};
 use serde::Deserialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Component, Path, PathBuf},
 };
@@ -13,55 +13,124 @@ pub const DEFAULT_PROFILE_ROOT: &str = "/usr/share/catdot/profiles";
 struct RawManifest {
     schema: u32,
     profile: RawProfile,
+    #[serde(default)]
     defaults: BTreeMap<String, String>,
-    components: BTreeMap<String, RawComponent>,
+    #[serde(default)]
+    component_files: Vec<String>,
+    #[serde(default)]
+    components: Vec<RawComponent>,
 }
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProfile {
     id: String,
     name: String,
     description: String,
+    source_root: String,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawComponentFile {
+    component: RawComponent,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawComponent {
+    id: String,
     role: String,
-    path: String,
     #[serde(default)]
     packages: Vec<String>,
     #[serde(default)]
     optional_packages: Vec<String>,
+    exec: Option<RawExec>,
+    xdg: Option<RawXdg>,
     #[serde(default)]
-    exec: Vec<String>,
-    #[serde(default)]
-    links: Vec<Link>,
-    backend: Option<String>,
-    settings: Option<BTreeMap<String, String>>,
+    configuration: Vec<RawConfiguration>,
 }
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Link {
-    pub source: String,
-    pub target: String,
+struct RawExec {
+    argv: Vec<String>,
 }
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawXdg {
+    desktop_entry: Option<String>,
+    #[serde(default)]
+    mime_types: Vec<String>,
+    #[serde(default)]
+    uri_schemes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfiguration {
+    target: String,
+    lifecycle: String,
+    mode: Option<String>,
+    source: Option<String>,
+    template: Option<String>,
+    adapter: Option<String>,
+    seed: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lifecycle {
+    Generate,
+    Overwrite(OverwriteMode),
+    User,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverwriteMode {
+    Symlink,
+    File,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfigurationEntry {
+    pub target: PathBuf,
+    pub lifecycle: Lifecycle,
+    pub source: Option<PathBuf>,
+    pub template: Option<String>,
+    pub adapter: Option<String>,
+    pub seed: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct XdgProvider {
+    pub desktop_entry: Option<String>,
+    pub mime_types: Vec<String>,
+    pub uri_schemes: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Profile {
     pub id: String,
     pub name: String,
     pub description: String,
-    pub root: PathBuf,
+    /// The installed skel-style content tree. This is deliberately distinct
+    /// from the directory that contains profile metadata.
+    pub source_root: PathBuf,
     pub defaults: BTreeMap<String, String>,
     pub components: BTreeMap<String, ComponentDef>,
 }
+
 #[derive(Debug, Clone)]
 pub struct ComponentDef {
     pub role: String,
-    pub path: PathBuf,
     pub packages: Vec<String>,
     pub optional_packages: Vec<String>,
     pub exec: Vec<String>,
-    pub links: Vec<Link>,
+    pub xdg: XdgProvider,
+    pub configuration: Vec<ConfigurationEntry>,
+    // Theme adapters are retained as an internal consumer until their profile
+    // declarations move to lifecycle entries; schema 2 does not parse them.
     pub backend: Option<String>,
     pub settings: BTreeMap<String, String>,
 }
@@ -94,65 +163,46 @@ fn valid_id(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
+
 fn safe_relative(value: &str) -> bool {
     !value.is_empty()
         && Path::new(value)
             .components()
             .all(|part| matches!(part, Component::Normal(_)))
 }
-fn validate_template(value: &str) -> bool {
-    let stripped = value
-        .replace("{profile}", "")
-        .replace("{component}", "")
-        .replace("{home}", "")
-        .replace("{xdg_config_home}", "");
-    !stripped.contains('{') && !stripped.contains('}')
+
+fn safe_home_target(value: &str) -> bool {
+    Path::new(value).is_relative() && safe_relative(value)
 }
-fn shell_argument(value: &str) -> bool {
-    matches!(
-        value,
-        "sh" | "bash"
-            | "dash"
-            | "zsh"
-            | "fish"
-            | "/bin/sh"
-            | "/bin/bash"
-            | "/bin/dash"
-            | "/bin/zsh"
-            | "/usr/bin/sh"
-            | "/usr/bin/bash"
-    )
+
+fn valid_package(value: &str) -> bool {
+    valid_id(value)
 }
-fn validate_theme_settings(
-    backend: Option<&str>,
-    settings: &Option<BTreeMap<String, String>>,
-) -> bool {
-    let settings = settings.as_ref();
-    let expected: &[&str] = match backend {
-        None => return settings.is_none_or(BTreeMap::is_empty),
-        Some("gtk") => &[
-            "theme",
-            "icon_theme",
-            "cursor_theme",
-            "font",
-            "color_scheme",
-        ],
-        Some("qtct-kvantum") => &["qt5_style", "qt6_style", "kvantum_theme", "icon_theme"],
-        Some(_) => return false,
-    };
-    let Some(settings) = settings else {
-        return false;
-    };
-    settings.len() == expected.len()
-        && expected
-            .iter()
-            .all(|key| settings.contains_key(*key) && !settings[*key].is_empty())
+
+fn valid_exec(argv: &[String]) -> bool {
+    !argv.is_empty()
+        && argv.iter().all(|arg| {
+            !arg.is_empty()
+                && !arg.contains('\0')
+                && !matches!(
+                    arg.as_str(),
+                    "sh" | "bash"
+                        | "dash"
+                        | "zsh"
+                        | "/bin/sh"
+                        | "/bin/bash"
+                        | "/bin/dash"
+                        | "/bin/zsh"
+                )
+        })
 }
+
 pub fn profile_root() -> PathBuf {
     std::env::var_os("CATDOT_PROFILE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_PROFILE_ROOT))
 }
+
 pub fn discover_profiles(root: &Path) -> Result<BTreeMap<String, Profile>> {
     let registry = discover_profile_registry(root)?;
     if let Some(diagnostic) = registry.diagnostics.into_iter().next() {
@@ -173,10 +223,19 @@ pub fn discover_profile_registry(root: &Path) -> Result<ProfileRegistry> {
         let manifest_path = entry.path().join("profile.toml");
         if !manifest_path.is_file() {
             continue;
-        };
+        }
         match load_profile(&canonical_root, &entry, &manifest_path) {
             Ok(profile) => {
-                registry.valid_profiles.insert(profile.id.clone(), profile);
+                if registry.valid_profiles.contains_key(&profile.id) {
+                    registry.diagnostics.push(ProfileDiagnostic {
+                        profile_directory: entry.path(),
+                        manifest_path,
+                        kind: ProfileDiagnosticKind::Validation,
+                        message: format!("duplicate profile id {}", profile.id),
+                    });
+                } else {
+                    registry.valid_profiles.insert(profile.id.clone(), profile);
+                }
             }
             Err(error) => registry.diagnostics.push(ProfileDiagnostic {
                 profile_directory: entry.path(),
@@ -193,108 +252,142 @@ pub fn discover_profile_registry(root: &Path) -> Result<ProfileRegistry> {
     Ok(registry)
 }
 
+fn read_toml<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<T> {
+    toml::from_str(&io(path, fs::read_to_string(path))?).map_err(|source| Error::Toml {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
 fn load_profile(
     canonical_root: &Path,
     entry: &fs::DirEntry,
     manifest_path: &Path,
 ) -> Result<Profile> {
-    let raw: RawManifest = toml::from_str(&io(manifest_path, fs::read_to_string(manifest_path))?)
-        .map_err(|source| Error::Toml {
-        path: manifest_path.display().to_string(),
-        source,
-    })?;
-    if raw.schema != 1 {
+    let raw: RawManifest = read_toml(manifest_path)?;
+    if raw.schema != 2 {
         return Err(Error::Message(format!(
             "{}: unsupported schema {}",
             manifest_path.display(),
             raw.schema
         )));
-    };
+    }
     if !valid_id(&raw.profile.id) || entry.file_name().to_string_lossy() != raw.profile.id {
         return Err(Error::Message(format!(
             "{}: invalid profile id",
             manifest_path.display()
         )));
-    };
-    let root = io(&entry.path(), entry.path().canonicalize())?;
-    if !root.starts_with(canonical_root) {
+    }
+    let metadata_root = io(&entry.path(), entry.path().canonicalize())?;
+    if !metadata_root.starts_with(canonical_root) {
         return Err(Error::Message(format!(
             "{}: profile directory escapes profile root",
             manifest_path.display()
         )));
     }
+    let source_root = PathBuf::from(&raw.profile.source_root);
+    if !source_root.is_absolute() {
+        return Err(Error::Message(format!(
+            "{}: source root must be absolute",
+            manifest_path.display()
+        )));
+    }
+    let source_for_overlap_check = if source_root.exists() {
+        io(&source_root, source_root.canonicalize())?
+    } else {
+        source_root.clone()
+    };
+    if source_for_overlap_check.starts_with(&metadata_root)
+        || metadata_root.starts_with(&source_for_overlap_check)
+    {
+        return Err(Error::Message(format!(
+            "{}: source root must be separate from profile metadata",
+            manifest_path.display()
+        )));
+    }
+
+    let mut raw_components = raw.components;
+    let mut files = BTreeSet::new();
+    for file in raw.component_files {
+        if !safe_relative(&file) || !file.ends_with(".toml") || !files.insert(file.clone()) {
+            return Err(Error::Message(format!(
+                "{}: invalid component file {file}",
+                manifest_path.display()
+            )));
+        }
+        let path = metadata_root.join(&file);
+        if !path.is_file() {
+            return Err(Error::Message(format!(
+                "{}: component file {file} is missing",
+                manifest_path.display()
+            )));
+        }
+        raw_components.push(read_toml::<RawComponentFile>(&path)?.component);
+    }
     let mut components = BTreeMap::new();
-    for (id, raw_component) in raw.components {
-        if !valid_id(&id)
-            || !valid_id(&raw_component.role)
-            || !safe_relative(&raw_component.path)
-            || raw_component
+    for component in raw_components {
+        if !valid_id(&component.id)
+            || !valid_id(&component.role)
+            || component
                 .packages
                 .iter()
-                .chain(&raw_component.optional_packages)
-                .any(|package| !valid_id(package))
+                .chain(&component.optional_packages)
+                .any(|package| !valid_package(package))
         {
             return Err(Error::Message(format!(
-                "{}: invalid component {id}",
-                manifest_path.display()
+                "{}: invalid component {}",
+                manifest_path.display(),
+                component.id
             )));
-        };
-        let path = root.join(&raw_component.path);
-        if !path.exists() {
+        }
+        if components.contains_key(&component.id) {
             return Err(Error::Message(format!(
-                "{}: component {id} path does not exist",
-                manifest_path.display()
+                "{}: duplicate component {}",
+                manifest_path.display(),
+                component.id
             )));
         }
-        let actual = io(&path, path.canonicalize())?;
-        if !actual.starts_with(&root) {
+        let exec = component
+            .exec
+            .map(|provider| provider.argv)
+            .unwrap_or_default();
+        if !exec.is_empty() && !valid_exec(&exec) {
             return Err(Error::Message(format!(
-                "{}: component {id} escapes profile",
-                manifest_path.display()
+                "{}: unsafe exec for component {}",
+                manifest_path.display(),
+                component.id
             )));
         }
-        for link in &raw_component.links {
-            let target_suffix = link
-                .target
-                .strip_prefix("{home}/")
-                .or_else(|| link.target.strip_prefix("{xdg_config_home}/"));
-            let source = actual.join(&link.source);
-            if !safe_relative(&link.source)
-                || !target_suffix.is_some_and(safe_relative)
-                || !source.is_file()
-                || !io(&source, source.canonicalize())?.starts_with(&root)
-            {
-                return Err(Error::Message(format!(
-                    "{}: unsafe link in {id}",
-                    manifest_path.display()
-                )));
-            }
-        }
-        if raw_component.exec.iter().any(|argument| {
-            argument.contains('\0') || !validate_template(argument) || shell_argument(argument)
+        let configuration = component
+            .configuration
+            .into_iter()
+            .map(|entry| parse_configuration(manifest_path, &component.id, entry))
+            .collect::<Result<Vec<_>>>()?;
+        let xdg = component.xdg.unwrap_or_default();
+        if xdg.desktop_entry.as_deref().is_some_and(|value| {
+            value.is_empty() || value.contains('/') || !value.ends_with(".desktop")
         }) {
             return Err(Error::Message(format!(
-                "{}: unsafe exec argument",
-                manifest_path.display()
-            )));
-        };
-        if !validate_theme_settings(raw_component.backend.as_deref(), &raw_component.settings) {
-            return Err(Error::Message(format!(
-                "{}: invalid backend settings for component {id}",
-                manifest_path.display()
+                "{}: invalid xdg provider for component {}",
+                manifest_path.display(),
+                component.id
             )));
         }
         components.insert(
-            id,
+            component.id,
             ComponentDef {
-                role: raw_component.role,
-                path,
-                packages: raw_component.packages,
-                optional_packages: raw_component.optional_packages,
-                exec: raw_component.exec,
-                links: raw_component.links,
-                backend: raw_component.backend,
-                settings: raw_component.settings.unwrap_or_default(),
+                role: component.role,
+                packages: component.packages,
+                optional_packages: component.optional_packages,
+                exec,
+                xdg: XdgProvider {
+                    desktop_entry: xdg.desktop_entry,
+                    mime_types: xdg.mime_types,
+                    uri_schemes: xdg.uri_schemes,
+                },
+                configuration,
+                backend: None,
+                settings: BTreeMap::new(),
             },
         );
     }
@@ -314,8 +407,86 @@ fn load_profile(
         id: raw.profile.id,
         name: raw.profile.name,
         description: raw.profile.description,
-        root,
+        source_root,
         defaults: raw.defaults,
         components,
+    })
+}
+
+fn parse_configuration(
+    manifest: &Path,
+    component: &str,
+    raw: RawConfiguration,
+) -> Result<ConfigurationEntry> {
+    if !safe_home_target(&raw.target) {
+        return Err(Error::Message(format!(
+            "{}: unsafe configuration target for {component}",
+            manifest.display()
+        )));
+    }
+    let source = raw.source.map(PathBuf::from);
+    let seed = raw.seed.map(PathBuf::from);
+    if source
+        .as_ref()
+        .is_some_and(|path| !safe_relative(&path.to_string_lossy()))
+        || seed
+            .as_ref()
+            .is_some_and(|path| !safe_relative(&path.to_string_lossy()))
+    {
+        return Err(Error::Message(format!(
+            "{}: unsafe configuration source for {component}",
+            manifest.display()
+        )));
+    }
+    let lifecycle = match (raw.lifecycle.as_str(), raw.mode.as_deref()) {
+        ("generate", None)
+            if raw.template.is_some()
+                && raw.adapter.is_none()
+                && source.is_none()
+                && seed.is_none() =>
+        {
+            Lifecycle::Generate
+        }
+        ("generate", None)
+            if raw.template.is_none()
+                && raw.adapter.is_some()
+                && source.is_none()
+                && seed.is_none() =>
+        {
+            Lifecycle::Generate
+        }
+        ("overwrite", Some("symlink"))
+            if source.is_some()
+                && raw.template.is_none()
+                && raw.adapter.is_none()
+                && seed.is_none() =>
+        {
+            Lifecycle::Overwrite(OverwriteMode::Symlink)
+        }
+        ("overwrite", Some("file"))
+            if source.is_some()
+                && raw.template.is_none()
+                && raw.adapter.is_none()
+                && seed.is_none() =>
+        {
+            Lifecycle::Overwrite(OverwriteMode::File)
+        }
+        ("user", None) if raw.template.is_none() && raw.adapter.is_none() && source.is_none() => {
+            Lifecycle::User
+        }
+        _ => {
+            return Err(Error::Message(format!(
+                "{}: invalid configuration lifecycle for {component}",
+                manifest.display()
+            )));
+        }
+    };
+    Ok(ConfigurationEntry {
+        target: PathBuf::from(raw.target),
+        lifecycle,
+        source,
+        template: raw.template,
+        adapter: raw.adapter,
+        seed,
     })
 }

@@ -39,8 +39,8 @@ pub fn expand_exec(
             "component {id} has no exec command"
         )));
     }
-    let profile_root = profile.root.display().to_string();
-    let component_path = component.path.display().to_string();
+    let profile_root = profile.source_root.display().to_string();
+    let component_path = profile.source_root.display().to_string();
     let mut argv = component
         .exec
         .iter()
