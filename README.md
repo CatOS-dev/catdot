@@ -65,16 +65,41 @@ catdot prune [--dry-run] [--yes]   Remove safe, unused Catdot packages
 catdot doctor                      Diagnose user and system state
 catdot users list                  List system user records
 catdot users prune [--yes]         Remove records for deleted users
+catdot validate PROFILE_ROOT       Validate profile packages without user state
 ```
 
+Schema 3 has four configuration lifecycles:
+
+- `generate` owns a writable result produced from an inline template, a source
+  file, or a backend result. User edits are allowed but are overwritten on the
+  next apply.
+- `symlink` exposes an immutable file or directory from the Profile source tree.
+- `merge` installs an editable text default and performs a best-effort three-way
+  merge when that default changes. A conflict preserves the live file and writes
+  `base`, `local`, `upstream`, and `merged` recovery inputs below Catdot state.
+- `user` seeds a file or directory once and does not update it afterward.
+
 Lifecycle-managed targets are backed up and replaced transactionally during
-`resolve`; there is no separate adoption workflow. `overwrite` content may be
-replaced, `generate` content comes from a manifest template, and `user` content
-is seeded only when missing. Changing a previously managed path to `user`
-releases it without deleting the current content; a managed symlink is detached
-into a user-owned copy.
+`resolve`; there is no separate adoption workflow. Switching away from a
+`merge` target backs it up and removes the live target. Selecting that Profile
+again installs the current packaged default as a fresh configuration. Schema 2
+`overwrite/file` and `overwrite/symlink` declarations remain readable only for
+compatibility with already published Profiles.
 
 ## Reliability model
+
+Catdot guarantees the safe installation and switching mechanics for valid
+Profiles: a failed activation does not advance active state, and the previous
+working configuration remains available. Official Profile defaults are checked
+for target ownership conflicts, XDG single-value conflicts, invalid WM startup
+orders, and selected startup roles without executable providers. Package builds
+and CI can run `catdot validate PROFILE_ROOT` without creating user state.
+
+Arbitrary cross-Profile component mixing, automatic three-way merge results,
+and migration of heavily modified old configurations are best-effort features.
+Catdot attempts them deterministically, reports warnings or conflicts, and must
+not sacrifice the previous active configuration to force a result. WM startup
+ordering guarantees emitted command order, not process readiness.
 
 Catdot keeps desired and active selections separate. Package and activation
 plans are regenerated from installed manifests, tied to a state generation,
@@ -136,8 +161,7 @@ mutating plan unless `--yes` is supplied. Non-interactive mutation without
 ## Profile manifest example
 
 ```toml
-schema = 2
-component_files = ["terminal.toml"]
+schema = 3
 
 [profile]
 id = "catos-niri-dms"
@@ -147,6 +171,7 @@ source_root = "/usr/share/catos-niri-dms"
 
 [defaults]
 desktop = "niri"
+bar = "dms"
 terminal = "ghostty"
 
 [[components]]
@@ -154,22 +179,62 @@ id = "niri"
 role = "desktop"
 packages = ["xdg-desktop-portal-gtk"]
 
+[components.wm]
+autostart_target = ".config/niri/autostart.kdl"
+autostart_template = 'spawn-at-startup "catdot" "exec" "{role}"'
+
+[[components.wm.autostart]]
+role = "bar"
+
+[[components.wm.autostart]]
+role = "xwayland"
+before = ["bar"]
+
 [[components.configuration]]
 target = ".config/niri/config.kdl"
 lifecycle = "generate"
-template = "include \"default.kdl\"\ninclude \"custom/config.kdl\"\n"
+source = ".config/niri/config.kdl"
 
 [[components.configuration]]
-target = ".config/niri/default.kdl"
-lifecycle = "overwrite"
-mode = "symlink"
-source = ".config/niri/default.kdl"
+target = ".config/niri/binds.kdl"
+lifecycle = "merge"
+source = ".config/niri/binds.kdl"
+
+[[components.configuration]]
+target = ".config/niri/static"
+lifecycle = "symlink"
+source = ".config/niri/static"
 
 [[components.configuration]]
 target = ".config/niri/custom"
 lifecycle = "user"
 seed = ".config/niri/custom"
+
+[[components]]
+id = "dms"
+role = "bar"
+
+[components.exec]
+argv = ["dms", "run", "--session"]
+
+[[components]]
+id = "ghostty"
+role = "terminal"
+
+[components.exec]
+argv = ["ghostty"]
+
+[components.xdg]
+command = "ghostty"
+environment = ["TERMINAL"]
 ```
+
+The WM declaration compiles only selected autostart roles, applies stable
+`before`/`after` topological ordering, and rejects cycles. Role names are not
+hard-coded by Catdot. Binds can call `catdot exec <role>` and therefore do not
+need regeneration when only the provider changes. XDG declarations use an
+explicit real executable name; `command` does not accept arguments or wrappers.
+MIME types, URI schemes, and desktop entries remain part of the same XDG slot.
 
 External component files must be named explicitly in `component_files`;
 Catdot does not discover arbitrary TOML files. Manifest commands are argv
