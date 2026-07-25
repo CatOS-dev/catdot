@@ -6,6 +6,7 @@ pub mod manifest;
 pub mod planning;
 pub mod state;
 pub mod theme;
+pub mod update;
 
 pub use activation::{
     ActivationJournal, ActivationPlan, ManagedRegistry, ManagedTarget, Materialization,
@@ -32,3 +33,6 @@ pub use state::{
     validate_user_state, write_state, write_system_packages,
 };
 pub use theme::{apply_theme, merge_ini, theme_expected_files};
+pub use update::{
+    activation_digests, package_digests, read_system_generation, system_generation_path,
+};

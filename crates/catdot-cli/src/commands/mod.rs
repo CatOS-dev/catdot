@@ -10,8 +10,8 @@ use std::{
 mod runtime;
 
 use runtime::{
-    apply, component_for, exec_role, package_present, profiles, state_file, sync_active_settings,
-    unresolved_packages,
+    apply, clear_profile_custom, component_for, exec_role, package_present, profiles, state_file,
+    sync_active_settings, unresolved_packages,
 };
 
 const MANAGE_HELPER: &str = "/usr/lib/catdot/catdot-helper";
@@ -68,6 +68,15 @@ enum Cmd {
     /// Reapply the current active configuration without changing selection.
     #[command(about = "Reapply the active configuration")]
     Apply,
+    /// Check a system profile generation and reapply the active profile.
+    #[command(about = "Reapply changed active profile inputs without installing packages")]
+    Update,
+    /// Reset the current active profile's custom areas and managed files.
+    #[command(about = "Reset the current active profile")]
+    Reset {
+        /// Active profile ID to reset.
+        profile: String,
+    },
     /// Execute the active provider for a role.
     #[command(about = "Execute an active component role")]
     Exec {
@@ -169,6 +178,20 @@ fn system_doctor_report() -> Result<SystemDoctorReport> {
     )?;
     toml::from_str(&String::from_utf8_lossy(&output.stdout))
         .context("parse system Catdot diagnostics")
+}
+
+fn user_update_service_active() -> Option<bool> {
+    let unit = std::env::var_os("CATDOT_USER_UPDATE_UNIT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "/usr/lib/systemd/user/catdot-update.path".into());
+    if !unit.exists() {
+        return None;
+    }
+    Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", "catdot-update.path"])
+        .status()
+        .ok()
+        .map(|status| status.success())
 }
 
 fn print_missing_packages(
@@ -543,7 +566,12 @@ pub fn run() -> Result<i32> {
         && (!path.exists()
             || matches!(
                 &cli.command,
-                Cmd::Select { .. } | Cmd::Disable { .. } | Cmd::Apply | Cmd::Resolve { .. }
+                Cmd::Select { .. }
+                    | Cmd::Disable { .. }
+                    | Cmd::Apply
+                    | Cmd::Update
+                    | Cmd::Reset { .. }
+                    | Cmd::Resolve { .. }
             ));
     let _state_lock = if mutates_state {
         Some(lock(&state_lock_path(&path)?)?)
@@ -670,18 +698,72 @@ pub fn run() -> Result<i32> {
             write_state(&path, &state)?;
             println!("Disabled desired {role}; run: catdot resolve");
         }
-        Cmd::Apply => {
+        Cmd::Apply | Cmd::Update => {
+            let system_generation = read_system_generation()?;
             let mut active = state.clone();
             active.components = active.active_components.clone();
-            let mut journal = ActivationJournal::begin(&path, state.clone(), state.clone())?;
+            let package_inputs = package_digests(ps, &active)?;
+            let activation_inputs = activation_digests(ps, &active)?;
+            if matches!(cli.command, Cmd::Update)
+                && system_generation == state.active_system_generation
+                && activation_inputs == state.activation_digests
+                && package_inputs == state.active_package_digests
+                && !state.needs_resolve
+            {
+                println!("Active profile is current.");
+                return Ok(0);
+            }
+            let declares_packages = active.components.keys().any(|role| {
+                component_for(ps, &active, role).is_ok_and(|(_, component, _)| {
+                    !component.packages.is_empty() || !component.optional_packages.is_empty()
+                })
+            });
+            let package_declaration_changed = package_inputs != state.active_package_digests
+                && (!state.active_package_digests.is_empty() || declares_packages);
+            if package_declaration_changed {
+                state.needs_resolve = true;
+                write_state(&path, &state)?;
+                bail!("active profile dependency declarations changed; run: catdot resolve");
+            }
+            let missing = unresolved_packages(ps, &active)?;
+            if !missing.is_empty() {
+                state.needs_resolve = true;
+                write_state(&path, &state)?;
+                bail!(
+                    "active profile needs resolve; missing {}",
+                    missing.into_iter().collect::<Vec<_>>().join(", ")
+                );
+            }
+            let mut new_state = state.clone();
+            new_state.activation_digests = activation_inputs;
+            new_state.active_package_digests = package_inputs;
+            new_state.active_system_generation = system_generation;
+            new_state.needs_resolve = false;
+            let mut journal = ActivationJournal::begin(&path, state.clone(), new_state.clone())?;
             journal.mark_applying()?;
             if let Err(error) = apply(ps, &active, &mut journal) {
                 recover_activation_journals(&path)?;
                 return Err(error);
             }
+            write_state(&path, &new_state)?;
+            journal.mark_state_written()?;
             journal.complete()?;
             sync_active_settings(ps, &active)?;
             println!("Reapplied active configuration");
+        }
+        Cmd::Reset { profile } => {
+            let mut active = state.clone();
+            active.components = active.active_components.clone();
+            let mut journal = ActivationJournal::begin(&path, state.clone(), state.clone())?;
+            journal.mark_applying()?;
+            if let Err(error) = clear_profile_custom(ps, &state, &profile, &mut journal)
+                .and_then(|_| apply(ps, &active, &mut journal))
+            {
+                recover_activation_journals(&path)?;
+                return Err(error);
+            }
+            journal.complete()?;
+            println!("Reset active profile {profile}");
         }
         Cmd::Exec { role, arguments } => {
             exec_role(ps, &state, &role, &arguments)?;
@@ -725,6 +807,12 @@ pub fn run() -> Result<i32> {
                     let mut new_state = state.clone();
                     new_state.active_components = new_state.components.clone();
                     new_state.active_generation = new_state.generation;
+                    new_state.activation_digests =
+                        activation_digests(refreshed_profiles, &new_state)?;
+                    new_state.active_package_digests =
+                        package_digests(refreshed_profiles, &new_state)?;
+                    new_state.active_system_generation = read_system_generation()?;
+                    new_state.needs_resolve = false;
                     let mut journal =
                         ActivationJournal::begin(&path, old_state.clone(), new_state.clone())?;
                     journal.mark_applying()?;
@@ -832,6 +920,41 @@ pub fn run() -> Result<i32> {
                     state.generation, state.active_generation
                 );
                 warnings = true;
+            }
+            let system_generation = read_system_generation()?;
+            if system_generation != state.active_system_generation {
+                println!(
+                    "warning: system profile generation changed (system {system_generation}, user {})",
+                    state.active_system_generation
+                );
+                warnings = true;
+            }
+            if state.needs_resolve {
+                println!("warning: active profile needs resolve before it can be updated");
+                warnings = true;
+            }
+            match user_update_service_active() {
+                Some(true) => println!("ok: user update service is active"),
+                Some(false) => {
+                    println!("warning: user update service is inactive");
+                    warnings = true;
+                }
+                None => println!("user update service status: not installed"),
+            }
+            if !state.active_components.is_empty() {
+                let mut active = state.clone();
+                active.components = active.active_components.clone();
+                match activation_digests(ps, &active) {
+                    Ok(digests) if digests != state.activation_digests => {
+                        println!("warning: active profile inputs changed; run catdot update");
+                        warnings = true;
+                    }
+                    Err(error) => {
+                        println!("error: cannot read active profile inputs: {error}");
+                        errors = true;
+                    }
+                    _ => {}
+                }
             }
             for (target, managed) in read_managed_registry(&managed_targets_path(&path)?)?.entries {
                 let metadata = std::fs::symlink_metadata(&target).ok();

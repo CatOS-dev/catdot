@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use catdot_core::*;
 use std::{
     collections::BTreeSet,
-    env,
+    env, fs,
     os::unix::process::CommandExt,
     path::PathBuf,
     process::{Command, Stdio},
@@ -119,6 +119,55 @@ pub(super) fn apply(
         }
     }
     journal.mark_applied()?;
+    Ok(())
+}
+
+/// Remove only the explicit user areas owned by the active profile.  The
+/// caller's activation journal snapshots each path first, so reset retains the
+/// same binary-safe rollback and backup semantics as a normal activation.
+pub(super) fn clear_profile_custom(
+    profiles: &std::collections::BTreeMap<String, Profile>,
+    state: &UserState,
+    profile_id: &str,
+    journal: &mut ActivationJournal,
+) -> Result<()> {
+    let home = home()?;
+    let active_components: Vec<_> = state
+        .active_components
+        .values()
+        .filter(|reference| reference.starts_with(&format!("{profile_id}/")))
+        .collect();
+    if active_components.is_empty() {
+        bail!("refusing to reset {profile_id}: it is not the current active profile");
+    }
+    for reference in active_components {
+        let (_, component_id) = reference
+            .split_once('/')
+            .context("invalid active component reference")?;
+        let profile = profiles
+            .get(profile_id)
+            .context("active profile is no longer installed")?;
+        let component = profile
+            .components
+            .get(component_id)
+            .with_context(|| format!("active component {reference} is no longer installed"))?;
+        for entry in &component.configuration {
+            if !matches!(entry.lifecycle, Lifecycle::User) {
+                continue;
+            }
+            let target = home.join(&entry.target);
+            journal.track_path(&target)?;
+            match fs::symlink_metadata(&target) {
+                Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
+                    fs::remove_file(&target)?
+                }
+                Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&target)?,
+                Ok(_) => bail!("unsupported user target {}", target.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
     Ok(())
 }
 

@@ -289,6 +289,13 @@ fn apply_entry(entry: &PlannedTarget) -> Result<()> {
     match &entry.materialization {
         Materialization::Generate { contents } => replace_file(&entry.target, contents, 0o644),
         Materialization::Symlink { source } => {
+            if fs::symlink_metadata(&entry.target)
+                .ok()
+                .is_some_and(|metadata| metadata.file_type().is_symlink())
+                && fs::read_link(&entry.target).ok().as_ref() == Some(source)
+            {
+                return Ok(());
+            }
             parent(&entry.target)?;
             let temporary = sibling(&entry.target, "link");
             symlink(source, &temporary).map_err(|source| Error::Io {

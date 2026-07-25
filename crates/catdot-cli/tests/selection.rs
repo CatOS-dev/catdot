@@ -365,3 +365,331 @@ fn resolve_dry_run_prints_xdg_defaults_and_preserves_home_and_state() {
     assert_eq!(fs::read(&xdg_registry).unwrap(), registry_before);
     assert!(!home.path().join(".config/mimeapps.list").exists());
 }
+
+// Protects the upgrade boundary: a root-owned generation marker can cause a
+// user-owned reapply, but it must preserve an existing custom area and never
+// need a package transaction for an already-active component.
+#[test]
+fn update_reapplies_active_profile_without_touching_custom() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let metadata = root.path().join("demo");
+    let source = root.path().join("share");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::create_dir_all(source.join(".config/demo/custom")).unwrap();
+    fs::write(source.join(".config/demo/custom/seed"), "seed").unwrap();
+    fs::write(metadata.join("profile.toml"), format!(
+        "schema = 2\n[profile]\nid = \"demo\"\nname = \"Demo\"\ndescription = \"test\"\nsource_root = \"{}\"\n[[components]]\nid = \"desktop\"\nrole = \"desktop\"\n[[components.configuration]]\ntarget = \".config/demo/config\"\nlifecycle = \"generate\"\ntemplate = \"managed\"\n[[components.configuration]]\ntarget = \".config/demo/custom\"\nlifecycle = \"user\"\nseed = \".config/demo/custom\"\n", source.display()
+    )).unwrap();
+    let state = home.path().join(".local/state/catdot/state.toml");
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::write(&state, "schema = 1\ngeneration = 1\nactive_generation = 1\n[components]\ndesktop = \"demo/desktop\"\n[active_components]\ndesktop = \"demo/desktop\"\n").unwrap();
+    let custom = home.path().join(".config/demo/custom");
+    fs::create_dir_all(&custom).unwrap();
+    fs::write(custom.join("mine"), "do not replace").unwrap();
+    let marker = root.path().join("generation");
+    fs::write(&marker, "7\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .arg("update")
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .env("CATDOT_SYSTEM_GENERATION", &marker)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(custom.join("mine")).unwrap(),
+        "do not replace"
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join(".config/demo/config")).unwrap(),
+        "managed"
+    );
+    assert!(
+        fs::read_to_string(&state)
+            .unwrap()
+            .contains("active_system_generation = 7")
+    );
+    let manifest = metadata.join("profile.toml");
+    fs::write(
+        &manifest,
+        fs::read_to_string(&manifest)
+            .unwrap()
+            .replace("managed", "changed"),
+    )
+    .unwrap();
+    let second = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .arg("update")
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .env("CATDOT_SYSTEM_GENERATION", &marker)
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join(".config/demo/config")).unwrap(),
+        "changed"
+    );
+}
+
+// Protects the reset exception to the normal user boundary: only an explicit
+// reset may remove custom data, and it must then reseed custom and repair the
+// managed entry in the same activation transaction.
+#[test]
+fn reset_reseeds_custom_and_repairs_managed_files() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let metadata = root.path().join("demo");
+    let source = root.path().join("share");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::create_dir_all(source.join(".config/demo/custom")).unwrap();
+    fs::write(source.join(".config/demo/custom/seed"), "seed").unwrap();
+    fs::write(metadata.join("profile.toml"), format!(
+        "schema = 2\n[profile]\nid = \"demo\"\nname = \"Demo\"\ndescription = \"test\"\nsource_root = \"{}\"\n[[components]]\nid = \"desktop\"\nrole = \"desktop\"\n[[components.configuration]]\ntarget = \".config/demo/config\"\nlifecycle = \"generate\"\ntemplate = \"managed\"\n[[components.configuration]]\ntarget = \".config/demo/custom\"\nlifecycle = \"user\"\nseed = \".config/demo/custom\"\n", source.display()
+    )).unwrap();
+    let state = home.path().join(".local/state/catdot/state.toml");
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::write(&state, "schema = 1\ngeneration = 1\nactive_generation = 1\n[components]\ndesktop = \"demo/desktop\"\n[active_components]\ndesktop = \"demo/desktop\"\n").unwrap();
+    let custom = home.path().join(".config/demo/custom");
+    fs::create_dir_all(&custom).unwrap();
+    fs::write(custom.join("mine"), "remove me").unwrap();
+    fs::write(home.path().join(".config/demo/config"), "damaged").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .args(["reset", "demo"])
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!custom.join("mine").exists());
+    assert_eq!(fs::read_to_string(custom.join("seed")).unwrap(), "seed");
+    assert_eq!(
+        fs::read_to_string(home.path().join(".config/demo/config")).unwrap(),
+        "managed"
+    );
+    assert!(home.path().join(".local/state/catdot/backups").exists());
+    let wrong_profile = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .args(["reset", "other"])
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(!wrong_profile.status.success());
+    assert!(String::from_utf8_lossy(&wrong_profile.stderr).contains("not the current active"));
+}
+
+// A profile package update may add an unavailable component dependency.  The
+// login service must record that explicit resolve is needed; it must not turn
+// a background generation check into a package installation transaction.
+#[test]
+fn update_marks_needs_resolve_without_installing_packages() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let metadata = root.path().join("demo");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(metadata.join("profile.toml"), format!(
+        "schema = 2\n[profile]\nid = \"demo\"\nname = \"Demo\"\ndescription = \"test\"\nsource_root = \"{}\"\n[[components]]\nid = \"desktop\"\nrole = \"desktop\"\npackages = [\"catdot-update-test-missing\"]\n", root.path().join("share").display()
+    )).unwrap();
+    let state = home.path().join(".local/state/catdot/state.toml");
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::write(&state, "schema = 1\ngeneration = 1\nactive_generation = 1\n[components]\ndesktop = \"demo/desktop\"\n[active_components]\ndesktop = \"demo/desktop\"\n").unwrap();
+    let marker = root.path().join("generation");
+    fs::write(&marker, "1\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .arg("update")
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .env("CATDOT_SYSTEM_GENERATION", &marker)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("dependency declarations changed")
+            || String::from_utf8_lossy(&output.stderr).contains("needs resolve")
+    );
+    assert!(
+        fs::read_to_string(state)
+            .unwrap()
+            .contains("needs_resolve = true")
+    );
+}
+
+// Even when a newly declared package already exists, changing the dependency
+// declaration needs explicit `resolve`; an update service may never silently
+// accept that product change or invoke a package transaction.
+#[test]
+fn update_requires_resolve_when_an_installed_dependency_declaration_changes() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let metadata = root.path().join("demo");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(metadata.join("profile.toml"), format!(
+        "schema = 2\n[profile]\nid = \"demo\"\nname = \"Demo\"\ndescription = \"test\"\nsource_root = \"{}\"\n[[components]]\nid = \"desktop\"\nrole = \"desktop\"\npackages = [\"already-installed\"]\n", root.path().join("share").display()
+    )).unwrap();
+    let state = home.path().join(".local/state/catdot/state.toml");
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::write(&state, "schema = 1\ngeneration = 1\nactive_generation = 1\n[components]\ndesktop = \"demo/desktop\"\n[active_components]\ndesktop = \"demo/desktop\"\n[active_package_digests]\ndesktop = \"old-declaration\"\n").unwrap();
+    let marker = root.path().join("generation");
+    fs::write(&marker, "2\n").unwrap();
+    let bin = root.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let calls = root.path().join("pacman.calls");
+    let pacman = bin.join("pacman");
+    fs::write(
+        &pacman,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&pacman).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&pacman, permissions).unwrap();
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .arg("update")
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .env("CATDOT_SYSTEM_GENERATION", &marker)
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("dependency declarations changed"));
+    assert!(
+        !calls.exists(),
+        "update must not query or transact packages before resolve"
+    );
+    assert!(
+        fs::read_to_string(state)
+            .unwrap()
+            .contains("needs_resolve = true")
+    );
+}
+
+// Roles may deliberately come from more than one profile.  Reset must prove
+// ownership per active component instead of refusing the normal cross-profile
+// selection model or deleting another profile's custom data.
+#[test]
+fn reset_only_clears_the_named_active_profiles_custom_area() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    for (profile, role) in [("desktop", "desktop"), ("common", "terminal")] {
+        let metadata = root.path().join(profile);
+        let source = root.path().join(format!("{profile}-share"));
+        fs::create_dir_all(source.join(format!(".config/{profile}/custom"))).unwrap();
+        fs::write(
+            source.join(format!(".config/{profile}/custom/seed")),
+            profile,
+        )
+        .unwrap();
+        fs::create_dir_all(&metadata).unwrap();
+        fs::write(metadata.join("profile.toml"), format!(
+            "schema = 2\n[profile]\nid = \"{profile}\"\nname = \"{profile}\"\ndescription = \"test\"\nsource_root = \"{}\"\n[[components]]\nid = \"main\"\nrole = \"{role}\"\n[[components.configuration]]\ntarget = \".config/{profile}/custom\"\nlifecycle = \"user\"\nseed = \".config/{profile}/custom\"\n", source.display()
+        )).unwrap();
+    }
+    let state = home.path().join(".local/state/catdot/state.toml");
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::write(&state, "schema = 1\ngeneration = 1\nactive_generation = 1\n[components]\ndesktop = \"desktop/main\"\nterminal = \"common/main\"\n[active_components]\ndesktop = \"desktop/main\"\nterminal = \"common/main\"\n").unwrap();
+    for profile in ["desktop", "common"] {
+        let custom = home.path().join(format!(".config/{profile}/custom"));
+        fs::create_dir_all(&custom).unwrap();
+        fs::write(custom.join("mine"), profile).unwrap();
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .args(["reset", "desktop"])
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!home.path().join(".config/desktop/custom/mine").exists());
+    assert!(home.path().join(".config/desktop/custom/seed").is_file());
+    assert_eq!(
+        fs::read_to_string(home.path().join(".config/common/custom/mine")).unwrap(),
+        "common"
+    );
+}
+
+// Doctor must make a stopped installed user watcher visible, otherwise users
+// cannot tell why a root hook generation is waiting for their next login.
+#[test]
+fn doctor_reports_an_inactive_installed_user_update_service() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let unit = root.path().join("catdot-update.path");
+    fs::write(&unit, "[Path]\n").unwrap();
+    let marker = root.path().join("generation");
+    fs::write(&marker, "3\n").unwrap();
+    let bin = root.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let systemctl = bin.join("systemctl");
+    fs::write(&systemctl, "#!/bin/sh\nexit 3\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&systemctl).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&systemctl, permissions).unwrap();
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .arg("doctor")
+        .env("CATDOT_PROFILE_ROOT", root.path())
+        .env("HOME", home.path())
+        .env("CATDOT_USER_UPDATE_UNIT", &unit)
+        .env("CATDOT_SYSTEM_GENERATION", &marker)
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("user update service is inactive"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("system profile generation changed"));
+}
+
+// The pacman hook is root-side bookkeeping only.  It may advance the system
+// marker, but must never traverse or write a user's HOME.
+#[test]
+fn generation_marker_hook_only_writes_the_redirected_system_marker() {
+    let root = tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let sentinel = home.join("untouched");
+    fs::write(&sentinel, "user data").unwrap();
+    let marker = root.path().join("system/generation");
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("packaging/mark-generation");
+    for expected in ["1\n", "2\n"] {
+        let status = Command::new("sh")
+            .arg(&script)
+            .env("CATDOT_SYSTEM_GENERATION", &marker)
+            .env("HOME", &home)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(fs::read_to_string(&marker).unwrap(), expected);
+    }
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "user data");
+}

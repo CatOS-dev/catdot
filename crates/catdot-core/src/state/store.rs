@@ -15,6 +15,14 @@ pub struct UserState {
     pub components: BTreeMap<String, String>,
     pub active_generation: u64,
     pub active_components: BTreeMap<String, String>,
+    #[serde(default)]
+    pub activation_digests: BTreeMap<String, String>,
+    #[serde(default)]
+    pub active_package_digests: BTreeMap<String, String>,
+    #[serde(default)]
+    pub active_system_generation: u64,
+    #[serde(default)]
+    pub needs_resolve: bool,
 }
 impl Default for UserState {
     fn default() -> Self {
@@ -24,6 +32,10 @@ impl Default for UserState {
             components: BTreeMap::new(),
             active_generation: 0,
             active_components: BTreeMap::new(),
+            activation_digests: BTreeMap::new(),
+            active_package_digests: BTreeMap::new(),
+            active_system_generation: 0,
+            needs_resolve: false,
         }
     }
 }
@@ -40,6 +52,14 @@ struct RawUserState {
     active_generation: u64,
     #[serde(default)]
     active_components: BTreeMap<String, String>,
+    #[serde(default)]
+    activation_digests: BTreeMap<String, String>,
+    #[serde(default)]
+    active_package_digests: BTreeMap<String, String>,
+    #[serde(default)]
+    active_system_generation: u64,
+    #[serde(default)]
+    needs_resolve: bool,
 }
 pub fn state_path(home: &Path) -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
@@ -179,6 +199,10 @@ pub fn parse_state_text(text: &str) -> std::result::Result<UserState, toml::de::
             components: raw.components.clone(),
             active_generation: raw.generation,
             active_components: raw.components,
+            activation_digests: BTreeMap::new(),
+            active_package_digests: BTreeMap::new(),
+            active_system_generation: 0,
+            needs_resolve: false,
         }),
         Some(1) => Ok(UserState {
             schema: 1,
@@ -186,6 +210,10 @@ pub fn parse_state_text(text: &str) -> std::result::Result<UserState, toml::de::
             components: raw.components,
             active_generation: raw.active_generation,
             active_components: raw.active_components,
+            activation_digests: raw.activation_digests,
+            active_package_digests: raw.active_package_digests,
+            active_system_generation: raw.active_system_generation,
+            needs_resolve: raw.needs_resolve,
         }),
         Some(schema) => Err(toml::de::Error::custom(format!(
             "unsupported state schema {schema}"
@@ -343,6 +371,10 @@ pub fn select_profile(profile: &Profile) -> Result<UserState> {
         components,
         active_generation: 0,
         active_components: BTreeMap::new(),
+        activation_digests: BTreeMap::new(),
+        active_package_digests: BTreeMap::new(),
+        active_system_generation: 0,
+        needs_resolve: false,
     })
 }
 pub fn select_component(

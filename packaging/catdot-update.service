@@ -1,0 +1,6 @@
+[Unit]
+Description=Reapply changed Catdot profile inputs
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/catdot update

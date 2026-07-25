@@ -840,6 +840,143 @@ fn activation_journal_can_explicitly_rollback_after_finalize_failure() {
     assert_eq!(fs::read_to_string(target).unwrap(), "old");
 }
 
+// Protects package-update reapplication: generated and copied inputs must be
+// rewritten, a correct symlink must stay untouched while seeing new source
+// content, and a changed symlink source path must be repaired.
+#[test]
+fn reapply_updates_generate_and_file_and_repairs_only_changed_symlinks() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    let source = temp.path().join("share/demo");
+    fs::create_dir_all(source.join(".config/demo")).unwrap();
+    fs::write(source.join(".config/demo/file"), "first file").unwrap();
+    fs::write(source.join(".config/demo/link"), "first link").unwrap();
+    fs::write(source.join(".config/demo/link2"), "second path").unwrap();
+    fs::create_dir_all(&metadata).unwrap();
+    let manifest = metadata.join("profile.toml");
+    fs::write(
+        &manifest,
+        profile(
+            &source.display().to_string(),
+            r#"[[components]]
+id = "desktop"
+role = "desktop"
+[[components.configuration]]
+target = ".config/demo/generated"
+lifecycle = "generate"
+template = "first generated"
+[[components.configuration]]
+target = ".config/demo/file"
+lifecycle = "overwrite"
+mode = "file"
+source = ".config/demo/file"
+[[components.configuration]]
+target = ".config/demo/link"
+lifecycle = "overwrite"
+mode = "symlink"
+source = ".config/demo/link"
+"#,
+            "",
+            r#"desktop = "desktop"
+"#,
+        ),
+    )
+    .unwrap();
+    let home = temp.path().join("home");
+    let registry = home.join(".local/state/catdot/managed.toml");
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    apply_configuration(
+        &build_activation_plan(&profiles, &state, &home, &registry).unwrap(),
+        &registry,
+        &home,
+    )
+    .unwrap();
+    let target = home.join(".config/demo/link");
+    let link_inode = fs::symlink_metadata(&target).unwrap().ino();
+    fs::write(source.join(".config/demo/file"), "second file").unwrap();
+    fs::write(source.join(".config/demo/link"), "second link").unwrap();
+    apply_configuration(
+        &build_activation_plan(&profiles, &state, &home, &registry).unwrap(),
+        &registry,
+        &home,
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(home.join(".config/demo/file")).unwrap(),
+        "second file"
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "second link");
+    assert_eq!(fs::symlink_metadata(&target).unwrap().ino(), link_inode);
+    fs::write(
+        &manifest,
+        fs::read_to_string(&manifest)
+            .unwrap()
+            .replace("first generated", "second generated")
+            .replace(
+                "source = \".config/demo/link\"",
+                "source = \".config/demo/link2\"",
+            ),
+    )
+    .unwrap();
+    let changed = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let changed_state = select_profile(&changed["demo"]).unwrap();
+    apply_configuration(
+        &build_activation_plan(&changed, &changed_state, &home, &registry).unwrap(),
+        &registry,
+        &home,
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(home.join(".config/demo/generated")).unwrap(),
+        "second generated"
+    );
+    assert_eq!(
+        fs::read_link(target).unwrap(),
+        source.join(".config/demo/link2")
+    );
+}
+
+// Successful activations retain a bounded recovery history. Without this,
+// ordinary profile updates would grow a user's state directory indefinitely.
+#[test]
+fn activation_backup_retention_keeps_the_latest_five_generations() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    let source = temp.path().join("share/demo");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        profile(
+            &source.display().to_string(),
+            r#"[[components]]
+id = "desktop"
+role = "desktop"
+[[components.configuration]]
+target = ".config/demo/generated"
+lifecycle = "generate"
+template = "generated"
+"#,
+            "",
+            r#"desktop = "desktop"
+"#,
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    let home = temp.path().join("home");
+    let registry = home.join(".local/state/catdot/managed.toml");
+    let plan = build_activation_plan(&profiles, &state, &home, &registry).unwrap();
+    for _ in 0..6 {
+        apply_configuration(&plan, &registry, &home).unwrap();
+    }
+    let backups = home.join(".local/state/catdot/backups");
+    assert_eq!(fs::read_dir(backups).unwrap().count(), 5);
+}
+
 // Desktop overrides select desired providers only; they never activate one.
 #[test]
 fn skel_default_desktop_override_replaces_the_profile_default() {

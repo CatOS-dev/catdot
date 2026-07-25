@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+marker=${CATDOT_SYSTEM_GENERATION:-/var/lib/catdot/generation}
+state_dir=$(dirname "$marker")
+install -d -m 0755 "$state_dir"
+generation=0
+if test -r "$marker"; then
+  generation=$(cat "$marker")
+fi
+case $generation in
+  *[!0-9]*|'') generation=0 ;;
+esac
+printf '%s\n' "$((generation + 1))" >"$marker"
