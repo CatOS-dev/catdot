@@ -49,18 +49,19 @@ PACMAN
     install -Dm755 /catdot-bin/catdot /usr/bin/catdot
     install -Dm755 /catdot-bin/catdot-helper /usr/lib/catdot/catdot-helper
     install -Dm755 /catdot-bin/catdot-query-helper /usr/lib/catdot/catdot-query-helper
-    install -d /usr/share/catdot/profiles/upgrade-test/component
+    install -d /usr/share/catdot/profiles/upgrade-test
     cat > /usr/share/catdot/profiles/upgrade-test/profile.toml <<"PROFILE"
-schema = 1
+schema = 2
 [profile]
 id = "upgrade-test"
 name = "Explicit upgrade ownership test"
 description = "Ensures pre-existing explicit packages remain user-owned"
+source_root = "/usr/share/upgrade-test"
 [defaults]
 tool = "consumer"
-[components.consumer]
+[[components]]
+id = "consumer"
 role = "tool"
-path = "component"
 packages = ["catdot-upgrade-consumer"]
 PROFILE
 

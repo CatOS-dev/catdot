@@ -25,7 +25,7 @@ pub(super) fn print_plan(
     state_path: &Path,
     optional: bool,
 ) -> Result<()> {
-    let context = prepare(uid, generation, state_path, optional)?;
+    let context = prepare(uid, generation, state_path, optional, true)?;
     let preview = PackagePlanPreview {
         plan: context.plan,
         requirements: aggregate_requirements(&context.records),
@@ -48,7 +48,7 @@ pub(super) fn apply(
     let database = Path::new(DB);
     let mut handle = open_handle()?;
     recover_pending(database, |name| handle.localdb().pkg(name).is_ok())?;
-    let context = prepare(uid, generation, state_path, optional)?;
+    let context = prepare(uid, generation, state_path, optional, false)?;
     if context.plan.digest() != digest {
         bail!("plan changed; run catdot resolve again")
     }
@@ -129,7 +129,13 @@ pub(super) fn finalize(uid: u32, generation: u64, state_path: &Path) -> Result<(
     Ok(())
 }
 
-fn prepare(uid: u32, generation: u64, state_path: &Path, optional: bool) -> Result<ResolveContext> {
+fn prepare(
+    uid: u32,
+    generation: u64,
+    state_path: &Path,
+    optional: bool,
+    default_preview: bool,
+) -> Result<ResolveContext> {
     let profiles = discover_profile_registry(Path::new(DEFAULT_PROFILE_ROOT))?.valid_profiles;
     let database = Path::new(DB);
     let existing_records = load_records(database)?;
@@ -142,7 +148,14 @@ fn prepare(uid: u32, generation: u64, state_path: &Path, optional: bool) -> Resu
     {
         bail!("state path does not match the path registered for uid {uid}")
     }
-    let state = read_trusted_user_state(uid, state_path)?;
+    let state = if default_preview && !state_path.exists() {
+        if !state_path.is_absolute() {
+            bail!("default preview state path must be absolute")
+        }
+        preview_state_from_default(state_path, &default_declaration_path(), &profiles)?
+    } else {
+        read_trusted_user_state(uid, state_path)?
+    };
     validate_user_state(&state, &profiles)?;
     if state.generation != generation {
         bail!("state changed; run catdot resolve again")

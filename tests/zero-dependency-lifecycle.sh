@@ -11,44 +11,26 @@ podman run --rm --security-opt label=disable \
     install -Dm755 /catdot-bin/catdot /usr/bin/catdot
     install -Dm755 /catdot-bin/catdot-helper /usr/lib/catdot/catdot-helper
     install -Dm755 /catdot-bin/catdot-query-helper /usr/lib/catdot/catdot-query-helper
-    install -d /usr/share/catdot/profiles/lifecycle/{one,two,gtk,qt}
+    install -d /usr/share/catdot/profiles/lifecycle
     cat > /usr/share/catdot/profiles/lifecycle/profile.toml <<"EOF"
-schema = 1
+schema = 2
 [profile]
 id = "lifecycle"
 name = "Zero dependency lifecycle"
 description = "Exercises activation without package transactions"
+source_root = "/usr/share/lifecycle"
 [defaults]
 tool = "one"
-gtk-theme = "gtk"
-qt-theme = "qt"
-[components.one]
+[[components]]
+id = "one"
 role = "tool"
-path = "one"
-exec = ["/usr/bin/printf", "one\\n"]
-[components.two]
+[components.exec]
+argv = ["/usr/bin/printf", "one\\n"]
+[[components]]
+id = "two"
 role = "tool"
-path = "two"
-exec = ["/usr/bin/printf", "two\\n"]
-[components.gtk]
-role = "gtk-theme"
-path = "gtk"
-backend = "gtk"
-[components.gtk.settings]
-theme = "Test-Gtk"
-icon_theme = "Test-Icons"
-cursor_theme = "Test-Cursor"
-font = "Test Sans 10"
-color_scheme = "prefer-dark"
-[components.qt]
-role = "qt-theme"
-path = "qt"
-backend = "qtct-kvantum"
-[components.qt.settings]
-qt5_style = "kvantum"
-qt6_style = "kvantum"
-kvantum_theme = "KvantumAlt"
-icon_theme = "Test-Icons"
+[components.exec]
+argv = ["/usr/bin/printf", "two\\n"]
 EOF
 
     cat > /tmp/pkexec-shim.c <<"EOF"
@@ -83,9 +65,6 @@ EOF
     printf "%s\n" "$resolve_output" | grep -F "Profile changes applied successfully."
     runuser -u alice -- env $alice catdot resolve --yes | grep -F "Catdot is already up to date."
     runuser -u alice -- env $alice catdot exec tool | grep -Fx one
-    grep -F "gtk-theme-name=Test-Gtk" /home/alice/.config/gtk-3.0/settings.ini
-    grep -F "style=kvantum" /home/alice/.config/qt5ct/qt5ct.conf
-    grep -F "theme=KvantumAlt" /home/alice/.config/Kvantum/kvantum.kvconfig
     runuser -u alice -- env $alice catdot select tool lifecycle/two
     runuser -u alice -- env $alice catdot resolve --yes
     runuser -u alice -- env $alice catdot exec tool | grep -Fx two

@@ -8,18 +8,19 @@ podman run --rm --security-opt label=disable \
     install -Dm755 /catdot-bin/catdot /usr/bin/catdot
     install -Dm755 /catdot-bin/catdot-helper /usr/lib/catdot/catdot-helper
     install -Dm755 /catdot-bin/catdot-query-helper /usr/lib/catdot/catdot-query-helper
-    install -d /usr/share/catdot/profiles/demo/component
+    install -d /usr/share/catdot/profiles/demo
     cat > /usr/share/catdot/profiles/demo/profile.toml <<"PROFILE"
-schema = 1
+schema = 2
 [profile]
 id = "demo"
 name = "Query helper test"
 description = "Separates read-only and mutating privilege paths"
+source_root = "/usr/share/demo"
 [defaults]
 tool = "tool"
-[components.tool]
+[[components]]
+id = "tool"
 role = "tool"
-path = "component"
 PROFILE
     cat > /tmp/pkexec.c <<"C"
 #include <fcntl.h>

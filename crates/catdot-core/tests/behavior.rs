@@ -808,6 +808,38 @@ fn activation_recovery_refuses_externally_changed_state() {
     assert_eq!(read_state(&state).unwrap().generation, 3);
 }
 
+// Protects the package-finalize boundary: a successful package transaction
+// followed by a failed record finalize must not leave the new HOME tree or
+// active state visible. The old resolve path completed its journal first.
+#[test]
+fn activation_journal_can_explicitly_rollback_after_finalize_failure() {
+    let temp = tempdir().unwrap();
+    let state_path = temp.path().join("home/.local/state/catdot/state.toml");
+    let target = temp.path().join("home/.config/app/config");
+    let old = UserState {
+        generation: 1,
+        active_generation: 1,
+        ..Default::default()
+    };
+    let mut new = old.clone();
+    new.generation = 2;
+    new.active_generation = 2;
+    write_state(&state_path, &old).unwrap();
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "old").unwrap();
+    let mut journal = ActivationJournal::begin(&state_path, old.clone(), new.clone()).unwrap();
+    journal.track_path(&target).unwrap();
+    journal.mark_applying().unwrap();
+    fs::write(&target, "new").unwrap();
+    journal.mark_applied().unwrap();
+    write_state(&state_path, &new).unwrap();
+    journal.mark_state_written().unwrap();
+    journal.rollback().unwrap();
+
+    assert_eq!(read_state(&state_path).unwrap(), old);
+    assert_eq!(fs::read_to_string(target).unwrap(), "old");
+}
+
 // Desktop overrides select desired providers only; they never activate one.
 #[test]
 fn skel_default_desktop_override_replaces_the_profile_default() {

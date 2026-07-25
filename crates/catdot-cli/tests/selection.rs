@@ -34,4 +34,22 @@ fn select_uses_profile_defaults_without_materializing_the_source_tree() {
     assert!(state.contains("terminal = \"demo/foot\""));
     assert!(state.contains("active_generation = 0"));
     assert!(!missing_source.exists());
+    assert!(
+        !home.path().join(".config").exists(),
+        "select must not write HOME configuration"
+    );
+}
+
+// Protects the lifecycle boundary that replaces the old link-manager product:
+// unmanaged targets are backed up transactionally by resolve, never adopted by
+// a separate command. The previous CLI still exposed `adopt`.
+#[test]
+fn adopt_is_not_a_catdot_command() {
+    let output = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .args(["adopt", "terminal"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand 'adopt'"));
 }

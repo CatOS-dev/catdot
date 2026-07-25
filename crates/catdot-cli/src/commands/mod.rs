@@ -68,12 +68,6 @@ enum Cmd {
     /// Reapply the current active configuration without changing selection.
     #[command(about = "Reapply the active configuration")]
     Apply,
-    /// Back up and replace an unmanaged target for an active role.
-    #[command(about = "Adopt existing files for an active role")]
-    Adopt {
-        /// Active component role to adopt.
-        role: String,
-    },
     /// Execute the active provider for a role.
     #[command(about = "Execute an active component role")]
     Exec {
@@ -236,7 +230,11 @@ fn print_package_plan(preview: &PackagePlanPreview) {
     }
 }
 
-fn print_activation_plan(state: &UserState) -> bool {
+fn print_activation_plan(
+    profiles: &std::collections::BTreeMap<String, Profile>,
+    state: &UserState,
+    state_path: &std::path::Path,
+) -> Result<bool> {
     let roles = state
         .components
         .keys()
@@ -277,10 +275,60 @@ fn print_activation_plan(state: &UserState) -> bool {
             println!("  {role}: {active}");
         }
     }
-    !(activate.is_empty() && change.is_empty() && deactivate.is_empty())
+    let home = runtime::home()?;
+    let registry_path = managed_targets_path(state_path)?;
+    let plan = build_activation_plan(profiles, state, &home, &registry_path)?;
+    for entry in &plan.entries {
+        match &entry.materialization {
+            Materialization::Generate { .. } => {
+                println!("  generate: {} ({})", entry.target.display(), entry.owner)
+            }
+            Materialization::Symlink { source } => println!(
+                "  symlink: {} -> {} ({})",
+                entry.target.display(),
+                source.display(),
+                entry.owner
+            ),
+            Materialization::File { source } => println!(
+                "  copy: {} -> {} ({})",
+                source.display(),
+                entry.target.display(),
+                entry.owner
+            ),
+            Materialization::User { .. } => {
+                println!(
+                    "  preserve user: {} ({})",
+                    entry.target.display(),
+                    entry.owner
+                )
+            }
+        }
+    }
+    for target in &plan.removals {
+        println!("  delete managed target: {}", target.display());
+    }
+    let configuration_changes = plan
+        .entries
+        .iter()
+        .any(|entry| match &entry.materialization {
+            Materialization::Generate { contents } => {
+                std::fs::read(&entry.target).map_or(true, |existing| existing != *contents)
+            }
+            Materialization::Symlink { source } => {
+                std::fs::read_link(&entry.target).map_or(true, |existing| existing != *source)
+            }
+            Materialization::File { .. } => !entry.target.exists(),
+            Materialization::User { seed } => seed.is_some() && !entry.target.exists(),
+        })
+        || plan.removals.iter().any(|target| target.exists());
+    Ok(
+        !(activate.is_empty() && change.is_empty() && deactivate.is_empty())
+            || configuration_changes,
+    )
 }
 
 fn resolve_helper(
+    profiles: &std::collections::BTreeMap<String, Profile>,
     state: &UserState,
     state_path: &std::path::Path,
     optional: bool,
@@ -289,7 +337,7 @@ fn resolve_helper(
 ) -> Result<Option<PackagePlanPreview>> {
     let uid = unsafe { libc::geteuid() }.to_string();
     let generation = state.generation.to_string();
-    let state_path = state_path
+    let state_path_text = state_path
         .to_str()
         .context("state path is not valid UTF-8")?;
     println!("Checking package requirements...");
@@ -302,7 +350,7 @@ fn resolve_helper(
             "--generation",
             &generation,
             "--state-path",
-            state_path,
+            state_path_text,
             if optional {
                 "--with-optional"
             } else {
@@ -314,7 +362,7 @@ fn resolve_helper(
     let preview: PackagePlanPreview = toml::from_str(&String::from_utf8_lossy(&output.stdout))
         .context("parse canonical package plan from helper")?;
     print_package_plan(&preview);
-    let activation_changes = print_activation_plan(state);
+    let activation_changes = print_activation_plan(profiles, state, state_path)?;
     let needs_work =
         package_changes(&preview.plan) || activation_changes || preview.system_update_required;
     if !needs_work {
@@ -346,7 +394,7 @@ fn resolve_helper(
             "--generation",
             &generation,
             "--state-path",
-            state_path,
+            state_path_text,
             "--digest",
             &digest,
         ])
@@ -484,15 +532,13 @@ pub fn run() -> Result<i32> {
     let ps = &registry.valid_profiles;
     let path = state_file()?;
     let is_doctor = matches!(&cli.command, Cmd::Doctor);
-    let mutates_state = !path.exists()
-        || matches!(
-            &cli.command,
-            Cmd::Select { .. }
-                | Cmd::Disable { .. }
-                | Cmd::Apply
-                | Cmd::Adopt { .. }
-                | Cmd::Resolve { .. }
-        );
+    let dry_run = matches!(&cli.command, Cmd::Resolve { dry_run: true, .. });
+    let mutates_state = !dry_run
+        && (!path.exists()
+            || matches!(
+                &cli.command,
+                Cmd::Select { .. } | Cmd::Disable { .. } | Cmd::Apply | Cmd::Resolve { .. }
+            ));
     let _state_lock = if mutates_state {
         Some(lock(&state_lock_path(&path)?)?)
     } else {
@@ -502,7 +548,11 @@ pub fn run() -> Result<i32> {
         recover_activation_journals(&path)?;
     }
     let mut state_read_broken = false;
-    let mut state = match initialize_state_from_default(&path, &default_declaration_path(), ps) {
+    let mut state = match if dry_run {
+        preview_state_from_default(&path, &default_declaration_path(), ps)
+    } else {
+        initialize_state_from_default(&path, &default_declaration_path(), ps)
+    } {
         Ok(state) => state,
         Err(error) if is_doctor => {
             println!("error: broken state: {error}");
@@ -602,22 +652,13 @@ pub fn run() -> Result<i32> {
             active.components = active.active_components.clone();
             let mut journal = ActivationJournal::begin(&path, state.clone(), state.clone())?;
             journal.mark_applying()?;
-            if let Err(error) = apply(ps, &active, None, Some(&mut journal)) {
+            if let Err(error) = apply(ps, &active, &mut journal) {
                 recover_activation_journals(&path)?;
                 return Err(error);
             }
             journal.complete()?;
             sync_active_settings(ps, &active)?;
             println!("Reapplied active configuration");
-        }
-        Cmd::Adopt { role } => {
-            let mut journal = ActivationJournal::begin(&path, state.clone(), state.clone())?;
-            journal.mark_applying()?;
-            if let Err(error) = apply(ps, &state, Some(&role), Some(&mut journal)) {
-                recover_activation_journals(&path)?;
-                return Err(error);
-            }
-            journal.complete()?;
         }
         Cmd::Exec { role, arguments } => {
             exec_role(ps, &state, &role, &arguments)?;
@@ -628,11 +669,31 @@ pub fn run() -> Result<i32> {
             yes,
             with_optional,
         } => {
-            let Some(preview) = resolve_helper(&state, &path, with_optional, dry_run, yes)? else {
+            let Some(preview) = resolve_helper(ps, &state, &path, with_optional, dry_run, yes)?
+            else {
                 return Ok(0);
             };
             if !dry_run {
                 let old_state = state.clone();
+                // Packages may have installed the profile's content tree or
+                // changed its declarations. Never activate against the
+                // pre-transaction registry.
+                let refreshed_registry = profiles()?;
+                let refreshed_profiles = &refreshed_registry.valid_profiles;
+                validate_user_state(&state, refreshed_profiles)?;
+                let missing = unresolved_packages(refreshed_profiles, &state)?;
+                if !missing.is_empty() {
+                    bail!(
+                        "installed profile declarations require additional packages: {}; run catdot resolve again",
+                        missing.into_iter().collect::<Vec<_>>().join(", ")
+                    )
+                }
+                let home = runtime::home()?;
+                let registry_path = managed_targets_path(&path)?;
+                // This validates all post-install sources before any HOME
+                // target is touched. `apply` builds the same plan again while
+                // holding the activation journal.
+                build_activation_plan(refreshed_profiles, &state, &home, &registry_path)?;
                 let activation_changes = state.active_components != state.components
                     || state.active_generation != state.generation;
                 if activation_changes {
@@ -644,7 +705,7 @@ pub fn run() -> Result<i32> {
                     let mut journal =
                         ActivationJournal::begin(&path, old_state.clone(), new_state.clone())?;
                     journal.mark_applying()?;
-                    if let Err(error) = apply(ps, &state, None, Some(&mut journal)) {
+                    if let Err(error) = apply(refreshed_profiles, &state, &mut journal) {
                         recover_activation_journals(&path)?;
                         return Err(error);
                     }
@@ -653,30 +714,60 @@ pub fn run() -> Result<i32> {
                         return Err(error.into());
                     }
                     journal.mark_state_written()?;
-                    journal.complete()?;
                     state = new_state;
-                    sync_active_settings(ps, &state)?;
-                }
-                println!("Finalizing system records...");
-                io::stdout().flush()?;
-                let uid = unsafe { libc::geteuid() }.to_string();
-                let generation = state.generation.to_string();
-                let state_path = path.to_str().context("state path is not valid UTF-8")?;
-                let status = Command::new("pkexec")
-                    .arg(MANAGE_HELPER)
-                    .args([
-                        "finalize",
-                        "--uid",
-                        &uid,
-                        "--generation",
-                        &generation,
-                        "--state-path",
-                        state_path,
-                    ])
-                    .status()
-                    .context("finalize Catdot activation")?;
-                if !status.success() {
-                    bail!("helper finalize failed; active and pending requirements were retained")
+                    println!("Finalizing system records...");
+                    io::stdout().flush()?;
+                    let uid = unsafe { libc::geteuid() }.to_string();
+                    let generation = state.generation.to_string();
+                    let state_path = path.to_str().context("state path is not valid UTF-8")?;
+                    let status = Command::new("pkexec")
+                        .arg(MANAGE_HELPER)
+                        .args([
+                            "finalize",
+                            "--uid",
+                            &uid,
+                            "--generation",
+                            &generation,
+                            "--state-path",
+                            state_path,
+                        ])
+                        .status()
+                        .context("finalize Catdot activation");
+                    let status = match status {
+                        Ok(status) => status,
+                        Err(error) => {
+                            journal.rollback()?;
+                            return Err(error);
+                        }
+                    };
+                    if !status.success() {
+                        journal.rollback()?;
+                        bail!("helper finalize failed; activation was rolled back")
+                    }
+                    journal.complete()?;
+                    sync_active_settings(refreshed_profiles, &state)?;
+                } else {
+                    println!("Finalizing system records...");
+                    io::stdout().flush()?;
+                    let uid = unsafe { libc::geteuid() }.to_string();
+                    let generation = state.generation.to_string();
+                    let state_path = path.to_str().context("state path is not valid UTF-8")?;
+                    let status = Command::new("pkexec")
+                        .arg(MANAGE_HELPER)
+                        .args([
+                            "finalize",
+                            "--uid",
+                            &uid,
+                            "--generation",
+                            &generation,
+                            "--state-path",
+                            state_path,
+                        ])
+                        .status()
+                        .context("finalize Catdot activation")?;
+                    if !status.success() {
+                        bail!("helper finalize failed; pending requirements were retained")
+                    }
                 }
                 print_success_summary(&old_state, &state, &preview.plan);
             }

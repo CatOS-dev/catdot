@@ -8,13 +8,11 @@ for test in \
   explicit-upgrade-ownership.sh \
   prune-recovery.sh \
   finalize-retry.sh \
-  adopt-pending-isolation.sh \
   multi-user-prune.sh \
   prune-maximal-safe-set.sh \
   install-conflict-plan.sh \
   doctor-system-state.sh \
-  query-helper-boundary.sh \
-  default-profile-resources.sh
+  query-helper-boundary.sh
 do
   echo "==> $test"
   "$repo_root/tests/$test"

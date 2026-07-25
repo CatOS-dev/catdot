@@ -12,33 +12,33 @@ podman run --rm --security-opt label=disable \
     install -Dm755 /catdot-bin/catdot-helper /usr/lib/catdot/catdot-helper
     install -Dm755 /catdot-bin/catdot-query-helper /usr/lib/catdot/catdot-query-helper
 
-    for profile in jq-test bash-test; do
-      install -d "/usr/share/catdot/profiles/$profile/component"
-    done
+    install -d /usr/share/catdot/profiles/{jq-test,bash-test}
     cat > /usr/share/catdot/profiles/jq-test/profile.toml <<"EOF"
-schema = 1
+schema = 2
 [profile]
 id = "jq-test"
 name = "JQ transaction test"
 description = "Exercises a real libalpm transaction"
+source_root = "/usr/share/jq-test"
 [defaults]
 tool = "jq"
-[components.jq]
+[[components]]
+id = "jq"
 role = "tool"
-path = "component"
 packages = ["jq"]
 EOF
     cat > /usr/share/catdot/profiles/bash-test/profile.toml <<"EOF"
-schema = 1
+schema = 2
 [profile]
 id = "bash-test"
 name = "Bash aggregation test"
 description = "Exercises multi-user package aggregation"
+source_root = "/usr/share/bash-test"
 [defaults]
 shell = "bash"
-[components.bash]
+[[components]]
+id = "bash"
 role = "shell"
-path = "component"
 packages = ["bash"]
 EOF
 

@@ -126,6 +126,31 @@ impl ActivationJournal {
             source,
         })
     }
+    /// Explicitly undo an activation whose system-side finalize step failed.
+    /// Recovery on the next invocation treats a written state as committed, so
+    /// callers that still know finalize failed must request rollback directly.
+    pub fn rollback(self) -> Result<()> {
+        let current = read_state(&self.state_path)?;
+        if current != self.old_active_state && current != self.new_active_state {
+            return Err(Error::Message(
+                "activation state was changed outside the journal".into(),
+            ));
+        }
+        for file in &self.files {
+            let current = snapshot(&file.path)?;
+            if current != file.previous && current != file.expected {
+                return Err(Error::Message(format!(
+                    "refusing to rollback changed activation target {}",
+                    file.path.display()
+                )));
+            }
+        }
+        for file in self.files.iter().rev() {
+            restore(&file.path, &file.previous)?;
+        }
+        write_state(&self.state_path, &self.old_active_state)?;
+        self.complete()
+    }
     fn archive_backup(&self) -> Result<()> {
         let catdot = self
             .state_path

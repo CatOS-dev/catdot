@@ -87,6 +87,30 @@ pub fn initialize_state_from_default(
     if state_file.exists() {
         return read_state(state_file);
     }
+    let state = state_from_default(declaration_file, profiles)?;
+    if declaration_file.exists() {
+        write_state(state_file, &state)?;
+    }
+    Ok(state)
+}
+
+/// Reads the first-run declaration without creating user state. This lets a
+/// dry-run preview defaults while preserving its read-only contract.
+pub fn preview_state_from_default(
+    state_file: &Path,
+    declaration_file: &Path,
+    profiles: &BTreeMap<String, Profile>,
+) -> Result<UserState> {
+    if state_file.exists() {
+        return read_state(state_file);
+    }
+    state_from_default(declaration_file, profiles)
+}
+
+fn state_from_default(
+    declaration_file: &Path,
+    profiles: &BTreeMap<String, Profile>,
+) -> Result<UserState> {
     if !declaration_file.exists() {
         return Ok(UserState::default());
     }
@@ -129,14 +153,7 @@ pub fn initialize_state_from_default(
         };
         select_component(&mut state, profiles, &role, &reference)?;
     }
-    write_state(state_file, &state)?;
     Ok(state)
-}
-pub fn managed_links_path(state_path: &Path) -> Result<PathBuf> {
-    let parent = state_path
-        .parent()
-        .ok_or_else(|| Error::Message("state path has no parent".into()))?;
-    Ok(parent.join("managed-links.toml"))
 }
 pub fn state_lock_path(state_path: &Path) -> Result<PathBuf> {
     let parent = state_path

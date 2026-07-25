@@ -58,16 +58,14 @@ Other common operations:
 ```text
 catdot disable <role>              Stop selecting a role after resolve
 catdot apply                       Reapply the active configuration
-catdot adopt <role>                Back up and adopt files for an active role
 catdot prune [--dry-run] [--yes]   Remove safe, unused Catdot packages
 catdot doctor                      Diagnose user and system state
 catdot users list                  List system user records
 catdot users prune [--yes]         Remove records for deleted users
 ```
 
-Catdot refuses to overwrite unmanaged files. `adopt` is the explicit operation
-for backing up and replacing such a target, and it only uses the currently
-active component rather than a pending selection.
+Lifecycle-managed targets are backed up and replaced transactionally during
+`resolve`; there is no separate adoption workflow.
 
 ## Reliability model
 
@@ -76,7 +74,7 @@ plans are regenerated from installed manifests, tied to a state generation,
 and checked by digest before a privileged transaction. The helper never accepts
 an arbitrary shell command or a client-supplied package list.
 
-User configuration changes use atomic files, a per-user lock, a managed-link
+User configuration changes use atomic files, a per-user lock, a managed-target
 registry, and an activation journal. Package installation, finalization, and
 pruning use root-owned records and recovery journals under `/var/lib/catdot`.
 If a process or machine stops after an ALPM transaction but before record

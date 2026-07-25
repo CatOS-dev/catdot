@@ -11,18 +11,19 @@ podman run --rm --security-opt label=disable \
     install -Dm755 /catdot-bin/catdot /usr/bin/catdot
     install -Dm755 /catdot-bin/catdot-helper /usr/lib/catdot/catdot-helper
     install -Dm755 /catdot-bin/catdot-query-helper /usr/lib/catdot/catdot-query-helper
-    install -d /usr/share/catdot/profiles/bash-test/component
+    install -d /usr/share/catdot/profiles/bash-test
     cat > /usr/share/catdot/profiles/bash-test/profile.toml <<"EOF"
-schema = 1
+schema = 2
 [profile]
 id = "bash-test"
 name = "Finalize retry test"
 description = "Exercises finalize recovery"
+source_root = "/usr/share/bash-test"
 [defaults]
 shell = "bash"
-[components.bash]
+[[components]]
+id = "bash"
 role = "shell"
-path = "component"
 packages = ["bash"]
 EOF
 
@@ -56,6 +57,15 @@ EOF
       catdot resolve --yes; then
       exit 1
     fi
+    python3 - <<"PY"
+import tomllib
+
+with open("/home/alice/.local/state/catdot/state.toml", "rb") as file:
+    state = tomllib.load(file)
+assert state["components"]["shell"] == "bash-test/bash"
+assert state["active_components"] == {}
+assert state["active_generation"] == 0
+PY
     grep -F "bash-test/bash" /var/lib/catdot/users/1000.toml
     runuser -u alice -- env HOME=/home/alice XDG_STATE_HOME=/home/alice/.local/state \
       catdot resolve --yes

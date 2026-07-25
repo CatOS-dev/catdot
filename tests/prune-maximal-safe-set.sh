@@ -9,13 +9,14 @@ podman run --rm --security-opt label=disable \
     install -Dm755 /catdot-bin/catdot /usr/bin/catdot
     install -Dm755 /catdot-bin/catdot-helper /usr/lib/catdot/catdot-helper
     install -Dm755 /catdot-bin/catdot-query-helper /usr/lib/catdot/catdot-query-helper
-    install -d /usr/share/catdot/profiles/empty/component
+    install -d /usr/share/catdot/profiles/empty
     cat >/usr/share/catdot/profiles/empty/profile.toml <<"P"
-schema = 1
+schema = 2
 [profile]
 id = "empty"
 name = "Empty"
 description = "Prune test profile"
+source_root = "/usr/share/empty"
 [defaults]
 P
     cat >/tmp/pkexec.c <<"C"

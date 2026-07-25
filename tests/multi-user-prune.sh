@@ -13,20 +13,22 @@ podman run --rm --security-opt label=disable \
     install -Dm755 /catdot-bin/catdot-query-helper /usr/lib/catdot/catdot-query-helper
 
     for profile in jq-alice jq-bob; do
-      install -d "/usr/share/catdot/profiles/$profile/component"
+      install -d "/usr/share/catdot/profiles/$profile"
       cat > "/usr/share/catdot/profiles/$profile/profile.toml" <<EOF
-schema = 1
+schema = 2
 [profile]
 id = "$profile"
 name = "Multi-user prune $profile"
 description = "Exercises real shared package ownership"
+source_root = "/usr/share/$profile"
 [defaults]
 tool = "jq"
-[components.jq]
+[[components]]
+id = "jq"
 role = "tool"
-path = "component"
 packages = ["jq"]
-exec = ["/usr/bin/jq", "--version"]
+[components.exec]
+argv = ["/usr/bin/jq", "--version"]
 EOF
     done
 

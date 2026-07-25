@@ -87,18 +87,12 @@ pub(super) fn unresolved_packages(
 pub(super) fn apply(
     profiles: &std::collections::BTreeMap<String, Profile>,
     state: &UserState,
-    adopt: Option<&str>,
-    journal: Option<&mut ActivationJournal>,
+    journal: &mut ActivationJournal,
 ) -> Result<()> {
     let home = home()?;
     let registry = managed_targets_path(&state_file()?)?;
     let xdg = xdg_config_home(&home);
-    if adopt.is_some() {
-        bail!("adopt is unavailable for lifecycle-managed profiles");
-    }
     let plan = build_activation_plan(profiles, state, &home, &registry)?;
-    let journal =
-        journal.ok_or_else(|| anyhow::anyhow!("activation requires a transaction journal"))?;
     activate_configuration(&plan, &registry, journal)?;
     for role in state.components.keys() {
         let (_profile, component, _) = component_for(profiles, state, role)?;
