@@ -376,12 +376,24 @@ fn print_activation_plan(
         println!("  delete managed target: {}", target.display());
     }
     let xdg_plan = build_xdg_plan(profiles, state, &runtime::xdg_config_home(&home))?;
+    for warning in &xdg_plan.warnings {
+        println!("warning: {warning}");
+    }
     if xdg_plan.has_changes() {
         for (association, desktop) in &xdg_plan.defaults {
             println!("  xdg default: {association} -> {desktop}");
         }
         for association in xdg_plan.restore.keys() {
             println!("  xdg restore: {association}");
+        }
+        for (key, command) in &xdg_plan.environment {
+            println!("  xdg environment: {key}={command}");
+        }
+        if xdg_plan.environment.is_empty() && xdg_plan.environment_path.exists() {
+            println!(
+                "  remove xdg environment: {}",
+                xdg_plan.environment_path.display()
+            );
         }
     }
     let configuration_changes = plan.has_changes();

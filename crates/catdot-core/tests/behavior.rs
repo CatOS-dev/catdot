@@ -1268,6 +1268,8 @@ fn xdg_activation_is_idempotent_when_defaults_are_already_satisfied() {
             packages: vec![],
             exec: vec![],
             xdg: XdgProvider {
+                command: None,
+                environment: vec![],
                 desktop_entry: Some("demo.desktop".into()),
                 mime_types: vec!["text/html".into()],
                 uri_schemes: vec![],
@@ -1570,4 +1572,122 @@ fn merge_conflict_preserves_live_file_and_writes_recovery_inputs() {
             .unwrap()
             .contains("<<<<<<< local")
     );
+}
+
+// Protects desktop integration across a provider switch: environment variables
+// use the selected component's declared real program name and disappear when
+// the role is disabled, without wrappers or stale values.
+#[test]
+fn xdg_environment_tracks_real_provider_commands_across_switches() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    fs::create_dir_all(&metadata).unwrap();
+    let source = temp.path().join("share/demo");
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            r#"schema = 3
+[profile]
+id = "demo"
+name = "Demo"
+description = "test"
+source_root = "{}"
+[defaults]
+terminal = "ghostty"
+[[components]]
+id = "ghostty"
+role = "terminal"
+[components.xdg]
+command = "ghostty"
+environment = ["TERMINAL"]
+[[components]]
+id = "foot"
+role = "terminal"
+[components.xdg]
+command = "foot"
+environment = ["TERMINAL"]
+"#,
+            source.display()
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let config = temp.path().join("home/.config");
+    let state_path = temp.path().join("home/.local/state/catdot/state.toml");
+    let env_path = config.join("environment.d/90-catdot.conf");
+    let mut state = select_profile(&profiles["demo"]).unwrap();
+
+    for expected in [Some("ghostty"), Some("foot"), None] {
+        if expected == Some("foot") {
+            state
+                .components
+                .insert("terminal".into(), "demo/foot".into());
+        } else if expected.is_none() {
+            state.components.remove("terminal");
+        }
+        let plan = build_xdg_plan(&profiles, &state, &config).unwrap();
+        let mut journal =
+            ActivationJournal::begin(&state_path, UserState::default(), UserState::default())
+                .unwrap();
+        journal.mark_applying().unwrap();
+        activate_xdg(&plan, &mut journal).unwrap();
+        journal.complete().unwrap();
+        match expected {
+            Some(command) => assert_eq!(
+                fs::read_to_string(&env_path).unwrap(),
+                format!("TERMINAL={command}\n")
+            ),
+            None => assert!(!env_path.exists()),
+        }
+    }
+}
+
+// Runtime mixing is best effort: malformed third-party combinations must not
+// abort profile switching merely because two components claim one XDG variable.
+// The component whose role semantically owns the variable wins deterministically.
+#[test]
+fn xdg_environment_conflict_uses_the_semantic_role_and_warns() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    fs::create_dir_all(&metadata).unwrap();
+    let source = temp.path().join("share/demo");
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            r#"schema = 3
+[profile]
+id = "demo"
+name = "Demo"
+description = "test"
+source_root = "{}"
+[[components]]
+id = "browser"
+role = "browser"
+[components.xdg]
+command = "browser-editor"
+environment = ["EDITOR"]
+[[components]]
+id = "editor"
+role = "editor"
+[components.xdg]
+command = "nvim"
+environment = ["EDITOR", "VISUAL"]
+"#,
+            source.display()
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let mut state = UserState::default();
+    state
+        .components
+        .insert("browser".into(), "demo/browser".into());
+    state
+        .components
+        .insert("editor".into(), "demo/editor".into());
+    let plan = build_xdg_plan(&profiles, &state, &temp.path().join("home/.config")).unwrap();
+    assert_eq!(plan.environment["EDITOR"], "nvim");
+    assert_eq!(plan.environment["VISUAL"], "nvim");
+    assert_eq!(plan.warnings.len(), 1);
+    assert!(plan.warnings[0].contains("EDITOR"));
 }

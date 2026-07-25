@@ -60,6 +60,13 @@ pub fn activation_digests(
             digest.update(argument.as_bytes());
             digest.update([0]);
         }
+        if let Some(command) = &component.xdg.command {
+            digest.update(command.as_bytes());
+        }
+        for key in &component.xdg.environment {
+            digest.update(key.as_bytes());
+            digest.update([0]);
+        }
         if let Some(desktop) = &component.xdg.desktop_entry {
             digest.update(desktop.as_bytes());
         }

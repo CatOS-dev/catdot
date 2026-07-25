@@ -7,17 +7,23 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// The XDG defaults Catdot owns for the selected active components.  Keeping
-/// this as a plan makes the whole mimeapps.list replacement journalled along
-/// with configuration materialization.
+/// The desktop-integration state Catdot owns for the selected components.
+/// MIME defaults and the dedicated environment.d file are planned together so
+/// a provider switch is committed by the same activation journal.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct XdgPlan {
     pub path: PathBuf,
     pub defaults: BTreeMap<String, String>,
     pub restore: BTreeMap<String, Option<String>>,
+    pub environment_path: PathBuf,
+    pub environment: BTreeMap<String, String>,
+    pub warnings: Vec<String>,
     registry_path: PathBuf,
     registry: XdgRegistry,
     rendered: String,
+    environment_rendered: String,
+    mime_changed: bool,
+    environment_changed: bool,
     changed: bool,
 }
 
@@ -28,12 +34,20 @@ struct XdgRegistry {
     absent: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Candidate {
+    role: String,
+    reference: String,
+    value: String,
+}
+
 pub fn build_xdg_plan(
     profiles: &BTreeMap<String, crate::Profile>,
     state: &UserState,
     config_home: &Path,
 ) -> Result<XdgPlan> {
-    let mut defaults = BTreeMap::new();
+    let mut default_candidates = BTreeMap::<String, Vec<Candidate>>::new();
+    let mut environment_candidates = BTreeMap::<String, Vec<Candidate>>::new();
     for (role, reference) in &state.components {
         let (profile_id, component_id) = reference
             .split_once('/')
@@ -47,8 +61,18 @@ pub fn build_xdg_plan(
                 "{reference} does not provide role {role}"
             )));
         }
-        add_component(&mut defaults, component)?;
+        collect_component(
+            &mut default_candidates,
+            &mut environment_candidates,
+            role,
+            reference,
+            component,
+        );
     }
+    let (defaults, mut warnings) = resolve_candidates(default_candidates, false);
+    let (environment, environment_warnings) = resolve_candidates(environment_candidates, true);
+    warnings.extend(environment_warnings);
+
     let path = config_home.join("mimeapps.list");
     let registry_path = config_home.join("catdot/xdg.toml");
     let existing_text = read_text(&path)?;
@@ -85,15 +109,31 @@ pub fn build_xdg_plan(
         .filter(|(association, _)| !defaults.contains_key(association))
         .collect();
     let rendered = render_mimeapps(&existing_text, &defaults, &restore);
-    let changed = (!defaults.is_empty() || !restore.is_empty())
+    let mime_changed = (!defaults.is_empty() || !restore.is_empty())
         && (rendered != existing_text || registry != previous_registry);
+
+    let environment_path = config_home.join("environment.d/90-catdot.conf");
+    let existing_environment = read_text(&environment_path)?;
+    let environment_rendered = render_environment(&environment);
+    let environment_changed = if environment.is_empty() {
+        environment_path.exists()
+    } else {
+        environment_rendered != existing_environment
+    };
+    let changed = mime_changed || environment_changed;
     Ok(XdgPlan {
         path,
         defaults,
         restore,
+        environment_path,
+        environment,
+        warnings,
         registry_path,
         registry,
         rendered,
+        environment_rendered,
+        mime_changed,
+        environment_changed,
         changed,
     })
 }
@@ -108,6 +148,8 @@ impl XdgPlan {
         digest.update(self.path.as_os_str().as_encoded_bytes());
         digest.update([0]);
         digest.update(self.registry_path.as_os_str().as_encoded_bytes());
+        digest.update([0]);
+        digest.update(self.environment_path.as_os_str().as_encoded_bytes());
         digest.update([0]);
         for (association, desktop) in &self.defaults {
             digest.update(b"default\0");
@@ -125,7 +167,16 @@ impl XdgPlan {
             }
             digest.update([0xff]);
         }
+        for (key, value) in &self.environment {
+            digest.update(b"environment\0");
+            digest.update(key.as_bytes());
+            digest.update([0]);
+            digest.update(value.as_bytes());
+            digest.update([0xff]);
+        }
         digest.update(self.rendered.as_bytes());
+        digest.update([0]);
+        digest.update(self.environment_rendered.as_bytes());
         digest.update([0]);
         digest.update(
             toml::to_string(&self.registry)
@@ -136,41 +187,128 @@ impl XdgPlan {
     }
 }
 
-fn add_component(defaults: &mut BTreeMap<String, String>, component: &ComponentDef) -> Result<()> {
-    let Some(desktop) = &component.xdg.desktop_entry else {
-        return Ok(());
-    };
-    for association in component.xdg.mime_types.iter().cloned().chain(
-        component
-            .xdg
-            .uri_schemes
-            .iter()
-            .map(|scheme| format!("x-scheme-handler/{scheme}")),
-    ) {
-        match defaults.insert(association.clone(), desktop.clone()) {
-            Some(previous) if previous != *desktop => {
-                return Err(Error::Message(format!(
-                    "xdg default conflict for {association}: {previous} and {desktop}"
-                )));
-            }
-            _ => {}
+fn collect_component(
+    defaults: &mut BTreeMap<String, Vec<Candidate>>,
+    environment: &mut BTreeMap<String, Vec<Candidate>>,
+    role: &str,
+    reference: &str,
+    component: &ComponentDef,
+) {
+    if let Some(desktop) = &component.xdg.desktop_entry {
+        for association in component.xdg.mime_types.iter().cloned().chain(
+            component
+                .xdg
+                .uri_schemes
+                .iter()
+                .map(|scheme| format!("x-scheme-handler/{scheme}")),
+        ) {
+            defaults.entry(association).or_default().push(Candidate {
+                role: role.into(),
+                reference: reference.into(),
+                value: desktop.clone(),
+            });
         }
     }
-    Ok(())
+    if let Some(command) = &component.xdg.command {
+        for key in &component.xdg.environment {
+            environment.entry(key.clone()).or_default().push(Candidate {
+                role: role.into(),
+                reference: reference.into(),
+                value: command.clone(),
+            });
+        }
+    }
+}
+
+fn resolve_candidates(
+    candidates: BTreeMap<String, Vec<Candidate>>,
+    semantic_environment_role: bool,
+) -> (BTreeMap<String, String>, Vec<String>) {
+    let mut selected = BTreeMap::new();
+    let mut warnings = Vec::new();
+    for (key, mut values) in candidates {
+        let expected = semantic_environment_role
+            .then(|| expected_environment_role(&key))
+            .flatten();
+        values.sort_by(|left, right| {
+            let left_priority = usize::from(expected.is_some_and(|role| left.role != role));
+            let right_priority = usize::from(expected.is_some_and(|role| right.role != role));
+            (left_priority, &left.role, &left.reference, &left.value).cmp(&(
+                right_priority,
+                &right.role,
+                &right.reference,
+                &right.value,
+            ))
+        });
+        let distinct = values
+            .iter()
+            .map(|candidate| candidate.value.as_str())
+            .collect::<BTreeSet<_>>();
+        let chosen = values.first().expect("candidate group is non-empty");
+        if distinct.len() > 1 {
+            warnings.push(format!(
+                "xdg conflict for {key}: {}; using {} from {}",
+                values
+                    .iter()
+                    .map(|candidate| format!("{} from {}", candidate.value, candidate.reference))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                chosen.value,
+                chosen.reference
+            ));
+        }
+        selected.insert(key, chosen.value.clone());
+    }
+    (selected, warnings)
+}
+
+fn expected_environment_role(key: &str) -> Option<&'static str> {
+    match key {
+        "TERMINAL" => Some("terminal"),
+        "EDITOR" | "VISUAL" => Some("editor"),
+        "BROWSER" => Some("browser"),
+        _ => None,
+    }
+}
+
+fn render_environment(environment: &BTreeMap<String, String>) -> String {
+    environment
+        .iter()
+        .map(|(key, value)| format!("{key}={value}\n"))
+        .collect()
 }
 
 pub fn activate_xdg(plan: &XdgPlan, journal: &mut ActivationJournal) -> Result<()> {
     if !plan.changed {
         return Ok(());
     }
-    journal.track_path(&plan.path)?;
-    journal.track_path(&plan.registry_path)?;
-    crate::atomic_write(&plan.path, &plan.rendered)?;
-    crate::atomic_write(
-        &plan.registry_path,
-        &toml::to_string_pretty(&plan.registry)
-            .map_err(|error| Error::Message(error.to_string()))?,
-    )?;
+    if plan.mime_changed {
+        journal.track_path(&plan.path)?;
+        journal.track_path(&plan.registry_path)?;
+        crate::atomic_write(&plan.path, &plan.rendered)?;
+        crate::atomic_write(
+            &plan.registry_path,
+            &toml::to_string_pretty(&plan.registry)
+                .map_err(|error| Error::Message(error.to_string()))?,
+        )?;
+    }
+    if plan.environment_changed {
+        journal.track_path(&plan.environment_path)?;
+        if plan.environment.is_empty() {
+            match fs::remove_file(&plan.environment_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(Error::Io {
+                        path: plan.environment_path.display().to_string(),
+                        source,
+                    });
+                }
+            }
+        } else {
+            crate::atomic_write(&plan.environment_path, &plan.environment_rendered)?;
+        }
+    }
     journal.mark_applied()
 }
 
@@ -288,6 +426,8 @@ mod tests {
             packages: vec![],
             exec: vec![],
             xdg: crate::XdgProvider {
+                command: None,
+                environment: vec![],
                 desktop_entry: Some("browser.desktop".into()),
                 mime_types: vec!["text/html".into()],
                 uri_schemes: vec!["http".into()],
@@ -355,6 +495,8 @@ mod tests {
                     packages: vec![],
                     exec: vec![],
                     xdg: crate::XdgProvider {
+                        command: None,
+                        environment: vec![],
                         desktop_entry: Some(desktop.into()),
                         mime_types: vec!["text/html".into()],
                         uri_schemes: vec![],

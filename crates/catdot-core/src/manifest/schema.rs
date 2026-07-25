@@ -58,6 +58,9 @@ struct RawExec {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawXdg {
+    command: Option<String>,
+    #[serde(default)]
+    environment: Vec<String>,
     desktop_entry: Option<String>,
     #[serde(default)]
     mime_types: Vec<String>,
@@ -95,6 +98,8 @@ pub struct ConfigurationEntry {
 
 #[derive(Debug, Clone, Default)]
 pub struct XdgProvider {
+    pub command: Option<String>,
+    pub environment: Vec<String>,
     pub desktop_entry: Option<String>,
     pub mime_types: Vec<String>,
     pub uri_schemes: Vec<String>,
@@ -219,6 +224,22 @@ fn valid_exec(argv: &[String]) -> bool {
                         | "/bin/zsh"
                 )
         })
+}
+
+fn valid_xdg_command(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains('/')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
+}
+
+fn valid_environment_key(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 pub fn profile_root() -> PathBuf {
@@ -389,7 +410,16 @@ fn load_profile(
         let xdg = component.xdg.unwrap_or_default();
         if xdg.desktop_entry.as_deref().is_some_and(|value| {
             value.is_empty() || value.contains('/') || !value.ends_with(".desktop")
-        }) {
+        }) || xdg
+            .command
+            .as_deref()
+            .is_some_and(|value| !valid_xdg_command(value))
+            || (!xdg.environment.is_empty() && xdg.command.is_none())
+            || xdg
+                .environment
+                .iter()
+                .any(|value| !valid_environment_key(value))
+        {
             return Err(Error::Message(format!(
                 "{}: invalid xdg provider for component {}",
                 manifest_path.display(),
@@ -403,6 +433,8 @@ fn load_profile(
                 packages: component.packages,
                 exec,
                 xdg: XdgProvider {
+                    command: xdg.command,
+                    environment: xdg.environment,
                     desktop_entry: xdg.desktop_entry,
                     mime_types: xdg.mime_types,
                     uri_schemes: xdg.uri_schemes,
