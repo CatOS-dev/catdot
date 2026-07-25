@@ -463,6 +463,115 @@ fn validate_wm_autostart_graph(
     Ok(())
 }
 
+fn validate_default_closure(
+    manifest: &Path,
+    defaults: &BTreeMap<String, String>,
+    components: &BTreeMap<String, ComponentDef>,
+) -> Result<()> {
+    let selected = defaults
+        .iter()
+        .map(|(role, id)| {
+            (
+                role.as_str(),
+                id.as_str(),
+                components.get(id).expect("validated default"),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let wm_owners = selected
+        .iter()
+        .filter(|(_, _, component)| component.wm.is_some())
+        .map(|(role, id, _)| format!("{role}={id}"))
+        .collect::<Vec<_>>();
+    if wm_owners.len() > 1 {
+        return Err(Error::Message(format!(
+            "{}: multiple default wm owners: {}",
+            manifest.display(),
+            wm_owners.join(", ")
+        )));
+    }
+
+    let mut xdg = BTreeMap::<String, (String, String)>::new();
+    for (role, id, component) in &selected {
+        let reference = format!("{role}={id}");
+        if let Some(command) = &component.xdg.command {
+            for key in &component.xdg.environment {
+                insert_default_xdg(manifest, &mut xdg, key, command, &reference)?;
+            }
+        }
+        if let Some(desktop) = &component.xdg.desktop_entry {
+            for association in component.xdg.mime_types.iter().cloned().chain(
+                component
+                    .xdg
+                    .uri_schemes
+                    .iter()
+                    .map(|scheme| format!("x-scheme-handler/{scheme}")),
+            ) {
+                insert_default_xdg(manifest, &mut xdg, &association, desktop, &reference)?;
+            }
+        }
+    }
+
+    let mut targets = Vec::<(PathBuf, String)>::new();
+    for (role, id, component) in &selected {
+        let owner = format!("{role}={id}");
+        for configuration in &component.configuration {
+            targets.push((configuration.target.clone(), owner.clone()));
+        }
+        if let Some(wm) = &component.wm {
+            targets.push((wm.autostart_target.clone(), owner.clone()));
+            for autostart in &wm.autostart {
+                if let Some(provider_id) = defaults.get(&autostart.role) {
+                    let provider = components.get(provider_id).expect("validated default");
+                    if provider.exec.is_empty() {
+                        return Err(Error::Message(format!(
+                            "{}: default autostart role {} uses {}, which has no exec provider",
+                            manifest.display(),
+                            autostart.role,
+                            provider_id
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    for (index, (target, owner)) in targets.iter().enumerate() {
+        for (other, other_owner) in targets.iter().skip(index + 1) {
+            if target == other || target.starts_with(other) || other.starts_with(target) {
+                return Err(Error::Message(format!(
+                    "{}: default configuration target conflict: {} ({owner}) and {} ({other_owner})",
+                    manifest.display(),
+                    target.display(),
+                    other.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn insert_default_xdg(
+    manifest: &Path,
+    values: &mut BTreeMap<String, (String, String)>,
+    key: &str,
+    value: &str,
+    owner: &str,
+) -> Result<()> {
+    if let Some((previous, previous_owner)) = values.get(key)
+        && previous != value
+    {
+        return Err(Error::Message(format!(
+            "{}: default xdg conflict for {key}: {previous} from {previous_owner}, {value} from {owner}",
+            manifest.display()
+        )));
+    }
+    values
+        .entry(key.into())
+        .or_insert_with(|| (value.into(), owner.into()));
+    Ok(())
+}
+
 fn load_profile(
     canonical_root: &Path,
     entry: &fs::DirEntry,
@@ -616,6 +725,7 @@ fn load_profile(
             )));
         }
     }
+    validate_default_closure(manifest_path, &raw.defaults, &components)?;
     Ok(Profile {
         id: raw.profile.id,
         name: raw.profile.name,
@@ -636,6 +746,18 @@ fn parse_configuration(
         return Err(Error::Message(format!(
             "{}: unsafe configuration target for {component}",
             manifest.display()
+        )));
+    }
+    if matches!(
+        raw.target.as_str(),
+        ".config/environment.d/90-catdot.conf"
+            | ".config/mimeapps.list"
+            | ".config/catdot/xdg.toml"
+    ) {
+        return Err(Error::Message(format!(
+            "{}: reserved Catdot target {} for {component}",
+            manifest.display(),
+            raw.target
         )));
     }
     let source = raw.source.map(PathBuf::from);

@@ -601,12 +601,13 @@ lifecycle = "user"
         ),
     )
     .unwrap();
-    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
-    let state = select_profile(&profiles["demo"]).unwrap();
-    let home = temp.path().join("home");
-    let registry = home.join(".local/state/catdot/managed.toml");
-    assert!(build_activation_plan(&profiles, &state, &home, &registry).is_err());
-    assert!(!home.exists());
+    let error = discover_profiles(&temp.path().join("profiles")).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("default configuration target conflict")
+    );
+    assert!(!temp.path().join("home").exists());
 }
 
 // Protects the single-owner rule: two active components cannot silently race
@@ -646,12 +647,13 @@ source = ".config/app/two"
         ),
     )
     .unwrap();
-    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
-    let state = select_profile(&profiles["demo"]).unwrap();
-    let home = temp.path().join("home");
-    let registry = home.join(".local/state/catdot/managed.toml");
-    assert!(build_activation_plan(&profiles, &state, &home, &registry).is_err());
-    assert!(!home.exists());
+    let error = discover_profiles(&temp.path().join("profiles")).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("default configuration target conflict")
+    );
+    assert!(!temp.path().join("home").exists());
 }
 
 // Protects a component switch from leaving executable stale fragments behind.
@@ -1878,4 +1880,163 @@ environment = ["TERMINAL"]
     activate_xdg(&plan, &mut journal).unwrap();
     journal.complete().unwrap();
     assert_eq!(fs::read_to_string(environment).unwrap(), "CUSTOM=value\n");
+}
+
+// Official defaults are a release contract, unlike runtime cross-profile
+// mixing. A profile whose default closure assigns one environment key to two
+// different programs must be rejected during discovery.
+#[test]
+fn discovery_rejects_default_xdg_conflicts() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            r#"schema = 3
+[profile]
+id = "demo"
+name = "Demo"
+description = "test"
+source_root = "{}"
+[defaults]
+browser = "browser"
+editor = "editor"
+[[components]]
+id = "browser"
+role = "browser"
+[components.xdg]
+command = "browser-editor"
+environment = ["EDITOR"]
+[[components]]
+id = "editor"
+role = "editor"
+[components.xdg]
+command = "nvim"
+environment = ["EDITOR"]
+"#,
+            temp.path().join("share").display()
+        ),
+    )
+    .unwrap();
+    let error = discover_profiles(&temp.path().join("profiles")).unwrap_err();
+    assert!(error.to_string().contains("default xdg conflict"));
+    assert!(error.to_string().contains("EDITOR"));
+}
+
+// A default autostart entry that can only fail at login is not a valid
+// published profile. Optional undeclared roles remain allowed; selected roles
+// must provide an executable command.
+#[test]
+fn discovery_rejects_default_wm_autostart_without_exec() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            r#"schema = 3
+[profile]
+id = "demo"
+name = "Demo"
+description = "test"
+source_root = "{}"
+[defaults]
+desktop = "wm"
+bar = "bar"
+[[components]]
+id = "wm"
+role = "desktop"
+[components.wm]
+autostart_target = ".config/wm/autostart.conf"
+autostart_template = "exec catdot exec {{role}}"
+[[components.wm.autostart]]
+role = "bar"
+[[components]]
+id = "bar"
+role = "bar"
+"#,
+            temp.path().join("share").display()
+        ),
+    )
+    .unwrap();
+    let error = discover_profiles(&temp.path().join("profiles")).unwrap_err();
+    assert!(error.to_string().contains("default autostart role bar"));
+    assert!(error.to_string().contains("no exec provider"));
+}
+
+// Default components and the WM backend must retain one physical owner per
+// target. Catching this at publication prevents a fresh install from reaching
+// the activation transaction only to fail before its first desktop session.
+#[test]
+fn discovery_rejects_default_configuration_target_conflicts() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            r#"schema = 3
+[profile]
+id = "demo"
+name = "Demo"
+description = "test"
+source_root = "{}"
+[defaults]
+desktop = "wm"
+bar = "bar"
+[[components]]
+id = "wm"
+role = "desktop"
+[components.wm]
+autostart_target = ".config/wm/autostart.conf"
+autostart_template = "exec catdot exec {{role}}"
+[[components.wm.autostart]]
+role = "bar"
+[[components]]
+id = "bar"
+role = "bar"
+[components.exec]
+argv = ["bar"]
+[[components.configuration]]
+target = ".config/wm/autostart.conf"
+lifecycle = "generate"
+template = "duplicate"
+"#,
+            temp.path().join("share").display()
+        ),
+    )
+    .unwrap();
+    let error = discover_profiles(&temp.path().join("profiles")).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("default configuration target conflict")
+    );
+    assert!(error.to_string().contains("autostart.conf"));
+}
+
+// XDG state files have a dedicated transactional owner. A component may not
+// claim the same physical target through a generic lifecycle declaration.
+#[test]
+fn discovery_rejects_reserved_xdg_configuration_targets() {
+    for target in [
+        ".config/environment.d/90-catdot.conf",
+        ".config/mimeapps.list",
+        ".config/catdot/xdg.toml",
+    ] {
+        let temp = tempdir().unwrap();
+        let metadata = temp.path().join("profiles/demo");
+        fs::create_dir_all(&metadata).unwrap();
+        fs::write(
+            metadata.join("profile.toml"),
+            format!(
+                "schema = 3\n[profile]\nid = \"demo\"\nname = \"Demo\"\ndescription = \"test\"\nsource_root = \"{}\"\n[[components]]\nid = \"main\"\nrole = \"tool\"\n[[components.configuration]]\ntarget = \"{target}\"\nlifecycle = \"generate\"\ntemplate = \"bad\"\n",
+                temp.path().join("share").display()
+            ),
+        )
+        .unwrap();
+        let error = discover_profiles(&temp.path().join("profiles")).unwrap_err();
+        assert!(error.to_string().contains("reserved Catdot target"));
+    }
 }
