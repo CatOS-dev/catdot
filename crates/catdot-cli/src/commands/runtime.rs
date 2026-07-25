@@ -21,7 +21,7 @@ pub(super) fn state_file() -> Result<PathBuf> {
     Ok(state_path(&home()?))
 }
 
-fn xdg_config_home(home: &std::path::Path) -> PathBuf {
+pub(super) fn xdg_config_home(home: &std::path::Path) -> PathBuf {
     env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .map(|path| {
@@ -94,6 +94,8 @@ pub(super) fn apply(
     let xdg = xdg_config_home(&home);
     let plan = build_activation_plan(profiles, state, &home, &registry)?;
     activate_configuration(&plan, &registry, journal)?;
+    let xdg_plan = build_xdg_plan(profiles, state, &xdg)?;
+    activate_xdg(&xdg_plan, journal)?;
     for role in state.components.keys() {
         let (_profile, component, _) = component_for(profiles, state, role)?;
         if component
@@ -147,7 +149,15 @@ pub(super) fn exec_role(
         if state.components.contains_key(role) {
             bail!("{role} is selected but not activated; run: catdot resolve");
         }
-        bail!("role is not selected");
+        if profiles.values().any(|profile| {
+            profile
+                .components
+                .values()
+                .any(|component| component.role == role)
+        }) {
+            bail!("role {role} is not selected");
+        }
+        bail!("unknown role {role}");
     }
     let mut active = state.clone();
     active.components = active.active_components.clone();
@@ -174,6 +184,95 @@ pub(super) fn exec_role(
         &xdg,
         arguments,
     )?;
+    if !binary_present(&argv[0]) {
+        bail!(
+            "{role} ({reference}) has an active exec provider, but binary {} is missing",
+            argv[0]
+        );
+    }
     let error = Command::new(&argv[0]).args(&argv[1..]).exec();
     Err(error.into())
+}
+
+fn binary_present(binary: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = |path: &std::path::Path| {
+        std::fs::metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    };
+    if binary.contains('/') {
+        return executable(std::path::Path::new(binary));
+    }
+    env::var_os("PATH").is_some_and(|paths| {
+        env::split_paths(&paths).any(|directory| executable(&directory.join(binary)))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{collections::BTreeMap, fs, sync::Mutex};
+    use tempfile::tempdir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    // Protects the activation ordering: if a later theme consumer rejects its
+    // input after XDG has been written, journal recovery restores mimeapps.
+    #[test]
+    fn apply_rolls_back_xdg_when_a_later_theme_step_fails() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp = tempdir().unwrap();
+        let config = temp.path().join(".config");
+        fs::create_dir_all(&config).unwrap();
+        let mimeapps = config.join("mimeapps.list");
+        fs::write(
+            &mimeapps,
+            "[Default Applications]\ntext/html=outside.desktop;\n",
+        )
+        .unwrap();
+        unsafe {
+            env::set_var("HOME", temp.path());
+            env::set_var("XDG_CONFIG_HOME", &config);
+        }
+        let component = ComponentDef {
+            role: "browser".into(),
+            packages: vec![],
+            optional_packages: vec![],
+            exec: vec![],
+            xdg: XdgProvider {
+                desktop_entry: Some("browser.desktop".into()),
+                mime_types: vec!["text/html".into()],
+                uri_schemes: vec![],
+            },
+            configuration: vec![],
+            backend: Some("unsupported".into()),
+            settings: BTreeMap::new(),
+        };
+        let mut profile = Profile {
+            id: "demo".into(),
+            name: "Demo".into(),
+            description: "test".into(),
+            source_root: temp.path().join("share"),
+            defaults: BTreeMap::new(),
+            components: BTreeMap::new(),
+        };
+        profile.components.insert("browser".into(), component);
+        let mut profiles = BTreeMap::new();
+        profiles.insert("demo".into(), profile);
+        let mut state = UserState::default();
+        state
+            .components
+            .insert("browser".into(), "demo/browser".into());
+        let state_path = state_path(temp.path());
+        let mut journal =
+            ActivationJournal::begin(&state_path, UserState::default(), UserState::default())
+                .unwrap();
+        journal.mark_applying().unwrap();
+        assert!(apply(&profiles, &state, &mut journal).is_err());
+        recover_activation_journals(&state_path).unwrap();
+        assert_eq!(
+            fs::read_to_string(mimeapps).unwrap(),
+            "[Default Applications]\ntext/html=outside.desktop;\n"
+        );
+    }
 }

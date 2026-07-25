@@ -353,7 +353,7 @@ fn load_profile(
             .unwrap_or_default();
         if !exec.is_empty() && !valid_exec(&exec) {
             return Err(Error::Message(format!(
-                "{}: unsafe exec for component {}",
+                "{}: invalid exec argv for component {}",
                 manifest_path.display(),
                 component.id
             )));

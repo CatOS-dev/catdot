@@ -307,6 +307,13 @@ fn print_activation_plan(
     for target in &plan.removals {
         println!("  delete managed target: {}", target.display());
     }
+    let xdg_plan = build_xdg_plan(profiles, state, &runtime::xdg_config_home(&home))?;
+    for (association, desktop) in &xdg_plan.defaults {
+        println!("  xdg default: {association} -> {desktop}");
+    }
+    for association in xdg_plan.restore.keys() {
+        println!("  xdg restore: {association}");
+    }
     let configuration_changes = plan
         .entries
         .iter()
@@ -321,10 +328,9 @@ fn print_activation_plan(
             Materialization::User { seed } => seed.is_some() && !entry.target.exists(),
         })
         || plan.removals.iter().any(|target| target.exists());
-    Ok(
-        !(activate.is_empty() && change.is_empty() && deactivate.is_empty())
-            || configuration_changes,
-    )
+    let selection_changes = !activate.is_empty() || !change.is_empty() || !deactivate.is_empty();
+    let xdg_changes = !xdg_plan.defaults.is_empty() || !xdg_plan.restore.is_empty();
+    Ok(selection_changes || configuration_changes || xdg_changes)
 }
 
 fn resolve_helper(
@@ -567,7 +573,24 @@ pub fn run() -> Result<i32> {
             remaining.components.remove(role);
             validate_user_state(&remaining, ps)?;
         } else {
-            validate_user_state(&state, ps)?;
+            if let Err(error) = validate_user_state(&state, ps) {
+                if let Cmd::Exec { role, .. } = &cli.command
+                    && let Some(reference) = state.active_components.get(role)
+                    && let Some((profile_id, _)) = reference.split_once('/')
+                    && let Some(diagnostic) = registry.diagnostics.iter().find(|diagnostic| {
+                        diagnostic
+                            .profile_directory
+                            .file_name()
+                            .is_some_and(|name| name == std::ffi::OsStr::new(profile_id))
+                    })
+                {
+                    bail!(
+                        "active component {reference} has an invalid provider declaration: {}",
+                        diagnostic.message
+                    );
+                }
+                return Err(error.into());
+            }
         }
     }
     match cli.command {
