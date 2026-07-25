@@ -1154,3 +1154,170 @@ fn recover_commands_use_the_correct_helper_modes() {
     assert!(calls.contains("catdot-helper recovery-accept"));
     assert!(!home.path().join(".local/state/catdot/state.toml").exists());
 }
+
+// Protects the two primary product scenarios through the public CLI. A fresh
+// schema 3 profile must become active as one transaction; later component
+// switches must update generated WM/XDG state without leaving stale providers.
+#[test]
+fn schema3_first_install_and_component_switch_complete_end_to_end() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let metadata = root.path().join("demo");
+    let source = root.path().join("share");
+    let bin = root.path().join("bin");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::create_dir_all(source.join("defaults")).unwrap();
+    fs::create_dir_all(source.join("custom")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        source.join("defaults/binds.kdl"),
+        "bind terminal through catdot\n",
+    )
+    .unwrap();
+    fs::write(source.join("defaults/static.kdl"), "static\n").unwrap();
+    fs::write(source.join("custom/seed"), "custom\n").unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            r#"schema = 3
+[profile]
+id = "demo"
+name = "Demo"
+description = "test"
+source_root = "{}"
+[defaults]
+desktop = "niri"
+bar = "panel"
+terminal = "ghostty"
+[[components]]
+id = "niri"
+role = "desktop"
+[components.wm]
+autostart_target = ".config/niri/autostart.kdl"
+autostart_template = 'spawn-at-startup "catdot" "exec" "{{role}}"'
+[[components.wm.autostart]]
+role = "bar"
+[[components.configuration]]
+target = ".config/niri/config.kdl"
+lifecycle = "generate"
+template = '''include "binds.kdl"
+include "autostart.kdl"
+'''
+[[components.configuration]]
+target = ".config/niri/binds.kdl"
+lifecycle = "merge"
+source = "defaults/binds.kdl"
+[[components.configuration]]
+target = ".config/niri/static.kdl"
+lifecycle = "symlink"
+source = "defaults/static.kdl"
+[[components.configuration]]
+target = ".config/niri/custom"
+lifecycle = "user"
+seed = "custom"
+[[components]]
+id = "panel"
+role = "bar"
+[components.exec]
+argv = ["panel"]
+[[components]]
+id = "ghostty"
+role = "terminal"
+[components.exec]
+argv = ["ghostty"]
+[components.xdg]
+command = "ghostty"
+environment = ["TERMINAL"]
+[[components]]
+id = "foot"
+role = "terminal"
+[components.exec]
+argv = ["foot"]
+[components.xdg]
+command = "foot"
+environment = ["TERMINAL"]
+"#,
+            source.display()
+        ),
+    )
+    .unwrap();
+    let pkexec = bin.join("pkexec");
+    fs::write(
+        &pkexec,
+        "#!/bin/sh\ncase \"$2\" in\n  resolve-plan) printf '%s\\n' 'system_update_required = false' '[plan]' 'install = []' 'remove = []' 'replacements = []' 'satisfied = []' '[requirements]' ;;\n  resolve|finalize) exit 0 ;;\n  *) exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&pkexec, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let run = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_catdot"))
+            .args(arguments)
+            .env("CATDOT_PROFILE_ROOT", root.path())
+            .env("HOME", home.path())
+            .env("PATH", &bin)
+            .env_remove("CATDOT_DEFAULT_DECLARATION")
+            .output()
+            .unwrap()
+    };
+
+    let select = run(&["select", "demo"]);
+    assert!(
+        select.status.success(),
+        "{}",
+        String::from_utf8_lossy(&select.stderr)
+    );
+    let install = run(&["resolve", "--yes"]);
+    assert!(
+        install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join(".config/niri/autostart.kdl")).unwrap(),
+        "spawn-at-startup \"catdot\" \"exec\" \"bar\"\n"
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join(".config/environment.d/90-catdot.conf")).unwrap(),
+        "TERMINAL=ghostty\n"
+    );
+    assert!(home.path().join(".config/niri/custom/seed").is_file());
+    assert!(
+        fs::symlink_metadata(home.path().join(".config/niri/static.kdl"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    let select_foot = run(&["select", "terminal", "demo/foot"]);
+    assert!(select_foot.status.success());
+    let switch = run(&["resolve", "--yes"]);
+    assert!(
+        switch.status.success(),
+        "{}",
+        String::from_utf8_lossy(&switch.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join(".config/environment.d/90-catdot.conf")).unwrap(),
+        "TERMINAL=foot\n"
+    );
+
+    let disable = run(&["disable", "bar"]);
+    assert!(disable.status.success());
+    let switch = run(&["resolve", "--yes"]);
+    assert!(
+        switch.status.success(),
+        "{}",
+        String::from_utf8_lossy(&switch.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join(".config/niri/autostart.kdl")).unwrap(),
+        ""
+    );
+    let state = fs::read_to_string(home.path().join(".local/state/catdot/state.toml")).unwrap();
+    assert!(state.contains("terminal = \"demo/foot\""));
+    assert!(!state.contains("bar = \"demo/panel\""));
+    assert!(state.contains("active_generation"));
+}
