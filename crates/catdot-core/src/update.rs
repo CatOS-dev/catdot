@@ -79,16 +79,14 @@ pub fn activation_digests(
                     digest.update(b"generate");
                     if let Some(template) = &entry.template {
                         digest.update(template.as_bytes());
+                    } else {
+                        let source = profile
+                            .source_root
+                            .join(entry.source.as_ref().expect("validated source"));
+                        digest_file(&mut digest, &source)?;
                     }
                 }
-                crate::Lifecycle::Overwrite(crate::OverwriteMode::File) => {
-                    digest.update(b"file");
-                    let source = profile
-                        .source_root
-                        .join(entry.source.as_ref().expect("validated source"));
-                    digest_file(&mut digest, &source)?;
-                }
-                crate::Lifecycle::Overwrite(crate::OverwriteMode::Symlink) => {
+                crate::Lifecycle::Symlink => {
                     digest.update(b"symlink");
                     digest.update(
                         profile
@@ -97,6 +95,13 @@ pub fn activation_digests(
                             .as_os_str()
                             .as_encoded_bytes(),
                     );
+                }
+                crate::Lifecycle::Merge => {
+                    digest.update(b"merge");
+                    let source = profile
+                        .source_root
+                        .join(entry.source.as_ref().expect("validated source"));
+                    digest_file(&mut digest, &source)?;
                 }
                 crate::Lifecycle::User => digest.update(b"user"),
             }
@@ -183,7 +188,7 @@ fn digest_file(digest: &mut Sha256, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ComponentDef, ConfigurationEntry, Lifecycle, OverwriteMode, XdgProvider};
+    use crate::{ComponentDef, ConfigurationEntry, Lifecycle, XdgProvider};
     use std::{collections::BTreeMap, fs};
     use tempfile::tempdir;
 
@@ -203,7 +208,7 @@ mod tests {
             xdg: XdgProvider::default(),
             configuration: vec![ConfigurationEntry {
                 target: ".config/niri/default.kdl".into(),
-                lifecycle: Lifecycle::Overwrite(OverwriteMode::Symlink),
+                lifecycle: Lifecycle::Symlink,
                 source: Some("default.kdl".into()),
                 template: None,
                 seed: None,

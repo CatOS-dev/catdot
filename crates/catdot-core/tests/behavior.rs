@@ -1297,3 +1297,215 @@ fn xdg_activation_is_idempotent_when_defaults_are_already_satisfied() {
     journal.complete().unwrap();
     assert_eq!(fs::metadata(mimeapps).unwrap().ino(), inode);
 }
+
+// Protects the schema 3 installation contract: a fresh profile can install
+// generated files, static links, mergeable defaults and user-owned seeds
+// without relying on the removed overwrite/file lifecycle.
+#[test]
+fn schema3_first_install_materializes_the_four_lifecycles() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    let source = temp.path().join("share/demo");
+    fs::create_dir_all(source.join("defaults")).unwrap();
+    fs::create_dir_all(source.join("custom")).unwrap();
+    fs::write(source.join("defaults/generated"), "generated from source\n").unwrap();
+    fs::write(source.join("defaults/static"), "static\n").unwrap();
+    fs::write(source.join("defaults/binds"), "binds v1\n").unwrap();
+    fs::write(source.join("custom/seed"), "seed\n").unwrap();
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            r#"schema = 3
+[profile]
+id = "demo"
+name = "Demo"
+description = "test"
+source_root = "{}"
+[defaults]
+desktop = "desktop"
+[[components]]
+id = "desktop"
+role = "desktop"
+[[components.configuration]]
+target = ".config/demo/root"
+lifecycle = "generate"
+template = "root\n"
+[[components.configuration]]
+target = ".config/demo/generated"
+lifecycle = "generate"
+source = "defaults/generated"
+[[components.configuration]]
+target = ".config/demo/static"
+lifecycle = "symlink"
+source = "defaults/static"
+[[components.configuration]]
+target = ".config/demo/binds"
+lifecycle = "merge"
+source = "defaults/binds"
+[[components.configuration]]
+target = ".config/demo/custom"
+lifecycle = "user"
+seed = "custom"
+"#,
+            source.display()
+        ),
+    )
+    .unwrap();
+
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    let home = temp.path().join("home");
+    let registry = home.join(".local/state/catdot/managed.toml");
+    let plan = build_activation_plan(&profiles, &state, &home, &registry).unwrap();
+    apply_configuration(&plan, &registry, &home).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(home.join(".config/demo/root")).unwrap(),
+        "root\n"
+    );
+    assert_eq!(
+        fs::read_to_string(home.join(".config/demo/generated")).unwrap(),
+        "generated from source\n"
+    );
+    assert_eq!(
+        fs::read_link(home.join(".config/demo/static")).unwrap(),
+        source.join("defaults/static")
+    );
+    assert_eq!(
+        fs::read_to_string(home.join(".config/demo/binds")).unwrap(),
+        "binds v1\n"
+    );
+    assert_eq!(
+        fs::read_to_string(home.join(".config/demo/custom/seed")).unwrap(),
+        "seed\n"
+    );
+}
+
+// Schema 3 must not silently preserve the old copy lifecycle under another
+// spelling. Static writable files are generated; immutable resources are links.
+#[test]
+fn schema3_rejects_overwrite_and_mode() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    fs::create_dir_all(&metadata).unwrap();
+    let source = temp.path().join("share/demo");
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            "schema = 3\n[profile]\nid = \"demo\"\nname = \"Demo\"\ndescription = \"test\"\nsource_root = \"{}\"\n[[components]]\nid = \"desktop\"\nrole = \"desktop\"\n[[components.configuration]]\ntarget = \".config/demo/config\"\nlifecycle = \"overwrite\"\nmode = \"file\"\nsource = \"config\"\n",
+            source.display()
+        ),
+    )
+    .unwrap();
+    assert!(discover_profiles(&temp.path().join("profiles")).is_err());
+}
+
+// Protects best-effort configuration updates: clean upstream changes update a
+// locally untouched file, while a user-only edit survives an unchanged upstream.
+#[test]
+fn merge_updates_clean_files_and_preserves_user_only_edits() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    let source = temp.path().join("share/demo");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::create_dir_all(&source).unwrap();
+    let upstream = source.join("binds.kdl");
+    fs::write(&upstream, "v1\n").unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            "schema = 3\n[profile]\nid = \"demo\"\nname = \"Demo\"\ndescription = \"test\"\nsource_root = \"{}\"\n[defaults]\ndesktop = \"desktop\"\n[[components]]\nid = \"desktop\"\nrole = \"desktop\"\n[[components.configuration]]\ntarget = \".config/demo/binds.kdl\"\nlifecycle = \"merge\"\nsource = \"binds.kdl\"\n",
+            source.display()
+        ),
+    )
+    .unwrap();
+    let home = temp.path().join("home");
+    let registry = home.join(".local/state/catdot/managed.toml");
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    apply_configuration(
+        &build_activation_plan(&profiles, &state, &home, &registry).unwrap(),
+        &registry,
+        &home,
+    )
+    .unwrap();
+    let target = home.join(".config/demo/binds.kdl");
+
+    fs::write(&upstream, "v2\n").unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    apply_configuration(
+        &build_activation_plan(&profiles, &state, &home, &registry).unwrap(),
+        &registry,
+        &home,
+    )
+    .unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), "v2\n");
+
+    fs::write(&target, "mine\n").unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    apply_configuration(
+        &build_activation_plan(&profiles, &state, &home, &registry).unwrap(),
+        &registry,
+        &home,
+    )
+    .unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), "mine\n");
+}
+
+// Protects profile switching: a merge-owned file is backed up before removal,
+// and selecting the profile again starts from the current packaged default.
+#[test]
+fn switching_away_from_merge_backs_up_then_reinstalls_fresh() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    let source = temp.path().join("share/demo");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("binds.kdl"), "default\n").unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        format!(
+            "schema = 3\n[profile]\nid = \"demo\"\nname = \"Demo\"\ndescription = \"test\"\nsource_root = \"{}\"\n[defaults]\ndesktop = \"one\"\n[[components]]\nid = \"one\"\nrole = \"desktop\"\n[[components.configuration]]\ntarget = \".config/demo/binds.kdl\"\nlifecycle = \"merge\"\nsource = \"binds.kdl\"\n[[components]]\nid = \"two\"\nrole = \"desktop\"\n",
+            source.display()
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let home = temp.path().join("home");
+    let registry = home.join(".local/state/catdot/managed.toml");
+    let mut state = select_profile(&profiles["demo"]).unwrap();
+    apply_configuration(
+        &build_activation_plan(&profiles, &state, &home, &registry).unwrap(),
+        &registry,
+        &home,
+    )
+    .unwrap();
+    let target = home.join(".config/demo/binds.kdl");
+    fs::write(&target, "mine\n").unwrap();
+
+    state.components.insert("desktop".into(), "demo/two".into());
+    apply_configuration(
+        &build_activation_plan(&profiles, &state, &home, &registry).unwrap(),
+        &registry,
+        &home,
+    )
+    .unwrap();
+    assert!(!target.exists());
+    let backups = home.join(".local/state/catdot/backups");
+    assert!(fs::read_dir(&backups).unwrap().any(|entry| {
+        let path = entry.unwrap().path().join("home/.config/demo/binds.kdl");
+        fs::read_to_string(path).ok().as_deref() == Some("mine\n")
+    }));
+
+    fs::write(source.join("binds.kdl"), "fresh\n").unwrap();
+    state.components.insert("desktop".into(), "demo/one".into());
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    apply_configuration(
+        &build_activation_plan(&profiles, &state, &home, &registry).unwrap(),
+        &registry,
+        &home,
+    )
+    .unwrap();
+    assert_eq!(fs::read_to_string(target).unwrap(), "fresh\n");
+}

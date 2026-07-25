@@ -352,7 +352,13 @@ fn print_activation_plan(
                 entry.owner
             ),
             Materialization::File { source } => println!(
-                "  copy: {} -> {} ({})",
+                "  generate: {} -> {} ({})",
+                source.display(),
+                entry.target.display(),
+                entry.owner
+            ),
+            Materialization::Merge { source, .. } => println!(
+                "  merge: {} -> {} ({})",
                 source.display(),
                 entry.target.display(),
                 entry.owner
@@ -1103,13 +1109,13 @@ pub fn run() -> Result<i32> {
             for (target, managed) in read_managed_registry(&managed_targets_path(&path)?)?.entries {
                 let metadata = std::fs::symlink_metadata(&target).ok();
                 let matches = match managed.lifecycle.as_str() {
-                    "overwrite/symlink" => {
+                    "symlink" | "overwrite/symlink" => {
                         metadata.is_some_and(|metadata| metadata.file_type().is_symlink())
                             && managed.source.as_ref().is_some_and(|source| {
                                 std::fs::read_link(&target).ok().as_ref() == Some(source)
                             })
                     }
-                    "generate" | "overwrite/file" => {
+                    "generate" | "merge" | "overwrite/file" => {
                         metadata.is_some_and(|metadata| !metadata.file_type().is_symlink())
                     }
                     _ => false,

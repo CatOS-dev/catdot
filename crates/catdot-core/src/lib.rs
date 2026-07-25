@@ -15,9 +15,9 @@ pub use activation::{
 };
 pub use error::{Error, Result};
 pub use manifest::{
-    ComponentDef, ConfigurationEntry, DEFAULT_PROFILE_ROOT, Lifecycle, OverwriteMode, Profile,
-    ProfileDiagnostic, ProfileDiagnosticKind, ProfileRegistry, XdgProvider,
-    discover_profile_registry, discover_profiles, profile_root,
+    ComponentDef, ConfigurationEntry, DEFAULT_PROFILE_ROOT, Lifecycle, Profile, ProfileDiagnostic,
+    ProfileDiagnosticKind, ProfileRegistry, XdgProvider, discover_profile_registry,
+    discover_profiles, profile_root,
 };
 pub use planning::{
     InstallReason, ManagedPackage, PackageAvailability, PackageBackend, PackagePlan,

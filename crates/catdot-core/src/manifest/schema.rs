@@ -79,14 +79,9 @@ struct RawConfiguration {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Lifecycle {
     Generate,
-    Overwrite(OverwriteMode),
-    User,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OverwriteMode {
     Symlink,
-    File,
+    Merge,
+    User,
 }
 
 #[derive(Debug, Clone)]
@@ -294,7 +289,7 @@ fn load_profile(
     manifest_path: &Path,
 ) -> Result<Profile> {
     let raw: RawManifest = read_toml(manifest_path)?;
-    if raw.schema != 2 {
+    if !matches!(raw.schema, 2 | 3) {
         return Err(Error::Message(format!(
             "{}: unsupported schema {}",
             manifest_path.display(),
@@ -389,7 +384,7 @@ fn load_profile(
         let configuration = component
             .configuration
             .into_iter()
-            .map(|entry| parse_configuration(manifest_path, &component.id, entry))
+            .map(|entry| parse_configuration(manifest_path, raw.schema, &component.id, entry))
             .collect::<Result<Vec<_>>>()?;
         let xdg = component.xdg.unwrap_or_default();
         if xdg.desktop_entry.as_deref().is_some_and(|value| {
@@ -440,6 +435,7 @@ fn load_profile(
 
 fn parse_configuration(
     manifest: &Path,
+    schema: u32,
     component: &str,
     raw: RawConfiguration,
 ) -> Result<ConfigurationEntry> {
@@ -463,27 +459,49 @@ fn parse_configuration(
             manifest.display()
         )));
     }
-    let lifecycle = match (raw.lifecycle.as_str(), raw.mode.as_deref()) {
-        ("generate", None) if raw.template.is_some() && source.is_none() && seed.is_none() => {
-            Lifecycle::Generate
-        }
-        ("overwrite", Some("symlink"))
-            if source.is_some() && raw.template.is_none() && seed.is_none() =>
-        {
-            Lifecycle::Overwrite(OverwriteMode::Symlink)
-        }
-        ("overwrite", Some("file"))
-            if source.is_some() && raw.template.is_none() && seed.is_none() =>
-        {
-            Lifecycle::Overwrite(OverwriteMode::File)
-        }
-        ("user", None) if raw.template.is_none() && source.is_none() => Lifecycle::User,
-        _ => {
-            return Err(Error::Message(format!(
-                "{}: invalid configuration lifecycle for {component}",
-                manifest.display()
-            )));
-        }
+    let lifecycle = match schema {
+        2 => match (raw.lifecycle.as_str(), raw.mode.as_deref()) {
+            ("generate", None) if raw.template.is_some() && source.is_none() && seed.is_none() => {
+                Lifecycle::Generate
+            }
+            ("overwrite", Some("symlink"))
+                if source.is_some() && raw.template.is_none() && seed.is_none() =>
+            {
+                Lifecycle::Symlink
+            }
+            ("overwrite", Some("file"))
+                if source.is_some() && raw.template.is_none() && seed.is_none() =>
+            {
+                // Schema 2 compatibility: copied files become generated inputs.
+                Lifecycle::Generate
+            }
+            ("user", None) if raw.template.is_none() && source.is_none() => Lifecycle::User,
+            _ => {
+                return Err(Error::Message(format!(
+                    "{}: invalid configuration lifecycle for {component}",
+                    manifest.display()
+                )));
+            }
+        },
+        3 => match (raw.lifecycle.as_str(), raw.mode.as_deref()) {
+            ("generate", None) if raw.template.is_some() ^ source.is_some() && seed.is_none() => {
+                Lifecycle::Generate
+            }
+            ("symlink", None) if source.is_some() && raw.template.is_none() && seed.is_none() => {
+                Lifecycle::Symlink
+            }
+            ("merge", None) if source.is_some() && raw.template.is_none() && seed.is_none() => {
+                Lifecycle::Merge
+            }
+            ("user", None) if raw.template.is_none() && source.is_none() => Lifecycle::User,
+            _ => {
+                return Err(Error::Message(format!(
+                    "{}: invalid schema 3 configuration lifecycle for {component}",
+                    manifest.display()
+                )));
+            }
+        },
+        _ => unreachable!("validated schema"),
     };
     Ok(ConfigurationEntry {
         target: PathBuf::from(raw.target),

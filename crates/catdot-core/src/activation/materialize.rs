@@ -1,6 +1,5 @@
 use crate::{
-    ActivationJournal, ComponentDef, Error, Lifecycle, OverwriteMode, Profile, Result, UserState,
-    atomic_write,
+    ActivationJournal, ComponentDef, Error, Lifecycle, Profile, Result, UserState, atomic_write,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,6 +18,8 @@ pub struct ManagedTarget {
     pub owner: String,
     pub lifecycle: String,
     pub source: Option<PathBuf>,
+    #[serde(default)]
+    pub merge_base: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -38,6 +39,12 @@ pub enum Materialization {
     },
     File {
         source: PathBuf,
+    },
+    Merge {
+        source: PathBuf,
+        contents: Vec<u8>,
+        base: String,
+        ready: bool,
     },
     User {
         seed: Option<PathBuf>,
@@ -86,7 +93,11 @@ impl ActivationPlan {
                     digest.update(source.as_os_str().as_encoded_bytes());
                 }
                 Materialization::File { source } => {
-                    digest.update(b"file\0");
+                    digest.update(b"generate-source\0");
+                    digest.update(source.as_os_str().as_encoded_bytes());
+                }
+                Materialization::Merge { source, .. } => {
+                    digest.update(b"merge\0");
                     digest.update(source.as_os_str().as_encoded_bytes());
                 }
                 Materialization::User {
@@ -109,11 +120,24 @@ impl ActivationPlan {
             digest.update([0xff]);
         }
         digest.update([self.registry_changed as u8]);
-        digest.update(
-            toml::to_string(&self.registry)
-                .unwrap_or_default()
-                .as_bytes(),
-        );
+        for (target, managed) in &self.registry.entries {
+            digest.update(target.as_bytes());
+            digest.update([0]);
+            digest.update(managed.owner.as_bytes());
+            digest.update([0]);
+            digest.update(managed.lifecycle.as_bytes());
+            digest.update([0]);
+            if let Some(source) = &managed.source {
+                digest.update(source.as_os_str().as_encoded_bytes());
+            }
+            digest.update([0xff]);
+        }
+        for (target, owner) in &self.registry.user_initialized {
+            digest.update(target.as_bytes());
+            digest.update([0]);
+            digest.update(owner.as_bytes());
+            digest.update([0xff]);
+        }
         format!("{:x}", digest.finalize())
     }
 }
@@ -188,6 +212,7 @@ fn build_activation_plan_with_sources(
             component,
             reference,
             home,
+            &previous,
             verify_sources,
         )?;
     }
@@ -236,12 +261,13 @@ fn build_activation_plan_with_sources(
                 .insert(entry.target.display().to_string(), entry.owner.clone());
             continue;
         }
-        let (lifecycle, source) = match &entry.materialization {
-            Materialization::Generate { .. } => ("generate".into(), None),
-            Materialization::Symlink { source } => {
-                ("overwrite/symlink".into(), Some(source.clone()))
+        let (lifecycle, source, merge_base) = match &entry.materialization {
+            Materialization::Generate { .. } => ("generate".into(), None, None),
+            Materialization::Symlink { source } => ("symlink".into(), Some(source.clone()), None),
+            Materialization::File { source } => ("generate".into(), Some(source.clone()), None),
+            Materialization::Merge { source, base, .. } => {
+                ("merge".into(), Some(source.clone()), Some(base.clone()))
             }
-            Materialization::File { source } => ("overwrite/file".into(), Some(source.clone())),
             Materialization::User { .. } => unreachable!(),
         };
         registry.entries.insert(
@@ -250,6 +276,7 @@ fn build_activation_plan_with_sources(
                 owner: entry.owner.clone(),
                 lifecycle,
                 source,
+                merge_base,
             },
         );
     }
@@ -268,33 +295,41 @@ fn add_component_entries(
     component: &ComponentDef,
     owner: &str,
     home: &Path,
+    previous: &ManagedRegistry,
     verify_sources: bool,
 ) -> Result<()> {
     for configuration in &component.configuration {
         let target = home.join(&configuration.target);
         let materialization = match &configuration.lifecycle {
-            Lifecycle::Generate => Materialization::Generate {
-                contents: configuration
-                    .template
-                    .as_ref()
-                    .expect("validated template")
-                    .as_bytes()
-                    .to_vec(),
-            },
-            Lifecycle::Overwrite(OverwriteMode::Symlink) => Materialization::Symlink {
+            Lifecycle::Generate => {
+                if let Some(template) = &configuration.template {
+                    Materialization::Generate {
+                        contents: template.as_bytes().to_vec(),
+                    }
+                } else {
+                    Materialization::File {
+                        source: source(
+                            profile,
+                            configuration.source.as_ref().expect("validated source"),
+                            verify_sources,
+                        )?,
+                    }
+                }
+            }
+            Lifecycle::Symlink => Materialization::Symlink {
                 source: source(
                     profile,
                     configuration.source.as_ref().expect("validated source"),
                     verify_sources,
                 )?,
             },
-            Lifecycle::Overwrite(OverwriteMode::File) => Materialization::File {
-                source: source(
-                    profile,
-                    configuration.source.as_ref().expect("validated source"),
-                    verify_sources,
-                )?,
-            },
+            Lifecycle::Merge => build_merge_materialization(
+                profile,
+                configuration.source.as_ref().expect("validated source"),
+                &target,
+                previous,
+                verify_sources,
+            )?,
             Lifecycle::User => Materialization::User {
                 seed: configuration
                     .seed
@@ -312,6 +347,64 @@ fn add_component_entries(
         });
     }
     Ok(())
+}
+
+fn build_merge_materialization(
+    profile: &Profile,
+    relative: &Path,
+    target: &Path,
+    previous: &ManagedRegistry,
+    verify_sources: bool,
+) -> Result<Materialization> {
+    let source = source(profile, relative, verify_sources)?;
+    if !source.exists() && !verify_sources {
+        return Ok(Materialization::Merge {
+            source,
+            contents: Vec::new(),
+            base: previous
+                .entries
+                .get(&target.display().to_string())
+                .and_then(|entry| entry.merge_base.clone())
+                .unwrap_or_default(),
+            ready: false,
+        });
+    }
+    let upstream = fs::read_to_string(&source).map_err(|source_error| Error::Io {
+        path: source.display().to_string(),
+        source: source_error,
+    })?;
+    let old_base = previous
+        .entries
+        .get(&target.display().to_string())
+        .filter(|entry| entry.lifecycle == "merge")
+        .and_then(|entry| entry.merge_base.as_deref());
+    let local = match fs::read_to_string(target) {
+        Ok(local) => Some(local),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source_error) => {
+            return Err(Error::Io {
+                path: target.display().to_string(),
+                source: source_error,
+            });
+        }
+    };
+    let merged = match (old_base, local.as_deref()) {
+        (None, _) | (_, None) => upstream.clone(),
+        (Some(base), Some(local)) if local == base => upstream.clone(),
+        (Some(base), Some(local)) if upstream == base || local == upstream => local.to_owned(),
+        (Some(_), Some(_)) => {
+            return Err(Error::Message(format!(
+                "merge conflict for {}; current configuration was preserved",
+                target.display()
+            )));
+        }
+    };
+    Ok(Materialization::Merge {
+        source,
+        contents: merged.into_bytes(),
+        base: upstream,
+        ready: true,
+    })
 }
 
 fn source(profile: &Profile, relative: &Path, verify_sources: bool) -> Result<PathBuf> {
@@ -381,6 +474,15 @@ fn entry_has_changes(entry: &PlannedTarget) -> bool {
             fs::read_link(&entry.target).map_or(true, |existing| existing != *source)
         }
         Materialization::File { source } => !paths_equal(source, &entry.target),
+        Materialization::Merge {
+            contents, ready, ..
+        } => {
+            !*ready
+                || fs::read(&entry.target).map_or(true, |existing| existing != *contents)
+                || fs::metadata(&entry.target).map_or(true, |metadata| {
+                    metadata.permissions().mode() & 0o777 != 0o644
+                })
+        }
         Materialization::User {
             release_managed,
             initialized,
@@ -499,6 +601,17 @@ fn apply_entry(entry: &PlannedTarget) -> Result<()> {
             rename_staged(&temporary, &entry.target)
         }
         Materialization::File { source } => replace_from(source, &entry.target),
+        Materialization::Merge {
+            contents, ready, ..
+        } => {
+            if !ready {
+                return Err(Error::Message(format!(
+                    "merge source for {} is not available",
+                    entry.target.display()
+                )));
+            }
+            replace_file(&entry.target, contents, 0o644)
+        }
         Materialization::User {
             seed,
             release_managed,
