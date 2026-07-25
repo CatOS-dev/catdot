@@ -85,8 +85,30 @@ User configuration changes use atomic files, a per-user lock, a managed-target
 registry, and an activation journal. Package installation, finalization, and
 pruning use root-owned records and recovery journals under `/var/lib/catdot`.
 If a process or machine stops after an ALPM transaction but before record
-commit, the next mutating operation completes the safe recovery or refuses an
-uncertain partial result.
+commit, the next mutating operation completes only a provably safe recovery.
+An uncertain `Prepared` journal remains blocked and is inspected with:
+
+```sh
+catdot recover list
+```
+
+When every package expected from the confirmed transaction is installed and
+every confirmed replacement target is absent, an administrator may commit the
+recorded result with:
+
+```sh
+catdot recover accept TRANSACTION --yes
+```
+
+When no newly introduced package exists and every package scheduled for removal
+is still present, the untouched journal may instead be discarded with:
+
+```sh
+catdot recover discard TRANSACTION --yes
+```
+
+Partial package states and journals created before the recovery metadata schema
+are never guessed; both decisions remain unavailable until manually inspected.
 
 Catdot only claims ownership of packages that were absent before its
 transaction. Pre-existing explicit packages remain explicit even when ALPM

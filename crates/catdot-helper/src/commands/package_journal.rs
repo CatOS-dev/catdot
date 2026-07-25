@@ -106,11 +106,15 @@ impl PruneJournal {
 pub(super) struct PackageJournal {
     id: String,
     plan_digest: String,
+    #[serde(default)]
+    recovery_schema: u32,
     uid: u32,
     generation: u64,
     direct_requirements: BTreeMap<String, BTreeSet<String>>,
     transaction_packages: BTreeSet<String>,
     previously_present: BTreeSet<String>,
+    #[serde(default)]
+    removed_packages: BTreeSet<String>,
     expected_record: UserRecord,
     expected_packages: SystemPackageState,
     stage: JournalStage,
@@ -147,11 +151,13 @@ impl PackageJournal {
         let journal = Self {
             id,
             plan_digest: plan.digest(),
+            recovery_schema: 1,
             uid: input.uid,
             generation: input.generation,
             direct_requirements: input.direct_requirements,
             transaction_packages: input.transaction_packages,
             previously_present: input.previously_present,
+            removed_packages: plan.remove.iter().cloned().collect(),
             expected_record: input.expected_record,
             expected_packages,
             stage: JournalStage::Prepared,
@@ -171,11 +177,13 @@ impl PackageJournal {
         let journal = Self {
             id,
             plan_digest: "finalize".into(),
+            recovery_schema: 1,
             uid: expected_record.uid,
             generation: expected_record.active_generation,
             direct_requirements: expected_record.active_requirements.clone(),
             transaction_packages: BTreeSet::new(),
             previously_present: BTreeSet::new(),
+            removed_packages: BTreeSet::new(),
             expected_record,
             expected_packages,
             stage: JournalStage::RecordsPrepared,
@@ -227,6 +235,172 @@ impl PackageJournal {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RecoveryDecision {
+    Accept,
+    Discard,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RecoveryStatus {
+    pub id: String,
+    pub uid: u32,
+    pub generation: u64,
+    pub metadata_complete: bool,
+    pub accept_safe: bool,
+    pub discard_safe: bool,
+    pub installed: BTreeSet<String>,
+    pub missing: BTreeSet<String>,
+    pub removed: BTreeSet<String>,
+    pub still_present: BTreeSet<String>,
+}
+
+fn read_package_journals(database: &Path) -> Result<Vec<PackageJournal>> {
+    let directory = journal_directory(database)?;
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let mut journals = Vec::new();
+    for entry in
+        fs::read_dir(&directory).with_context(|| format!("read {}", directory.display()))?
+    {
+        let path = entry?.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
+            continue;
+        }
+        let contents =
+            fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let header: JournalHeader =
+            toml::from_str(&contents).with_context(|| format!("parse {}", path.display()))?;
+        if header.kind.as_deref() == Some("prune") {
+            continue;
+        }
+        let mut journal: PackageJournal =
+            toml::from_str(&contents).with_context(|| format!("parse {}", path.display()))?;
+        journal.path = path;
+        journals.push(journal);
+    }
+    Ok(journals)
+}
+
+fn status_for_journal<F>(journal: &PackageJournal, package_present: &mut F) -> RecoveryStatus
+where
+    F: FnMut(&str) -> bool,
+{
+    let mut installed = BTreeSet::new();
+    let mut missing = BTreeSet::new();
+    for package in &journal.transaction_packages {
+        if package_present(package) {
+            installed.insert(package.clone());
+        } else {
+            missing.insert(package.clone());
+        }
+    }
+    let mut removed = BTreeSet::new();
+    let mut still_present = BTreeSet::new();
+    for package in &journal.removed_packages {
+        if package_present(package) {
+            still_present.insert(package.clone());
+        } else {
+            removed.insert(package.clone());
+        }
+    }
+    let newly_expected = journal
+        .transaction_packages
+        .difference(&journal.previously_present)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let metadata_complete = journal.recovery_schema == 1;
+    let accept_safe = metadata_complete && missing.is_empty() && still_present.is_empty();
+    let discard_safe =
+        metadata_complete && newly_expected.is_disjoint(&installed) && removed.is_empty();
+    RecoveryStatus {
+        id: journal.id.clone(),
+        uid: journal.uid,
+        generation: journal.generation,
+        metadata_complete,
+        accept_safe,
+        discard_safe,
+        installed,
+        missing,
+        removed,
+        still_present,
+    }
+}
+
+#[cfg(test)]
+pub(super) fn recovery_status<F>(
+    database: &Path,
+    id: &str,
+    mut package_present: F,
+) -> Result<RecoveryStatus>
+where
+    F: FnMut(&str) -> bool,
+{
+    let journal = read_package_journals(database)?
+        .into_iter()
+        .find(|journal| journal.id == id)
+        .ok_or_else(|| anyhow::anyhow!("unknown package transaction {id}"))?;
+    if journal.stage != JournalStage::Prepared {
+        bail!("package transaction {id} does not require an explicit recovery decision")
+    }
+    Ok(status_for_journal(&journal, &mut package_present))
+}
+
+pub(super) fn recovery_statuses<F>(
+    database: &Path,
+    mut package_present: F,
+) -> Result<Vec<RecoveryStatus>>
+where
+    F: FnMut(&str) -> bool,
+{
+    let mut statuses = read_package_journals(database)?
+        .into_iter()
+        .filter(|journal| journal.stage == JournalStage::Prepared)
+        .map(|journal| status_for_journal(&journal, &mut package_present))
+        .collect::<Vec<_>>();
+    statuses.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(statuses)
+}
+
+pub(super) fn recover_transaction<F>(
+    database: &Path,
+    id: &str,
+    decision: RecoveryDecision,
+    mut package_present: F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> bool,
+{
+    let mut journal = read_package_journals(database)?
+        .into_iter()
+        .find(|journal| journal.id == id)
+        .ok_or_else(|| anyhow::anyhow!("unknown package transaction {id}"))?;
+    if journal.stage != JournalStage::Prepared {
+        bail!("package transaction {id} does not require an explicit recovery decision")
+    }
+    let status = status_for_journal(&journal, &mut package_present);
+    match decision {
+        RecoveryDecision::Accept if status.accept_safe => {
+            journal.mark_alpm_committed()?;
+            commit_records(
+                database,
+                &journal.expected_packages,
+                &journal.expected_record,
+            )?;
+            journal.mark_records_committed()?;
+            journal.complete()
+        }
+        RecoveryDecision::Discard if status.discard_safe => journal.complete(),
+        RecoveryDecision::Accept => bail!(
+            "cannot accept transaction {id}: installed/missing or replacement state is incomplete"
+        ),
+        RecoveryDecision::Discard => bail!(
+            "cannot discard transaction {id}: package state shows that the transaction may have committed"
+        ),
+    }
+}
+
 pub(super) fn recover_pending<F>(database: &Path, mut package_present: F) -> Result<()>
 where
     F: FnMut(&str) -> bool,
@@ -258,15 +432,15 @@ where
         journal.path = path;
         match journal.stage {
             JournalStage::Prepared => {
-                if journal.transaction_packages.iter().any(|package| {
-                    !journal.previously_present.contains(package) && package_present(package)
-                }) {
+                let status = status_for_journal(&journal, &mut package_present);
+                if status.discard_safe {
+                    journal.complete()?;
+                } else {
                     bail!(
-                        "prepared package journal {} has an uncertain ALPM result",
+                        "prepared package journal {} has an uncertain ALPM result; run: catdot recover list",
                         journal.id
                     )
                 }
-                journal.complete()?;
             }
             JournalStage::AlpmCommitted | JournalStage::RecordsPrepared => {
                 if journal
@@ -373,7 +547,10 @@ fn sync_directory(directory: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PackageJournal, PreparedTransaction, PruneJournal, recover_pending};
+    use super::{
+        PackageJournal, PreparedTransaction, PruneJournal, RecoveryDecision, recover_pending,
+        recover_transaction, recovery_status,
+    };
     use catdot_core::{InstallReason, ManagedPackage, PackagePlan, SystemPackageState, UserRecord};
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -597,5 +774,145 @@ mod tests {
         let transitive = &journal.expected_packages().packages["transitive"];
         assert!(transitive.references.is_empty());
         assert!(transitive.introduced_by_transaction.is_some());
+    }
+
+    #[test]
+    fn explicit_recovery_accepts_only_a_fully_observed_install_transaction() {
+        let directory = tempdir().unwrap();
+        let database = directory.path();
+        let recovery_plan = PackagePlan {
+            install: vec!["dependency".into(), "transitive".into()],
+            remove: vec!["conflicting".into()],
+            replacements: vec![],
+            satisfied: vec![],
+        };
+        let mut expected = packages();
+        expected.packages.insert(
+            "transitive".into(),
+            ManagedPackage {
+                name: "transitive".into(),
+                catdot_installed: true,
+                was_missing_before_catdot: true,
+                install_reason: InstallReason::Dependency,
+                introduced_by_transaction: None,
+                references: vec![],
+            },
+        );
+        let journal = PackageJournal::prepared(
+            database,
+            &recovery_plan,
+            PreparedTransaction {
+                uid: 1000,
+                generation: 2,
+                direct_requirements: BTreeMap::new(),
+                transaction_packages: ["dependency".into(), "transitive".into()]
+                    .into_iter()
+                    .collect(),
+                previously_present: BTreeSet::new(),
+                expected_record: record(),
+                expected_packages: expected,
+            },
+        )
+        .unwrap();
+        let id = journal.id.clone();
+
+        let partial = recovery_status(database, &id, |name| name == "dependency").unwrap();
+        assert!(!partial.accept_safe);
+        assert!(!partial.discard_safe);
+        assert!(
+            recover_transaction(database, &id, RecoveryDecision::Accept, |name| {
+                name == "dependency"
+            })
+            .is_err()
+        );
+
+        let complete = recovery_status(database, &id, |name| {
+            matches!(name, "dependency" | "transitive")
+        })
+        .unwrap();
+        assert!(complete.accept_safe);
+        assert!(!complete.discard_safe);
+        recover_transaction(database, &id, RecoveryDecision::Accept, |name| {
+            matches!(name, "dependency" | "transitive")
+        })
+        .unwrap();
+        assert!(database.join("packages.toml").is_file());
+        assert!(database.join("users/1000.toml").is_file());
+        assert_eq!(
+            fs::read_dir(database.join("transactions")).unwrap().count(),
+            0
+        );
+    }
+
+    #[test]
+    fn explicit_recovery_discards_only_an_uncommitted_transaction() {
+        let directory = tempdir().unwrap();
+        let database = directory.path();
+        let recovery_plan = PackagePlan {
+            install: vec!["dependency".into()],
+            remove: vec!["conflicting".into()],
+            replacements: vec![],
+            satisfied: vec![],
+        };
+        let journal = PackageJournal::prepared(
+            database,
+            &recovery_plan,
+            PreparedTransaction {
+                uid: 1000,
+                generation: 2,
+                direct_requirements: BTreeMap::new(),
+                transaction_packages: ["dependency".into()].into_iter().collect(),
+                previously_present: BTreeSet::new(),
+                expected_record: record(),
+                expected_packages: packages(),
+            },
+        )
+        .unwrap();
+        let id = journal.id.clone();
+        let status = recovery_status(database, &id, |name| name == "conflicting").unwrap();
+        assert!(!status.accept_safe);
+        assert!(status.discard_safe);
+        recover_transaction(database, &id, RecoveryDecision::Discard, |name| {
+            name == "conflicting"
+        })
+        .unwrap();
+        assert!(!database.join("packages.toml").exists());
+        assert_eq!(
+            fs::read_dir(database.join("transactions")).unwrap().count(),
+            0
+        );
+    }
+
+    #[test]
+    fn automatic_recovery_refuses_a_partial_replacement_result() {
+        let directory = tempdir().unwrap();
+        let database = directory.path();
+        let replacement_plan = PackagePlan {
+            install: vec!["dependency".into()],
+            remove: vec!["conflicting".into()],
+            replacements: vec![],
+            satisfied: vec![],
+        };
+        PackageJournal::prepared(
+            database,
+            &replacement_plan,
+            PreparedTransaction {
+                uid: 1000,
+                generation: 2,
+                direct_requirements: BTreeMap::new(),
+                transaction_packages: ["dependency".into()].into_iter().collect(),
+                previously_present: BTreeSet::new(),
+                expected_record: record(),
+                expected_packages: packages(),
+            },
+        )
+        .unwrap();
+
+        let error = recover_pending(database, |_| false).unwrap_err();
+        assert!(error.to_string().contains("catdot recover list"));
+        assert_eq!(
+            fs::read_dir(database.join("transactions")).unwrap().count(),
+            1
+        );
     }
 }

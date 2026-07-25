@@ -106,6 +106,12 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Inspect and resolve uncertain package transaction journals.
+    #[command(about = "Recover an interrupted Catdot package transaction")]
+    Recover {
+        #[command(subcommand)]
+        command: RecoverCmd,
+    },
     /// Diagnose user configuration and privileged system records.
     #[command(about = "Diagnose user and system state")]
     Doctor,
@@ -114,6 +120,24 @@ enum Cmd {
     Users {
         #[command(subcommand)]
         command: UsersCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecoverCmd {
+    /// List package transactions that require an explicit decision.
+    List,
+    /// Accept the observed package result and commit Catdot records.
+    Accept {
+        transaction: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Discard an uncommitted transaction journal.
+    Discard {
+        transaction: String,
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -443,6 +467,43 @@ fn resolve_helper(
         package: preview,
         activation,
     }))
+}
+
+fn recovery_list() -> Result<String> {
+    let uid = unsafe { libc::geteuid() }.to_string();
+    let output = query_helper(
+        &["recovery-list", "--uid", &uid],
+        "helper could not inspect package recovery state",
+    )?;
+    String::from_utf8(output.stdout).context("recovery output is not valid UTF-8")
+}
+
+fn recover_helper(transaction: &str, accept: bool, yes: bool) -> Result<()> {
+    let report = recovery_list()?;
+    print!("{report}");
+    if !report.contains(&format!("transaction {transaction}")) {
+        bail!("unknown package transaction {transaction}")
+    }
+    confirm(yes)?;
+    let uid = unsafe { libc::geteuid() }.to_string();
+    let action = if accept {
+        "recovery-accept"
+    } else {
+        "recovery-discard"
+    };
+    let status = Command::new("pkexec")
+        .arg(MANAGE_HELPER)
+        .args([action, "--uid", &uid, "--transaction", transaction])
+        .status()
+        .context("start Catdot package recovery")?;
+    if !status.success() {
+        bail!("package recovery decision was rejected")
+    }
+    println!(
+        "Recovered package transaction {transaction} by {} its observed result.",
+        if accept { "accepting" } else { "discarding" }
+    );
+    Ok(())
 }
 
 fn prune_helper(dry_run: bool, yes: bool) -> Result<()> {
@@ -962,6 +1023,11 @@ pub fn run() -> Result<i32> {
             }
         }
         Cmd::Prune { dry_run, yes } => prune_helper(dry_run, yes)?,
+        Cmd::Recover { command } => match command {
+            RecoverCmd::List => print!("{}", recovery_list()?),
+            RecoverCmd::Accept { transaction, yes } => recover_helper(&transaction, true, yes)?,
+            RecoverCmd::Discard { transaction, yes } => recover_helper(&transaction, false, yes)?,
+        },
         Cmd::Doctor => {
             let mut warnings = false;
             let mut errors = state_read_broken;

@@ -1101,3 +1101,56 @@ fn doctor_reports_missing_active_dependencies_separately_from_desired() {
     assert!(stdout.contains("demo/old"));
     assert!(stdout.contains("missing-active-package"));
 }
+
+// Recovery must be reachable through the public CLI while preserving the
+// query/manage helper split. Listing is read-only; accepting a transaction is
+// explicit and goes through the privileged helper only after confirmation.
+#[test]
+fn recover_commands_use_the_correct_helper_modes() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let bin = root.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let calls = root.path().join("calls");
+    let pkexec = bin.join("pkexec");
+    fs::write(
+        &pkexec,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$2\" in\n  recovery-list) printf '%s\\n' 'transaction 1000-2-test' '  accept: safe' '  discard: unsafe' ;;\n  recovery-accept) exit 0 ;;\n  *) exit 1 ;;\nesac\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&pkexec, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let profile_root = root.path().join("profiles");
+    fs::create_dir_all(&profile_root).unwrap();
+    let list = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .args(["recover", "list"])
+        .env("CATDOT_PROFILE_ROOT", &profile_root)
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    assert!(String::from_utf8_lossy(&list.stdout).contains("transaction 1000-2-test"));
+    let accept = Command::new(env!("CARGO_BIN_EXE_catdot"))
+        .args(["recover", "accept", "1000-2-test", "--yes"])
+        .env("CATDOT_PROFILE_ROOT", &profile_root)
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    assert!(
+        accept.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accept.stderr)
+    );
+    let calls = fs::read_to_string(calls).unwrap();
+    assert!(calls.contains("catdot-query-helper recovery-list"));
+    assert!(calls.contains("catdot-helper recovery-accept"));
+    assert!(!home.path().join(".local/state/catdot/state.toml").exists());
+}

@@ -1,7 +1,9 @@
 use crate::backend::{
     hold_packages, open_handle, prepared_removal_plan, removable_with_alpm, remove_with_alpm,
 };
-use crate::system::{load_records, user_record_path, valid_records, write_system_file};
+use crate::system::{
+    ensure_system_database, load_records, user_record_path, valid_records, write_system_file,
+};
 use crate::{
     HelperMode,
     auth::{caller_uid, read_trusted_user_state, user_home},
@@ -14,7 +16,9 @@ use std::{fs, path::PathBuf};
 mod package_journal;
 mod resolve;
 
-use package_journal::{PruneJournal, recover_pending};
+use package_journal::{
+    PruneJournal, RecoveryDecision, recover_pending, recover_transaction, recovery_statuses,
+};
 
 pub(super) const DB: &str = "/var/lib/catdot";
 #[derive(Parser)]
@@ -68,6 +72,22 @@ enum Cmd {
         #[arg(long)]
         uid: u32,
     },
+    RecoveryList {
+        #[arg(long)]
+        uid: u32,
+    },
+    RecoveryAccept {
+        #[arg(long)]
+        uid: u32,
+        #[arg(long)]
+        transaction: String,
+    },
+    RecoveryDiscard {
+        #[arg(long)]
+        uid: u32,
+        #[arg(long)]
+        transaction: String,
+    },
     DoctorSystem {
         #[arg(long)]
         uid: u32,
@@ -105,6 +125,18 @@ pub fn run(mode: HelperMode) -> Result<()> {
         Cmd::UsersList { uid } => {
             require_root()?;
             users_list(caller_uid(uid)?)
+        }
+        Cmd::RecoveryList { uid } => {
+            require_root()?;
+            recovery_list(caller_uid(uid)?)
+        }
+        Cmd::RecoveryAccept { uid, transaction } => {
+            require_root()?;
+            recover_package_transaction(caller_uid(uid)?, &transaction, RecoveryDecision::Accept)
+        }
+        Cmd::RecoveryDiscard { uid, transaction } => {
+            require_root()?;
+            recover_package_transaction(caller_uid(uid)?, &transaction, RecoveryDecision::Discard)
         }
         Cmd::DoctorSystem { uid } => {
             require_root()?;
@@ -146,6 +178,7 @@ fn validate_mode(mode: HelperMode, command: &Cmd) -> Result<()> {
             | Cmd::PrunePlan { .. }
             | Cmd::UsersPrunePlan
             | Cmd::UsersList { .. }
+            | Cmd::RecoveryList { .. }
             | Cmd::DoctorSystem { .. }
     );
     match (mode, query) {
@@ -271,6 +304,79 @@ fn canonical_prune_plan(
         remove,
         replacements: vec![],
         satisfied: vec![],
+    })
+}
+
+fn recovery_list(_caller: u32) -> Result<()> {
+    let database = PathBuf::from(DB);
+    let handle = open_handle()?;
+    let statuses = recovery_statuses(&database, |name| handle.localdb().pkg(name).is_ok())?;
+    if statuses.is_empty() {
+        println!("No package recovery decisions pending.");
+        return Ok(());
+    }
+    for status in statuses {
+        println!("transaction {}", status.id);
+        println!("  uid: {}", status.uid);
+        println!("  generation: {}", status.generation);
+        if !status.metadata_complete {
+            println!("  metadata: incomplete (manual inspection required)");
+        }
+        println!(
+            "  accept: {}",
+            if status.accept_safe { "safe" } else { "unsafe" }
+        );
+        println!(
+            "  discard: {}",
+            if status.discard_safe {
+                "safe"
+            } else {
+                "unsafe"
+            }
+        );
+        if !status.installed.is_empty() {
+            println!(
+                "  installed: {}",
+                status.installed.into_iter().collect::<Vec<_>>().join(", ")
+            );
+        }
+        if !status.missing.is_empty() {
+            println!(
+                "  missing: {}",
+                status.missing.into_iter().collect::<Vec<_>>().join(", ")
+            );
+        }
+        if !status.removed.is_empty() {
+            println!(
+                "  removed: {}",
+                status.removed.into_iter().collect::<Vec<_>>().join(", ")
+            );
+        }
+        if !status.still_present.is_empty() {
+            println!(
+                "  still present: {}",
+                status
+                    .still_present
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn recover_package_transaction(
+    _caller: u32,
+    transaction: &str,
+    decision: RecoveryDecision,
+) -> Result<()> {
+    let database = PathBuf::from(DB);
+    ensure_system_database(&database)?;
+    let _lock = lock(&database.join("lock"))?;
+    let handle = open_handle()?;
+    recover_transaction(&database, transaction, decision, |name| {
+        handle.localdb().pkg(name).is_ok()
     })
 }
 
@@ -475,5 +581,15 @@ mod tests {
             state_path: PathBuf::from("/home/test/state.toml"),
         };
         assert!(validate_mode(HelperMode::Query, &resolve).is_ok());
+
+        let recovery_query = Cmd::RecoveryList { uid: 1000 };
+        let recovery_manage = Cmd::RecoveryAccept {
+            uid: 1000,
+            transaction: "1000-1-test".into(),
+        };
+        assert!(validate_mode(HelperMode::Query, &recovery_query).is_ok());
+        assert!(validate_mode(HelperMode::Manage, &recovery_manage).is_ok());
+        assert!(validate_mode(HelperMode::Manage, &recovery_query).is_err());
+        assert!(validate_mode(HelperMode::Query, &recovery_manage).is_err());
     }
 }
