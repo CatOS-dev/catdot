@@ -8,9 +8,11 @@ pub mod state;
 pub mod theme;
 
 pub use activation::{
-    ActivationJournal, LinkRegistry, LinkTransaction, activate_managed_link,
-    activation_transactions_path, deactivate_managed_link, lock, read_link_registry,
-    reconcile_managed_links, recover_activation_journals,
+    ActivationJournal, ActivationPlan, LinkRegistry, LinkTransaction, ManagedRegistry,
+    ManagedTarget, Materialization, PlannedTarget, activate_configuration, activate_managed_link,
+    activation_transactions_path, build_activation_plan, deactivate_managed_link, lock,
+    managed_targets_path, read_link_registry, read_managed_registry, reconcile_managed_links,
+    recover_activation_journals,
 };
 pub use error::{Error, Result};
 pub use manifest::{

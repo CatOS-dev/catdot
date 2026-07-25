@@ -1,7 +1,12 @@
 use crate::{Error, Result, UserState, atomic_write, read_state, write_state};
 use serde::{Deserialize, Serialize};
 use std::{
+    ffi::OsString,
     fs,
+    os::unix::{
+        ffi::{OsStrExt, OsStringExt},
+        fs::{PermissionsExt, symlink},
+    },
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -9,8 +14,17 @@ use std::{
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 enum Snapshot {
     Missing,
-    File { contents: Vec<u8> },
-    Symlink { target: PathBuf },
+    File {
+        contents: Vec<u8>,
+        mode: u32,
+    },
+    Symlink {
+        target: PathBuf,
+    },
+    Directory {
+        mode: u32,
+        children: Vec<(Vec<u8>, Snapshot)>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,17 +33,16 @@ struct JournalFile {
     previous: Snapshot,
     expected: Snapshot,
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 enum JournalStage {
     Prepared,
     Applying,
     StateWritten,
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivationJournal {
     id: String,
+    created_at: u64,
     state_path: PathBuf,
     old_active_state: UserState,
     new_active_state: UserState,
@@ -38,29 +51,27 @@ pub struct ActivationJournal {
     #[serde(skip)]
     path: PathBuf,
 }
-
 pub fn activation_transactions_path(state_path: &Path) -> Result<PathBuf> {
-    let parent = state_path
+    Ok(state_path
         .parent()
-        .ok_or_else(|| Error::Message("state path has no parent".into()))?;
-    Ok(parent.join("transactions"))
+        .ok_or_else(|| Error::Message("state path has no parent".into()))?
+        .join("transactions"))
 }
-
 impl ActivationJournal {
     pub fn begin(
         state_path: &Path,
         old_active_state: UserState,
         new_active_state: UserState,
     ) -> Result<Self> {
-        let directory = activation_transactions_path(state_path)?;
-        let stamp = SystemTime::now()
+        let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|error| Error::Message(error.to_string()))?
-            .as_nanos();
-        let id = format!("{}-{stamp}", std::process::id());
-        let path = directory.join(format!("{id}.toml"));
+            .map_err(|e| Error::Message(e.to_string()))?
+            .as_nanos() as u64;
+        let id = format!("{created_at}-{}", std::process::id());
+        let path = activation_transactions_path(state_path)?.join(format!("{id}.toml"));
         let journal = Self {
             id,
+            created_at,
             state_path: state_path.to_owned(),
             old_active_state,
             new_active_state,
@@ -71,60 +82,93 @@ impl ActivationJournal {
         journal.persist()?;
         Ok(journal)
     }
-
-    pub fn track_file(&mut self, path: &Path, expected_contents: &[u8]) -> Result<()> {
+    pub fn track_path(&mut self, path: &Path) -> Result<()> {
+        self.track(path, snapshot(path)?)
+    }
+    pub fn track_file(&mut self, path: &Path, expected: &[u8]) -> Result<()> {
         self.track(
             path,
             Snapshot::File {
-                contents: expected_contents.to_vec(),
+                contents: expected.to_vec(),
+                mode: 0o644,
             },
         )
     }
-
-    pub fn track_symlink(&mut self, path: &Path, expected_target: &Path) -> Result<()> {
+    pub fn track_symlink(&mut self, path: &Path, expected: &Path) -> Result<()> {
         self.track(
             path,
             Snapshot::Symlink {
-                target: expected_target.to_owned(),
+                target: expected.to_owned(),
             },
         )
     }
-
     pub fn track_removal(&mut self, path: &Path) -> Result<()> {
         self.track(path, Snapshot::Missing)
     }
-
     pub fn mark_applying(&mut self) -> Result<()> {
         self.stage = JournalStage::Applying;
         self.persist()
     }
-
     pub fn mark_state_written(&mut self) -> Result<()> {
         self.stage = JournalStage::StateWritten;
         self.persist()
     }
-
+    pub fn mark_applied(&mut self) -> Result<()> {
+        for file in &mut self.files {
+            file.expected = snapshot(&file.path)?;
+        }
+        self.persist()
+    }
     pub fn complete(self) -> Result<()> {
+        self.archive_backup()?;
         fs::remove_file(&self.path).map_err(|source| Error::Io {
             path: self.path.display().to_string(),
             source,
-        })?;
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| Error::Message("activation journal has no parent".into()))?;
-        fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|source| Error::Io {
-                path: parent.display().to_string(),
-                source,
-            })
+        })
     }
-
-    fn track(&mut self, path: &Path, expected: Snapshot) -> Result<()> {
-        if self.files.iter().any(|file| file.path == path) {
-            return Ok(());
+    fn archive_backup(&self) -> Result<()> {
+        let catdot = self
+            .state_path
+            .parent()
+            .ok_or_else(|| Error::Message("state path has no parent".into()))?;
+        let home = catdot.ancestors().nth(3).unwrap_or(catdot);
+        let backup = catdot.join("backups").join(&self.id);
+        let backup_home = backup.join("home");
+        for file in &self.files {
+            if let Ok(relative) = file.path.strip_prefix(home) {
+                restore(&backup_home.join(relative), &file.previous)?;
+            }
         }
+        atomic_write(
+            &backup.join("metadata.toml"),
+            &toml::to_string_pretty(self).map_err(|e| Error::Message(e.to_string()))?,
+        )?;
+        let mut generations: Vec<_> = fs::read_dir(catdot.join("backups"))
+            .map_err(|source| Error::Io {
+                path: backup.display().to_string(),
+                source,
+            })?
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let path = entry.path();
+                let metadata = fs::read_to_string(path.join("metadata.toml")).ok()?;
+                let journal: ActivationJournal = toml::from_str(&metadata).ok()?;
+                Some((journal.created_at, entry))
+            })
+            .collect();
+        generations.sort_by_key(|(created_at, _)| *created_at);
+        for (_, entry) in generations.into_iter().rev().skip(5) {
+            fs::remove_dir_all(entry.path()).map_err(|source| Error::Io {
+                path: entry.path().display().to_string(),
+                source,
+            })?;
+        }
+        Ok(())
+    }
+    fn track(&mut self, path: &Path, expected: Snapshot) -> Result<()> {
+        if self.files.iter().any(|f| f.path == path) {
+            return Ok(());
+        };
         self.files.push(JournalFile {
             path: path.to_owned(),
             previous: snapshot(path)?,
@@ -132,15 +176,13 @@ impl ActivationJournal {
         });
         self.persist()
     }
-
     fn persist(&self) -> Result<()> {
         atomic_write(
             &self.path,
-            &toml::to_string_pretty(self).map_err(|error| Error::Message(error.to_string()))?,
+            &toml::to_string_pretty(self).map_err(|e| Error::Message(e.to_string()))?,
         )
     }
 }
-
 pub fn recover_activation_journals(state_path: &Path) -> Result<()> {
     let directory = activation_transactions_path(state_path)?;
     if !directory.exists() {
@@ -156,103 +198,163 @@ pub fn recover_activation_journals(state_path: &Path) -> Result<()> {
                 source,
             })?
             .path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
+        if path.extension().and_then(|x| x.to_str()) != Some("toml") {
             continue;
         }
-        let contents = fs::read_to_string(&path).map_err(|source| Error::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
         let mut journal: ActivationJournal =
-            toml::from_str(&contents).map_err(|source| Error::Toml {
+            toml::from_str(&fs::read_to_string(&path).map_err(|source| Error::Io {
+                path: path.display().to_string(),
+                source,
+            })?)
+            .map_err(|source| Error::Toml {
                 path: path.display().to_string(),
                 source,
             })?;
         if journal.state_path != state_path {
-            return Err(Error::Message(format!(
-                "activation journal {} belongs to another state file",
-                path.display()
-            )));
-        }
+            return Err(Error::Message(
+                "activation journal belongs to another state file".into(),
+            ));
+        };
         journal.path = path;
         recover(&journal)?;
     }
     Ok(())
 }
-
-fn recover(journal: &ActivationJournal) -> Result<()> {
-    let current = read_state(&journal.state_path)?;
-    if current != journal.old_active_state && current != journal.new_active_state {
+fn recover(j: &ActivationJournal) -> Result<()> {
+    let current = read_state(&j.state_path)?;
+    if j.stage == JournalStage::StateWritten && current == j.new_active_state {
+        return j.clone().complete();
+    }
+    if current != j.old_active_state && current != j.new_active_state {
         return Err(Error::Message(
             "activation state was changed outside the journal".into(),
         ));
     }
-    if journal.stage == JournalStage::StateWritten && current == journal.new_active_state {
-        return journal.clone().complete();
-    }
-    for file in &journal.files {
+    for file in &j.files {
         let current = snapshot(&file.path)?;
         if current != file.previous && current != file.expected {
             return Err(Error::Message(format!(
-                "refusing to recover manually changed activation target {}",
+                "refusing to recover changed activation target {}",
                 file.path.display()
             )));
         }
     }
-    for file in journal.files.iter().rev() {
-        restore(&file.path, &file.previous)?;
+    for file in j.files.iter().rev() {
+        restore(&file.path, &file.previous)?
     }
-    write_state(&journal.state_path, &journal.old_active_state)?;
-    journal.clone().complete()
+    write_state(&j.state_path, &j.old_active_state)?;
+    j.clone().complete()
 }
-
 fn snapshot(path: &Path) -> Result<Snapshot> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Ok(Snapshot::Symlink {
+        Ok(m) if m.file_type().is_symlink() => Ok(Snapshot::Symlink {
             target: fs::read_link(path).map_err(|source| Error::Io {
                 path: path.display().to_string(),
                 source,
             })?,
         }),
-        Ok(metadata) if metadata.is_file() => Ok(Snapshot::File {
+        Ok(m) if m.is_file() => Ok(Snapshot::File {
             contents: fs::read(path).map_err(|source| Error::Io {
                 path: path.display().to_string(),
                 source,
             })?,
+            mode: m.permissions().mode(),
         }),
+        Ok(m) if m.is_dir() => {
+            let mut children = vec![];
+            for e in fs::read_dir(path).map_err(|source| Error::Io {
+                path: path.display().to_string(),
+                source,
+            })? {
+                let e = e.map_err(|source| Error::Io {
+                    path: path.display().to_string(),
+                    source,
+                })?;
+                children.push((e.file_name().as_bytes().to_vec(), snapshot(&e.path())?));
+            }
+            Ok(Snapshot::Directory {
+                mode: m.permissions().mode(),
+                children,
+            })
+        }
         Ok(_) => Err(Error::Message(format!(
             "unsupported activation target {}",
             path.display()
         ))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Snapshot::Missing),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Snapshot::Missing),
         Err(source) => Err(Error::Io {
             path: path.display().to_string(),
             source,
         }),
     }
 }
-
-fn restore(path: &Path, snapshot: &Snapshot) -> Result<()> {
-    if fs::symlink_metadata(path).is_ok() {
-        fs::remove_file(path).map_err(|source| Error::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
-    }
-    match snapshot {
+fn restore(path: &Path, s: &Snapshot) -> Result<()> {
+    remove(path)?;
+    match s {
         Snapshot::Missing => Ok(()),
-        Snapshot::File { contents } => atomic_write(path, &String::from_utf8_lossy(contents)),
-        Snapshot::Symlink { target } => {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|source| Error::Io {
-                    path: parent.display().to_string(),
+        Snapshot::File { contents, mode } => {
+            if let Some(p) = path.parent() {
+                fs::create_dir_all(p).map_err(|source| Error::Io {
+                    path: p.display().to_string(),
                     source,
-                })?;
-            }
-            std::os::unix::fs::symlink(target, path).map_err(|source| Error::Io {
+                })?
+            };
+            fs::write(path, contents).map_err(|source| Error::Io {
+                path: path.display().to_string(),
+                source,
+            })?;
+            fs::set_permissions(path, fs::Permissions::from_mode(*mode)).map_err(|source| {
+                Error::Io {
+                    path: path.display().to_string(),
+                    source,
+                }
+            })
+        }
+        Snapshot::Symlink { target } => {
+            if let Some(p) = path.parent() {
+                fs::create_dir_all(p).map_err(|source| Error::Io {
+                    path: p.display().to_string(),
+                    source,
+                })?
+            };
+            symlink(target, path).map_err(|source| Error::Io {
                 path: path.display().to_string(),
                 source,
             })
         }
+        Snapshot::Directory { mode, children } => {
+            fs::create_dir_all(path).map_err(|source| Error::Io {
+                path: path.display().to_string(),
+                source,
+            })?;
+            for (name, child) in children {
+                restore(&path.join(OsString::from_vec(name.clone())), child)?
+            }
+            fs::set_permissions(path, fs::Permissions::from_mode(*mode)).map_err(|source| {
+                Error::Io {
+                    path: path.display().to_string(),
+                    source,
+                }
+            })
+        }
+    }
+}
+fn remove(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {
+            fs::remove_dir_all(path).map_err(|source| Error::Io {
+                path: path.display().to_string(),
+                source,
+            })
+        }
+        Ok(_) => fs::remove_file(path).map_err(|source| Error::Io {
+            path: path.display().to_string(),
+            source,
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(Error::Io {
+            path: path.display().to_string(),
+            source,
+        }),
     }
 }

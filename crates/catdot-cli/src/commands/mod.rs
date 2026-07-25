@@ -648,7 +648,10 @@ pub fn run() -> Result<i32> {
                         recover_activation_journals(&path)?;
                         return Err(error);
                     }
-                    write_state(&path, &new_state)?;
+                    if let Err(error) = write_state(&path, &new_state) {
+                        recover_activation_journals(&path)?;
+                        return Err(error.into());
+                    }
                     journal.mark_state_written()?;
                     journal.complete()?;
                     state = new_state;
@@ -716,14 +719,22 @@ pub fn run() -> Result<i32> {
                 );
                 warnings = true;
             }
-            for (target, source) in read_link_registry(&managed_links_path(&path)?)?.entries {
-                let matches = std::fs::symlink_metadata(&target)
-                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
-                    && std::fs::read_link(&target)
-                        .ok()
-                        .is_some_and(|actual| actual == std::path::Path::new(&source));
+            for (target, managed) in read_managed_registry(&managed_targets_path(&path)?)?.entries {
+                let metadata = std::fs::symlink_metadata(&target).ok();
+                let matches = match managed.lifecycle.as_str() {
+                    "overwrite/symlink" => {
+                        metadata.is_some_and(|metadata| metadata.file_type().is_symlink())
+                            && managed.source.as_ref().is_some_and(|source| {
+                                std::fs::read_link(&target).ok().as_ref() == Some(source)
+                            })
+                    }
+                    "generate" | "overwrite/file" => {
+                        metadata.is_some_and(|metadata| !metadata.file_type().is_symlink())
+                    }
+                    _ => false,
+                };
                 if !matches {
-                    println!("warning: changed or missing managed link: {target}");
+                    println!("warning: missing or damaged managed target: {target}");
                     warnings = true;
                 }
             }

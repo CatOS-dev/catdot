@@ -1,6 +1,27 @@
-use catdot_core::{discover_profiles, initialize_state_from_default, read_state};
+use catdot_core::{
+    ActivationJournal, UserState, activate_configuration, build_activation_plan, discover_profiles,
+    initialize_state_from_default, read_state, recover_activation_journals, select_profile,
+    write_state,
+};
 use std::fs;
 use tempfile::tempdir;
+
+fn apply_configuration(
+    plan: &catdot_core::ActivationPlan,
+    registry: &std::path::Path,
+    home: &std::path::Path,
+) -> catdot_core::Result<()> {
+    let state = home.join(".local/state/catdot/state.toml");
+    let mut journal = ActivationJournal::begin(&state, Default::default(), Default::default())?;
+    journal.mark_applying()?;
+    let result = activate_configuration(plan, registry, &mut journal);
+    if result.is_err() {
+        recover_activation_journals(&state)?;
+    } else {
+        journal.complete()?;
+    }
+    result
+}
 
 fn profile(source_root: &str, inline: &str, files: &str, defaults: &str) -> String {
     format!(
@@ -265,6 +286,526 @@ fn skel_default_initializes_desired_state_without_active_state() {
         !source.exists(),
         "initialization must not materialize or install"
     );
+}
+
+// Protects a real application entry point: templates and adapters must create
+// regular HOME files, while static profile fragments remain top-level links.
+// The old link-only activation path could not generate either entry point.
+#[test]
+fn materialization_generates_entries_and_links_static_fragments() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    let source = temp.path().join("share/demo");
+    fs::create_dir_all(source.join(".config/niri")).unwrap();
+    fs::write(source.join(".config/niri/default.kdl"), "layout {}").unwrap();
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        profile(
+            &source.display().to_string(),
+            r#"[[components]]
+id = "niri"
+role = "desktop"
+[[components.configuration]]
+target = ".config/niri/config.kdl"
+lifecycle = "generate"
+template = "include \"default.kdl\"\ninclude \"custom/config.kdl\"\n"
+[[components.configuration]]
+target = ".config/niri/default.kdl"
+lifecycle = "overwrite"
+mode = "symlink"
+source = ".config/niri/default.kdl"
+"#,
+            "",
+            "desktop = \"niri\"\n",
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    let home = temp.path().join("home");
+    let registry = home.join(".local/state/catdot/managed.toml");
+    let plan = build_activation_plan(&profiles, &state, &home, &registry).unwrap();
+    apply_configuration(&plan, &registry, &home).unwrap();
+    assert_eq!(
+        fs::read_to_string(home.join(".config/niri/config.kdl")).unwrap(),
+        "include \"default.kdl\"\ninclude \"custom/config.kdl\"\n"
+    );
+    assert_eq!(
+        fs::read_link(home.join(".config/niri/default.kdl")).unwrap(),
+        source.join(".config/niri/default.kdl")
+    );
+}
+
+// Protects Niri's native include entry point without executing shell text:
+// the named adapter must generate HOME-relative includes only.
+#[test]
+fn materialization_generates_niri_include_adapter() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    let source = temp.path().join("share/demo");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        profile(
+            &source.display().to_string(),
+            r#"[[components]]
+id = "niri"
+role = "desktop"
+[[components.configuration]]
+target = ".config/niri/config.kdl"
+lifecycle = "generate"
+adapter = "niri-includes"
+"#,
+            "",
+            "desktop = \"niri\"\n",
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    let home = temp.path().join("home");
+    let registry = home.join(".local/state/catdot/managed.toml");
+    let plan = build_activation_plan(&profiles, &state, &home, &registry).unwrap();
+    apply_configuration(&plan, &registry, &home).unwrap();
+    let generated = fs::read_to_string(home.join(".config/niri/config.kdl")).unwrap();
+    assert!(generated.contains("include \"default.kdl\""));
+    assert!(generated.contains("include \"custom/config.kdl\""));
+    assert!(!generated.contains("/usr/share"));
+}
+
+// Protects applications whose prior config target is a non-empty directory:
+// staged generation replaces it through Linux's atomic exchange path.
+#[test]
+fn materialization_replaces_existing_nonempty_directory_with_generate() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    let source = temp.path().join("share/demo");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        profile(
+            &source.display().to_string(),
+            r#"[[components]]
+id = "app"
+role = "app"
+[[components.configuration]]
+target = ".config/app/config"
+lifecycle = "generate"
+template = "generated"
+"#,
+            "",
+            "app = \"app\"\n",
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    let home = temp.path().join("home");
+    let old = home.join(".config/app/config");
+    fs::create_dir_all(old.join("nested")).unwrap();
+    fs::write(old.join("nested/old"), "old").unwrap();
+    let registry = home.join(".local/state/catdot/managed.toml");
+    let plan = build_activation_plan(&profiles, &state, &home, &registry).unwrap();
+    apply_configuration(&plan, &registry, &home).unwrap();
+    assert_eq!(fs::read_to_string(old).unwrap(), "generated");
+}
+
+// Protects planner-time ownership validation: an on-disk parent symlink may
+// not hide a child target that Catdot would otherwise write through.
+#[test]
+fn materialization_rejects_existing_symlink_parent_before_writing_child() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    let source = temp.path().join("share/demo");
+    fs::create_dir_all(source.join(".config/app")).unwrap();
+    fs::write(source.join(".config/app/config"), "managed").unwrap();
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        profile(
+            &source.display().to_string(),
+            r#"[[components]]
+id = "app"
+role = "app"
+[[components.configuration]]
+target = ".config/app/config"
+lifecycle = "overwrite"
+mode = "file"
+source = ".config/app/config"
+"#,
+            "",
+            "app = \"app\"\n",
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    std::os::unix::fs::symlink(temp.path().join("outside"), home.join(".config")).unwrap();
+    let registry = home.join(".local/state/catdot/managed.toml");
+    assert!(build_activation_plan(&profiles, &state, &home, &registry).is_err());
+}
+
+// Protects writable generated resources and application-owned custom areas.
+// The former single-file link manager followed neither binary data nor a
+// one-time seed rule, so a normal reapply could overwrite user work.
+#[test]
+fn materialization_copies_binary_trees_preserves_mode_and_seeds_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    let source = temp.path().join("share/demo");
+    fs::create_dir_all(source.join(".config/app/runtime/empty")).unwrap();
+    let binary = source.join(".config/app/runtime/theme.bin");
+    fs::write(&binary, [0_u8, 255, 17]).unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o751)).unwrap();
+    fs::create_dir_all(source.join(".config/app/custom")).unwrap();
+    fs::write(source.join(".config/app/custom/config"), "seed").unwrap();
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        profile(
+            &source.display().to_string(),
+            r#"[[components]]
+id = "app"
+role = "app"
+[[components.configuration]]
+target = ".config/app/runtime"
+lifecycle = "overwrite"
+mode = "file"
+source = ".config/app/runtime"
+[[components.configuration]]
+target = ".config/app/custom"
+lifecycle = "user"
+seed = ".config/app/custom"
+"#,
+            "",
+            "app = \"app\"\n",
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    let home = temp.path().join("home");
+    let registry = home.join(".local/state/catdot/managed.toml");
+    let plan = build_activation_plan(&profiles, &state, &home, &registry).unwrap();
+    apply_configuration(&plan, &registry, &home).unwrap();
+    let target = home.join(".config/app/runtime/theme.bin");
+    assert_eq!(fs::read(target).unwrap(), [0_u8, 255, 17]);
+    assert_eq!(
+        fs::metadata(home.join(".config/app/runtime/theme.bin"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o751
+    );
+    fs::write(home.join(".config/app/custom/config"), "mine").unwrap();
+    apply_configuration(&plan, &registry, &home).unwrap();
+    assert_eq!(
+        fs::read_to_string(home.join(".config/app/custom/config")).unwrap(),
+        "mine"
+    );
+}
+
+// Protects first-login custom ownership: if a later managed resource fails,
+// a newly seeded custom tree must not survive as a half-applied profile.
+#[test]
+fn materialization_rolls_back_new_user_seed_after_later_failure() {
+    use std::os::unix::ffi::OsStrExt;
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    let source = temp.path().join("share/demo");
+    fs::create_dir_all(source.join(".config/app/custom")).unwrap();
+    fs::write(source.join(".config/app/custom/config"), "seed").unwrap();
+    let bad = source.join(".config/app/bad");
+    let bad_c = std::ffi::CString::new(bad.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(bad_c.as_ptr(), 0o600) }, 0);
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        profile(
+            &source.display().to_string(),
+            r#"[[components]]
+id = "app"
+role = "app"
+[[components.configuration]]
+target = ".config/app/custom"
+lifecycle = "user"
+seed = ".config/app/custom"
+[[components.configuration]]
+target = ".config/app/bad"
+lifecycle = "overwrite"
+mode = "file"
+source = ".config/app/bad"
+"#,
+            "",
+            "app = \"app\"\n",
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    let home = temp.path().join("home");
+    let registry = home.join(".local/state/catdot/managed.toml");
+    let plan = build_activation_plan(&profiles, &state, &home, &registry).unwrap();
+    assert!(apply_configuration(&plan, &registry, &home).is_err());
+    assert!(!home.join(".config/app/custom").exists());
+}
+
+// Protects profile switching: an incomplete materialization must restore a
+// replaced file and leave no partial tree. Old journals only supported UTF-8
+// regular files and symlinks.
+#[test]
+fn materialization_rolls_back_binary_target_after_later_failure() {
+    use std::os::unix::ffi::OsStrExt;
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    let source = temp.path().join("share/demo");
+    fs::create_dir_all(source.join(".config/app")).unwrap();
+    fs::write(source.join(".config/app/good"), [3_u8, 2, 1]).unwrap();
+    let unsupported = source.join(".config/app/unsupported");
+    let unsupported_c = std::ffi::CString::new(unsupported.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(unsupported_c.as_ptr(), 0o600) }, 0);
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        profile(
+            &source.display().to_string(),
+            r#"[[components]]
+id = "app"
+role = "app"
+[[components.configuration]]
+target = ".config/app/good"
+lifecycle = "overwrite"
+mode = "file"
+source = ".config/app/good"
+[[components.configuration]]
+target = ".config/app/unsupported"
+lifecycle = "overwrite"
+mode = "file"
+source = ".config/app/unsupported"
+"#,
+            "",
+            "app = \"app\"\n",
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    let home = temp.path().join("home");
+    let old = home.join(".config/app/good");
+    fs::create_dir_all(old.parent().unwrap()).unwrap();
+    fs::write(&old, [9_u8, 8, 7]).unwrap();
+    let registry = home.join(".local/state/catdot/managed.toml");
+    let plan = build_activation_plan(&profiles, &state, &home, &registry).unwrap();
+    assert!(apply_configuration(&plan, &registry, &home).is_err());
+    assert_eq!(fs::read(old).unwrap(), [9_u8, 8, 7]);
+}
+
+// Protects user custom areas from an owning directory link or recursive copy.
+// Such a plan would make a later normal apply overwrite a user's custom file.
+#[test]
+fn materialization_rejects_parent_and_user_child_conflicts_before_writing_home() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    let source = temp.path().join("share/demo");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        profile(
+            &source.display().to_string(),
+            r#"[[components]]
+id = "one"
+role = "one"
+[[components.configuration]]
+target = ".config/app"
+lifecycle = "overwrite"
+mode = "symlink"
+source = ".config/app"
+[[components]]
+id = "two"
+role = "two"
+[[components.configuration]]
+target = ".config/app/custom"
+lifecycle = "user"
+"#,
+            "",
+            "one = \"one\"\ntwo = \"two\"\n",
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    let home = temp.path().join("home");
+    let registry = home.join(".local/state/catdot/managed.toml");
+    assert!(build_activation_plan(&profiles, &state, &home, &registry).is_err());
+    assert!(!home.exists());
+}
+
+// Protects the single-owner rule: two active components cannot silently race
+// to replace one application file during activation.
+#[test]
+fn materialization_rejects_duplicate_component_targets_before_writing_home() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    let source = temp.path().join("share/demo");
+    fs::create_dir_all(source.join(".config/app")).unwrap();
+    fs::write(source.join(".config/app/one"), "one").unwrap();
+    fs::write(source.join(".config/app/two"), "two").unwrap();
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        profile(
+            &source.display().to_string(),
+            r#"[[components]]
+id = "one"
+role = "one"
+[[components.configuration]]
+target = ".config/app/config"
+lifecycle = "overwrite"
+mode = "file"
+source = ".config/app/one"
+[[components]]
+id = "two"
+role = "two"
+[[components.configuration]]
+target = ".config/app/config"
+lifecycle = "overwrite"
+mode = "file"
+source = ".config/app/two"
+"#,
+            "",
+            "one = \"one\"\ntwo = \"two\"\n",
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let state = select_profile(&profiles["demo"]).unwrap();
+    let home = temp.path().join("home");
+    let registry = home.join(".local/state/catdot/managed.toml");
+    assert!(build_activation_plan(&profiles, &state, &home, &registry).is_err());
+    assert!(!home.exists());
+}
+
+// Protects a component switch from leaving executable stale fragments behind.
+// The former link registry was limited to links and could not remove a copied
+// managed file when the next active component no longer owns that target.
+#[test]
+fn materialization_removes_old_managed_target_on_component_switch() {
+    let temp = tempdir().unwrap();
+    let metadata = temp.path().join("profiles/demo");
+    let source = temp.path().join("share/demo");
+    fs::create_dir_all(source.join(".config/one")).unwrap();
+    fs::write(source.join(".config/one/config"), "old").unwrap();
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("profile.toml"),
+        profile(
+            &source.display().to_string(),
+            r#"[[components]]
+id = "one"
+role = "tool"
+[[components.configuration]]
+target = ".config/one/config"
+lifecycle = "overwrite"
+mode = "file"
+source = ".config/one/config"
+[[components]]
+id = "two"
+role = "tool"
+"#,
+            "",
+            "tool = \"one\"\n",
+        ),
+    )
+    .unwrap();
+    let profiles = discover_profiles(&temp.path().join("profiles")).unwrap();
+    let home = temp.path().join("home");
+    let registry = home.join(".local/state/catdot/managed.toml");
+    let mut state = select_profile(&profiles["demo"]).unwrap();
+    let first = build_activation_plan(&profiles, &state, &home, &registry).unwrap();
+    apply_configuration(&first, &registry, &home).unwrap();
+    state.components.insert("tool".into(), "demo/two".into());
+    let second = build_activation_plan(&profiles, &state, &home, &registry).unwrap();
+    apply_configuration(&second, &registry, &home).unwrap();
+    assert!(!home.join(".config/one/config").exists());
+}
+
+// Protects the outer desired/active transaction: a later state-write failure
+// must restore an entire prior tree, including empty directories, modes and a
+// symlink itself rather than the symlink target's contents.
+#[test]
+fn activation_journal_restores_binary_directory_symlink_and_modes() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let temp = tempdir().unwrap();
+    let state = temp.path().join("state.toml");
+    let target = temp.path().join("home/.config/app");
+    fs::create_dir_all(target.join("empty")).unwrap();
+    fs::write(target.join("bin"), [0_u8, 7, 255]).unwrap();
+    fs::set_permissions(target.join("bin"), fs::Permissions::from_mode(0o751)).unwrap();
+    symlink("bin", target.join("current")).unwrap();
+    let mut journal =
+        ActivationJournal::begin(&state, Default::default(), Default::default()).unwrap();
+    journal.track_path(&target).unwrap();
+    journal.mark_applying().unwrap();
+    fs::remove_dir_all(&target).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("changed"), "broken").unwrap();
+    journal.mark_applied().unwrap();
+    drop(journal);
+    recover_activation_journals(&state).unwrap();
+    assert_eq!(fs::read(target.join("bin")).unwrap(), [0_u8, 7, 255]);
+    assert_eq!(
+        fs::metadata(target.join("bin"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o751
+    );
+    assert!(target.join("empty").is_dir());
+    assert_eq!(
+        fs::read_link(target.join("current")).unwrap(),
+        std::path::Path::new("bin")
+    );
+    let backups = temp.path().join("backups");
+    let generation = fs::read_dir(&backups)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(generation.join("metadata.toml").is_file());
+    assert_eq!(
+        fs::read(generation.join("home/home/.config/app/bin")).unwrap(),
+        [0_u8, 7, 255]
+    );
+}
+
+// Protects a concurrent desired-state update: recovery must refuse to replace
+// a third state value that was not written by the activation transaction.
+#[test]
+fn activation_recovery_refuses_externally_changed_state() {
+    let temp = tempdir().unwrap();
+    let state = temp.path().join("state.toml");
+    let old = UserState {
+        generation: 1,
+        ..Default::default()
+    };
+    let mut new = old.clone();
+    new.generation = 2;
+    write_state(&state, &old).unwrap();
+    let mut journal = ActivationJournal::begin(&state, old.clone(), new).unwrap();
+    journal.mark_applying().unwrap();
+    let mut external = old.clone();
+    external.generation = 3;
+    write_state(&state, &external).unwrap();
+    drop(journal);
+    assert!(recover_activation_journals(&state).is_err());
+    assert_eq!(read_state(&state).unwrap().generation, 3);
 }
 
 // Desktop overrides select desired providers only; they never activate one.

@@ -88,35 +88,18 @@ pub(super) fn apply(
     profiles: &std::collections::BTreeMap<String, Profile>,
     state: &UserState,
     adopt: Option<&str>,
-    mut journal: Option<&mut ActivationJournal>,
+    journal: Option<&mut ActivationJournal>,
 ) -> Result<()> {
     let home = home()?;
-    let registry = managed_links_path(&state_file()?)?;
+    let registry = managed_targets_path(&state_file()?)?;
     let xdg = xdg_config_home(&home);
-    if !xdg.exists() {
-        std::fs::create_dir_all(&xdg)?;
-    }
-    let mut links = LinkTransaction::new(&registry)?;
-    links.confine_targets_to(&[home.clone(), xdg.clone()])?;
     if adopt.is_some() {
         bail!("adopt is unavailable for lifecycle-managed profiles");
     }
-    links.reconcile();
-    let desired = desired_links(profiles, state, &home, None)?;
-    for (target, source) in desired {
-        if let Some(journal) = &mut journal {
-            journal.track_symlink(&target, &source.canonicalize()?)?;
-        }
-        if let Err(error) = links.stage(&source, &target, false) {
-            return Err(error.into());
-        }
-    }
-    if let Some(journal) = &mut journal {
-        for target in links.planned_removals()? {
-            journal.track_removal(&target)?;
-        }
-        journal.track_file(&registry, links.expected_registry_contents()?.as_bytes())?;
-    }
+    let plan = build_activation_plan(profiles, state, &home, &registry)?;
+    let journal =
+        journal.ok_or_else(|| anyhow::anyhow!("activation requires a transaction journal"))?;
+    activate_configuration(&plan, &registry, journal)?;
     for role in state.components.keys() {
         let (_profile, component, _) = component_for(profiles, state, role)?;
         if component
@@ -129,21 +112,17 @@ pub(super) fn apply(
         if component.backend.is_some() {
             let desktop = env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
             let plasma = desktop.contains("KDE") || desktop.contains("Plasma");
-            if let Some(journal) = &mut journal {
+            {
                 for (path, contents) in theme_expected_files(component, &xdg, plasma)? {
                     journal.track_file(&path, &contents)?;
                 }
             }
             if let Err(error) = apply_theme(component, &xdg, plasma) {
-                let _ = links.rollback();
                 return Err(error.into());
             }
         }
     }
-    if let Err(error) = links.commit() {
-        let _ = links.rollback();
-        return Err(error.into());
-    }
+    journal.mark_applied()?;
     Ok(())
 }
 
@@ -162,44 +141,6 @@ pub(super) fn sync_active_settings(
         }
     }
     Ok(())
-}
-
-fn desired_links(
-    profiles: &std::collections::BTreeMap<String, Profile>,
-    state: &UserState,
-    home: &std::path::Path,
-    excluded_role: Option<&str>,
-) -> Result<Vec<(PathBuf, PathBuf)>> {
-    let mut desired = Vec::new();
-    for (role, reference) in &state.components {
-        if excluded_role == Some(role.as_str()) {
-            continue;
-        }
-        let (profile, component, _) = component_for(profiles, state, role)?;
-        if component
-            .packages
-            .iter()
-            .any(|package| !package_present(package))
-        {
-            continue;
-        }
-        for entry in &component.configuration {
-            if entry.lifecycle != Lifecycle::Overwrite(OverwriteMode::Symlink) {
-                continue;
-            }
-            let source = profile
-                .source_root
-                .join(entry.source.as_ref().expect("validated source"));
-            if !source.is_file() {
-                bail!(
-                    "{reference}: configuration source {} does not exist",
-                    source.display()
-                );
-            }
-            desired.push((home.join(&entry.target), source));
-        }
-    }
-    Ok(desired)
 }
 
 pub(super) fn exec_role(
