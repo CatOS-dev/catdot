@@ -13,7 +13,7 @@ podman run --rm --security-opt label=disable \
     install -Dm755 /catdot-bin/catdot-query-helper /usr/lib/catdot/catdot-query-helper
     install -d /usr/share/catdot/profiles/lifecycle
     cat > /usr/share/catdot/profiles/lifecycle/profile.toml <<"EOF"
-schema = 2
+schema = 3
 [profile]
 id = "lifecycle"
 name = "Zero dependency lifecycle"

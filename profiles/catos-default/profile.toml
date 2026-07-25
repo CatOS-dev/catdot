@@ -1,4 +1,4 @@
-schema = 2
+schema = 3
 
 [profile]
 id = "catos-default"
@@ -21,30 +21,25 @@ packages = [
 
 [[components.configuration]]
 target = ".gtkrc-2.0"
-lifecycle = "overwrite"
-mode = "file"
+lifecycle = "generate"
 source = ".gtkrc-2.0"
 
 [[components.configuration]]
 target = ".config/gtk-3.0/settings.ini"
-lifecycle = "overwrite"
-mode = "file"
+lifecycle = "generate"
 source = ".config/gtk-3.0/settings.ini"
 
 [[components.configuration]]
 target = ".config/gtk-4.0/settings.ini"
-lifecycle = "overwrite"
-mode = "file"
+lifecycle = "generate"
 source = ".config/gtk-4.0/settings.ini"
 
 [[components.configuration]]
 target = ".config/gtk-4.0/gtk.css"
-lifecycle = "overwrite"
-mode = "file"
+lifecycle = "generate"
 source = ".config/gtk-4.0/gtk.css"
 
 [[components.configuration]]
 target = ".config/gtk-4.0/assets"
-lifecycle = "overwrite"
-mode = "file"
+lifecycle = "symlink"
 source = ".config/gtk-4.0/assets"

@@ -41,6 +41,7 @@ test ! -e "$stage/usr/share/catos-default"
 profile_root="$stage/usr/share/catdot/profiles"
 profile_count=$(find "$profile_root" -mindepth 1 -maxdepth 1 -type d | wc -l)
 test "$profile_count" -eq 1
+"$stage/usr/bin/catdot" validate "$profile_root" | grep -Fx 'validated profile catos-default'
 
 home="$temporary/home"
 mkdir -p "$home"
