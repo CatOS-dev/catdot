@@ -47,6 +47,11 @@ P
     backup=$(find /home/alice/.local/state/catdot/backups -mindepth 1 -maxdepth 1 -type d | head -n1)
     test "$(cat "$backup/home/.config/demo/managed")" = managed-old
     test "$(cat "$backup/home/.config/demo/seed")" = seed-old
+    test "$(stat -c %a /home/alice/.local/state/catdot)" = 700
+    test "$(stat -c %a /home/alice/.local/state/catdot/backups)" = 700
+    test "$(stat -c %a "$backup")" = 700
+    test "$(stat -c %a /home/alice/.local/state/catdot/state.toml)" = 600
+    test "$(stat -c %a /home/alice/.local/state/catdot/lock)" = 600
 
     printf managed-user > /home/alice/.config/demo/managed
     printf seed-user > /home/alice/.config/demo/seed

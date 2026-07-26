@@ -368,14 +368,11 @@ fn print_retained_profile(
     active: bool,
     installed: Option<&Profile>,
 ) {
-    let update_available = installed.is_some_and(|installed| !profile.matches_profile(installed));
-    let marker = match (active, installed.is_some(), update_available) {
-        (true, false, _) => "active, unavailable",
-        (false, false, _) => "retained, unavailable",
-        (true, true, true) => "active, update available",
-        (false, true, true) => "retained, update available",
-        (true, true, false) => "active",
-        (false, true, false) => "retained",
+    let marker = match (active, installed.is_some()) {
+        (true, false) => "active, unavailable",
+        (false, false) => "retained, unavailable",
+        (true, true) => "active",
+        (false, true) => "retained",
     };
     println!("{id} ({marker})");
     println!("  {}", profile.name);

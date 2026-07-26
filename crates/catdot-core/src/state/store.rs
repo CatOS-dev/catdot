@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -30,13 +31,6 @@ impl ProfileState {
             packages: profile.packages.iter().cloned().collect(),
             manage: profile.manage.clone(),
         }
-    }
-
-    pub fn matches_profile(&self, profile: &Profile) -> bool {
-        self.name == profile.name
-            && self.description == profile.description
-            && self.packages == profile.packages.iter().cloned().collect()
-            && self.manage == profile.manage
     }
 }
 
@@ -109,7 +103,7 @@ pub fn atomic_write(path: &Path, contents: &str) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| Error::Message("path has no parent".into()))?;
-    io(parent, fs::create_dir_all(parent))?;
+    create_private_directory(parent)?;
     let (temporary, mut file) = create_temporary(parent, path)?;
     io(&temporary, file.write_all(contents.as_bytes()))?;
     io(&temporary, file.sync_all())?;
@@ -136,6 +130,7 @@ fn create_temporary(parent: &Path, path: &Path) -> Result<(PathBuf, File)> {
         match OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&candidate)
         {
             Ok(file) => return Ok((candidate, file)),
@@ -152,6 +147,14 @@ fn create_temporary(parent: &Path, path: &Path) -> Result<(PathBuf, File)> {
         "cannot create unique temporary file for {}",
         path.display()
     )))
+}
+
+fn create_private_directory(path: &Path) -> Result<()> {
+    io(path, fs::create_dir_all(path))?;
+    io(
+        path,
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)),
+    )
 }
 
 pub fn write_state(path: &Path, state: &UserState) -> Result<()> {

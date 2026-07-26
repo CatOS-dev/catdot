@@ -245,6 +245,39 @@ fn select_backs_up_and_overwrites_managed_and_first_seed() {
         fs::read_to_string(backup.join("home/.config/demo/seed")).unwrap(),
         "seed-old"
     );
+    let state_root = home.path().join(".local/state/catdot");
+    assert_eq!(
+        fs::metadata(&state_root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(state_root.join("backups"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(state_root.join("state.toml"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(state_root.join("lock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
 }
 
 #[test]
@@ -343,10 +376,8 @@ fn show_and_list_use_the_accepted_retained_snapshot() {
         let output = run(root.path(), home.path(), &profile_root, &bin, &command);
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains("demo (active, update available)"),
-            "{stdout}"
-        );
+        assert!(stdout.contains("demo (active)"), "{stdout}");
+        assert!(!stdout.contains("update available"), "{stdout}");
         assert!(stdout.contains("packages: old-package"), "{stdout}");
         assert!(!stdout.contains("new-package"), "{stdout}");
         assert!(!stdout.contains("Demo v2 not accepted"), "{stdout}");
@@ -448,6 +479,74 @@ fn update_preflights_home_paths_before_installing_new_packages() {
             .lines()
             .any(|line| line == "new-package")
     );
+}
+
+#[test]
+fn updating_an_inactive_profile_does_not_validate_or_modify_home_targets() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let profile_root = install_profile(
+        root.path(),
+        "alpha",
+        &[],
+        &[".config/alpha/config"],
+        &[(".config/alpha/config", "alpha-v1")],
+    );
+    install_profile(root.path(), "beta", &[], &[], &[]);
+    let bin = fake_commands(root.path());
+
+    for command in [vec!["select", "alpha"], vec!["select", "beta"]] {
+        let output = run(root.path(), home.path(), &profile_root, &bin, &command);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fs::remove_dir_all(home.path().join(".config")).unwrap();
+    symlink(outside.path(), home.path().join(".config")).unwrap();
+    rewrite_manifest(
+        root.path(),
+        "alpha",
+        "alpha-v2",
+        &["new-package"],
+        &[".config/alpha/config"],
+    );
+    fs::write(
+        root.path().join("usr/share/alpha/.config/alpha/config"),
+        "alpha-v2",
+    )
+    .unwrap();
+
+    let output = run(
+        root.path(),
+        home.path(),
+        &profile_root,
+        &bin,
+        &["update", "alpha"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::read_to_string(root.path().join("installed.db"))
+            .unwrap()
+            .lines()
+            .any(|line| line == "new-package")
+    );
+    assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
+
+    let state = fs::read_to_string(home.path().join(".local/state/catdot/state.toml")).unwrap();
+    assert!(state.contains("active_profile = \"beta\""), "{state}");
+    assert!(state.contains("new-package"), "{state}");
+    let cache = home
+        .path()
+        .join(".local/state/catdot/profiles/alpha/managed/.config/alpha/config");
+    assert_eq!(fs::read_to_string(cache).unwrap(), "alpha-v2");
 }
 
 #[test]

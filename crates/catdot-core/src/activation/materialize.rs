@@ -2,7 +2,7 @@ use crate::{Error, Profile, ProfileState, Result, UserState};
 use std::{
     collections::BTreeSet,
     fs,
-    os::unix::fs::symlink,
+    os::unix::fs::{PermissionsExt, symlink},
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -98,8 +98,8 @@ pub fn build_activation_plan(
     for relative in &target_state.manage {
         let source = sources.managed.join(relative);
         validate_profile_source(&source)?;
-        let target = checked_target(home, state_path, relative)?;
         if write_home {
+            let target = checked_target(home, state_path, relative)?;
             writes.push(PlannedWrite {
                 relative: relative.clone(),
                 source,
@@ -297,18 +297,27 @@ fn new_backup_root(state_path: &Path) -> Result<PathBuf> {
     let catdot = state_path
         .parent()
         .ok_or_else(|| Error::Message("state path has no parent".into()))?;
+    create_private_directory(catdot)?;
+    let backups = catdot.join("backups");
+    create_private_directory(&backups)?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| Error::Message(error.to_string()))?
         .as_nanos();
-    let root = catdot
-        .join("backups")
-        .join(format!("{stamp}-{}", std::process::id()));
-    fs::create_dir_all(&root).map_err(|source| Error::Io {
-        path: root.display().to_string(),
+    let root = backups.join(format!("{stamp}-{}", std::process::id()));
+    create_private_directory(&root)?;
+    Ok(root)
+}
+
+fn create_private_directory(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).map_err(|source| Error::Io {
+        path: path.display().to_string(),
         source,
     })?;
-    Ok(root)
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| Error::Io {
+        path: path.display().to_string(),
+        source,
+    })
 }
 
 fn prune_backups(state_path: &Path) -> Result<()> {

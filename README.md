@@ -76,7 +76,8 @@ run again after the underlying problem is fixed.
 Catdot records each retained Profile's accepted metadata and caches only its
 managed content under the user state directory. Package upgrades alone do not
 change the accepted configuration revision. `list` and `show` display the
-accepted snapshot and mark a changed installed manifest as `update available`.
+accepted snapshot. Catdot does not attempt to detect whether `/usr/share`
+contains a newer managed revision; updates are always explicit.
 
 ```sh
 catdot update
@@ -117,6 +118,12 @@ Pacman displays and confirms the final removal transaction, calculates the
 dependency closure, and rejects unsafe removals. Catdot removes package records
 only after pacman succeeds. Packages that were already installed before Catdot
 first requested them are never added to the prune set.
+
+Package ownership and `prune` are intentionally single-user. A system should
+have one user account responsible for Catdot package management. Per-user
+Catdot states are not combined into a system-wide package reference database;
+running `prune` independently from multiple users can remove packages still
+listed by another user's retained Profile.
 
 ## Commands
 
