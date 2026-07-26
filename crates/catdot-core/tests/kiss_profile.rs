@@ -1,7 +1,7 @@
 use catdot_core::{
-    ActivationMode, ProfileState, UserState, apply_activation_plan, build_activation_plan,
-    cache_profile_content, discover_profiles, profile_cache_path, prune_candidates,
-    retained_packages, state_path,
+    ActivationMode, ActivationSources, ProfileState, UserState, apply_activation_plan,
+    build_activation_plan, cache_profile_content, discover_profiles, profile_cache_path,
+    prune_candidates, retained_packages, state_path,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -54,8 +54,6 @@ fn backup_file(backup: &Path, relative: &str) -> String {
     fs::read_to_string(backup.join("home").join(relative)).unwrap()
 }
 
-// Protects the deliberately small manifest language: package declarations are
-// exact pacman package names and do not embed version or dependency syntax.
 #[test]
 fn manifest_rejects_package_version_constraints() {
     let root = tempdir().unwrap();
@@ -63,8 +61,30 @@ fn manifest_rejects_package_version_constraints() {
     assert!(discover_profiles(&root.path().join("usr/share/catdot/profiles")).is_err());
 }
 
-// Protects first activation semantics: both managed and seed content overwrite
-// existing targets, and every overwritten target is copied into one backup.
+#[test]
+fn managed_cache_excludes_seed_content() {
+    let root = tempdir().unwrap();
+    install_profile(
+        root.path(),
+        "demo",
+        &[],
+        &[".config/demo/managed"],
+        &[
+            (".config/demo/managed", "managed"),
+            (".config/demo/seed", "seed"),
+        ],
+    );
+    let installed = profiles(root.path());
+    let state_file = state_path(&root.path().join("home/alice"));
+    let cache = profile_cache_path(&state_file, "demo").unwrap();
+    cache_profile_content(&installed["demo"], &cache).unwrap();
+    assert_eq!(
+        fs::read_to_string(cache.join(".config/demo/managed")).unwrap(),
+        "managed"
+    );
+    assert!(!cache.join(".config/demo/seed").exists());
+}
+
 #[test]
 fn first_select_overwrites_managed_and_seed_after_backup() {
     let root = tempdir().unwrap();
@@ -88,13 +108,17 @@ fn first_select_overwrites_managed_and_seed_after_backup() {
 
     let cache = profile_cache_path(&state_file, "demo").unwrap();
     cache_profile_content(profile, &cache).unwrap();
-    let target = ProfileState::from_profile(profile, false).unwrap();
+    let target = ProfileState::from_profile(profile);
     let plan = build_activation_plan(
         &UserState::default(),
         "demo",
         &target,
-        &cache,
+        ActivationSources {
+            managed: &cache,
+            seeds: Some(&profile.source_root),
+        },
         &home,
+        &state_file,
         ActivationMode::Select,
     )
     .unwrap();
@@ -114,8 +138,6 @@ fn first_select_overwrites_managed_and_seed_after_backup() {
     assert_eq!(backup_file(&backup, ".config/demo/seed"), "seed-old");
 }
 
-// Protects the ownership boundary after initialization: selecting the same
-// retained Profile overwrites managed content but leaves seed content alone.
 #[test]
 fn repeated_select_overwrites_only_managed_content() {
     let root = tempdir().unwrap();
@@ -143,16 +165,19 @@ fn repeated_select_overwrites_only_managed_content() {
         active_profile: Some("demo".into()),
         ..UserState::default()
     };
-    state.profiles.insert(
-        "demo".into(),
-        ProfileState::from_profile(profile, true).unwrap(),
-    );
+    state
+        .profiles
+        .insert("demo".into(), ProfileState::from_profile(profile));
     let plan = build_activation_plan(
         &state,
         "demo",
         &state.profiles["demo"],
-        &cache,
+        ActivationSources {
+            managed: &cache,
+            seeds: None,
+        },
         &home,
+        &state_file,
         ActivationMode::Select,
     )
     .unwrap();
@@ -172,8 +197,6 @@ fn repeated_select_overwrites_only_managed_content() {
     assert!(!backup.join("home/.config/demo/seed").exists());
 }
 
-// Protects complete Profile switching: old managed roots are removed after
-// backup, then the new Profile's managed and first-activation seed content win.
 #[test]
 fn switching_profiles_replaces_old_managed_with_new_seed() {
     let root = tempdir().unwrap();
@@ -209,15 +232,19 @@ fn switching_profiles_replaces_old_managed_with_new_seed() {
     };
     state.profiles.insert(
         "alpha".into(),
-        ProfileState::from_profile(&installed["alpha"], true).unwrap(),
+        ProfileState::from_profile(&installed["alpha"]),
     );
-    let beta = ProfileState::from_profile(&installed["beta"], false).unwrap();
+    let beta = ProfileState::from_profile(&installed["beta"]);
     let plan = build_activation_plan(
         &state,
         "beta",
         &beta,
-        &beta_cache,
+        ActivationSources {
+            managed: &beta_cache,
+            seeds: Some(&installed["beta"].source_root),
+        },
         &home,
+        &state_file,
         ActivationMode::Select,
     )
     .unwrap();
@@ -237,8 +264,6 @@ fn switching_profiles_replaces_old_managed_with_new_seed() {
     );
 }
 
-// Protects explicit update semantics: active managed content is overwritten
-// from the refreshed cache, while seed content remains untouched.
 #[test]
 fn update_active_profile_overwrites_managed_but_not_seed() {
     let root = tempdir().unwrap();
@@ -267,14 +292,18 @@ fn update_active_profile_overwrites_managed_but_not_seed() {
     };
     state.profiles.insert(
         "demo".into(),
-        ProfileState::from_profile(&installed["demo"], true).unwrap(),
+        ProfileState::from_profile(&installed["demo"]),
     );
     let plan = build_activation_plan(
         &state,
         "demo",
         &state.profiles["demo"],
-        &cache,
+        ActivationSources {
+            managed: &cache,
+            seeds: None,
+        },
         &home,
+        &state_file,
         ActivationMode::Update,
     )
     .unwrap();
@@ -290,9 +319,36 @@ fn update_active_profile_overwrites_managed_but_not_seed() {
     );
 }
 
-// Protects package pruning without a dependency solver in Catdot: only direct
-// packages introduced by Catdot and no longer referenced by retained Profiles
-// are candidates; pacman decides the dependency closure later.
+#[test]
+fn activation_rejects_paths_overlapping_the_actual_state_directory() {
+    let root = tempdir().unwrap();
+    install_profile(
+        root.path(),
+        "demo",
+        &[],
+        &[".state"],
+        &[(".state/profile", "managed")],
+    );
+    let installed = profiles(root.path());
+    let home = root.path().join("home/alice");
+    let state_file = home.join(".state/catdot/state.toml");
+    let target = ProfileState::from_profile(&installed["demo"]);
+    let error = build_activation_plan(
+        &UserState::default(),
+        "demo",
+        &target,
+        ActivationSources {
+            managed: &installed["demo"].source_root,
+            seeds: Some(&installed["demo"].source_root),
+        },
+        &home,
+        &state_file,
+        ActivationMode::Select,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("overlaps Catdot state"));
+}
+
 #[test]
 fn prune_candidates_use_introduced_direct_packages_only() {
     let mut state = UserState {
@@ -306,7 +362,8 @@ fn prune_candidates_use_introduced_direct_packages_only() {
     state.profiles.insert(
         "desktop".into(),
         ProfileState {
-            initialized: true,
+            name: "Desktop".into(),
+            description: String::new(),
             packages: BTreeSet::from(["niri".to_owned(), "ghostty".to_owned()]),
             manage: BTreeSet::new(),
         },
@@ -321,8 +378,6 @@ fn prune_candidates_use_introduced_direct_packages_only() {
     );
 }
 
-// Protects regular file mode preservation when Profile content is copied into
-// the cache and then overlaid into HOME.
 #[test]
 fn profile_copy_preserves_executable_mode() {
     let root = tempdir().unwrap();
@@ -340,13 +395,17 @@ fn profile_copy_preserves_executable_mode() {
     let state_file = state_path(&home);
     let cache = profile_cache_path(&state_file, "demo").unwrap();
     cache_profile_content(&installed["demo"], &cache).unwrap();
-    let target = ProfileState::from_profile(&installed["demo"], false).unwrap();
+    let target = ProfileState::from_profile(&installed["demo"]);
     let plan = build_activation_plan(
         &UserState::default(),
         "demo",
         &target,
-        &cache,
+        ActivationSources {
+            managed: &cache,
+            seeds: Some(&installed["demo"].source_root),
+        },
         &home,
+        &state_file,
         ActivationMode::Select,
     )
     .unwrap();

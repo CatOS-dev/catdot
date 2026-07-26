@@ -6,8 +6,8 @@ pub mod manifest;
 pub mod state;
 
 pub use activation::{
-    ActivationMode, ActivationPlan, PlannedWrite, apply_activation_plan, build_activation_plan,
-    cache_profile_content, lock, profile_cache_path,
+    ActivationMode, ActivationPlan, ActivationSources, PlannedWrite, apply_activation_plan,
+    build_activation_plan, cache_profile_content, lock, profile_cache_path,
 };
 pub use error::{Error, Result};
 pub use manifest::{

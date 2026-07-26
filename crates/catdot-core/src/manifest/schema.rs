@@ -32,14 +32,6 @@ pub struct Profile {
     pub manage: BTreeSet<PathBuf>,
 }
 
-impl Profile {
-    pub fn is_managed(&self, relative: &Path) -> bool {
-        self.manage
-            .iter()
-            .any(|managed| relative == managed || relative.starts_with(managed))
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfileDiagnosticKind {
     Toml,

@@ -43,9 +43,10 @@ syntax are rejected. Pacman resolves dependencies, providers, replacements,
 and conflicts.
 
 A path in `manage` may be a file or directory. Directory ownership is recursive,
-and managed declarations may not overlap. Profile content may contain only real
-files and directories; symbolic links, FIFOs, sockets, and device nodes are
-rejected.
+and managed declarations may not overlap. At activation time Catdot also rejects
+any path that overlaps its actual state directory, including a custom
+`XDG_STATE_HOME`. Profile content may contain only real files and directories;
+symbolic links, FIFOs, sockets, and device nodes are rejected.
 
 ## Managed and seed files
 
@@ -72,18 +73,20 @@ run again after the underlying problem is fixed.
 
 ## Explicit updates
 
-Catdot caches each retained Profile under its user state directory. Package
-upgrades alone do not change the accepted configuration revision.
+Catdot records each retained Profile's accepted metadata and caches only its
+managed content under the user state directory. Package upgrades alone do not
+change the accepted configuration revision. `list` and `show` display the
+accepted snapshot and mark a changed installed manifest as `update available`.
 
 ```sh
 catdot update
 catdot update catos-niri-dms
 ```
 
-`update` refreshes the retained Profile's package declaration and complete
-content cache from `/usr/share/<profile-id>`. If it is active, its old managed
-paths are backed up and replaced. Updating an inactive Profile does not switch
-to it or modify HOME. Seed content is never reapplied by update.
+`update` refreshes the retained Profile's accepted metadata and managed cache
+from `/usr/share/<profile-id>`. If it is active, its old managed paths are backed
+up and replaced. Updating an inactive Profile does not switch to it or modify
+HOME. Seed content is never cached or reapplied by update.
 
 ## Package installation and prune
 

@@ -8,13 +8,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const USER_STATE_SCHEMA: u32 = 4;
+pub const USER_STATE_SCHEMA: u32 = 5;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileState {
+    pub name: String,
     #[serde(default)]
-    pub initialized: bool,
+    pub description: String,
     #[serde(default)]
     pub packages: BTreeSet<String>,
     #[serde(default)]
@@ -22,12 +23,20 @@ pub struct ProfileState {
 }
 
 impl ProfileState {
-    pub fn from_profile(profile: &Profile, initialized: bool) -> Result<Self> {
-        Ok(Self {
-            initialized,
+    pub fn from_profile(profile: &Profile) -> Self {
+        Self {
+            name: profile.name.clone(),
+            description: profile.description.clone(),
             packages: profile.packages.iter().cloned().collect(),
             manage: profile.manage.clone(),
-        })
+        }
+    }
+
+    pub fn matches_profile(&self, profile: &Profile) -> bool {
+        self.name == profile.name
+            && self.description == profile.description
+            && self.packages == profile.packages.iter().cloned().collect()
+            && self.manage == profile.manage
     }
 }
 
@@ -170,6 +179,11 @@ pub fn validate_user_state(state: &UserState) -> Result<()> {
         if !valid_id(id) {
             return Err(Error::Message(format!("invalid saved profile {id}")));
         }
+        if profile.name.trim().is_empty() {
+            return Err(Error::Message(format!(
+                "saved profile {id} has an empty name"
+            )));
+        }
         for package in &profile.packages {
             validate_package(package)?;
         }
@@ -203,8 +217,7 @@ pub fn remove_profile(state: &mut UserState, profile: &str) -> Result<bool> {
             "cannot remove active profile {profile}"
         )));
     }
-    let removed = state.profiles.remove(profile).is_some();
-    Ok(removed)
+    Ok(state.profiles.remove(profile).is_some())
 }
 
 pub fn retained_packages(state: &UserState) -> BTreeSet<String> {

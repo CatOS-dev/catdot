@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
 };
 
 mod runtime;
@@ -79,14 +79,25 @@ fn installed_registry() -> Result<ProfileRegistry> {
     Ok(registry)
 }
 
-fn package_installed(package: &str) -> Result<bool> {
-    let status = Command::new("pacman")
-        .args(["-Qq", "--", package])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .with_context(|| format!("query installed package {package} with pacman"))?;
-    Ok(status.success())
+fn installed_packages() -> Result<BTreeSet<String>> {
+    let output = Command::new("pacman")
+        .arg("-Qq")
+        .output()
+        .context("query installed packages with pacman")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "pacman package query failed with {}: {}",
+            output.status,
+            stderr.trim()
+        )
+    }
+    Ok(String::from_utf8(output.stdout)?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 fn run_sudo_pacman(arguments: &[&str], packages: &[String], action: &str) -> Result<()> {
@@ -103,18 +114,19 @@ fn run_sudo_pacman(arguments: &[&str], packages: &[String], action: &str) -> Res
     Ok(())
 }
 
-fn install_packages(packages: &[String]) -> Result<BTreeSet<String>> {
+fn install_packages(
+    packages: &[String],
+    installed_before: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
     if packages.is_empty() {
         return Ok(BTreeSet::new());
     }
-    let mut missing = BTreeSet::new();
-    for package in packages {
-        if !package_installed(package)? {
-            missing.insert(package.clone());
-        }
-    }
     run_sudo_pacman(&["-S", "--needed"], packages, "installation")?;
-    Ok(missing)
+    Ok(packages
+        .iter()
+        .filter(|package| !installed_before.contains(*package))
+        .cloned()
+        .collect())
 }
 
 fn print_backup(backup: Option<PathBuf>) {
@@ -132,45 +144,78 @@ fn select_profile(
     let _lock = lock(&state_lock_path(state_file)?)?;
     let mut state = read_state(state_file)?;
     validate_user_state(&state)?;
+    let first_activation = !state.profiles.contains_key(target);
 
-    if !state.profiles.contains_key(target) {
+    let (target_state, packages, preflight, profile) = if first_activation {
         let profile = profiles
             .get(target)
             .with_context(|| format!("unknown Profile {target}"))?;
-        let introduced = install_packages(&profile.packages)?;
-        state.introduced_packages.extend(introduced);
+        let target_state = ProfileState::from_profile(profile);
+        let plan = build_activation_plan(
+            &state,
+            target,
+            &target_state,
+            ActivationSources {
+                managed: &profile.source_root,
+                seeds: Some(&profile.source_root),
+            },
+            home,
+            state_file,
+            ActivationMode::Select,
+        )?;
+        (target_state, profile.packages.clone(), plan, Some(profile))
+    } else {
+        let target_state = state.profiles[target].clone();
+        let cache = profile_cache_path(state_file, target)?;
+        let plan = build_activation_plan(
+            &state,
+            target,
+            &target_state,
+            ActivationSources {
+                managed: &cache,
+                seeds: None,
+            },
+            home,
+            state_file,
+            ActivationMode::Select,
+        )?;
+        (
+            target_state.clone(),
+            target_state.packages.iter().cloned().collect(),
+            plan,
+            None,
+        )
+    };
+
+    let installed_before = if packages.is_empty() {
+        BTreeSet::new()
+    } else {
+        installed_packages()?
+    };
+    let introduced = install_packages(&packages, &installed_before)?;
+    state.introduced_packages.extend(introduced);
+
+    let plan = if let Some(profile) = profile {
         let cache = profile_cache_path(state_file, target)?;
         cache_profile_content(profile, &cache)?;
-        state.profiles.insert(
-            target.to_owned(),
-            ProfileState::from_profile(profile, false)?,
-        );
+        build_activation_plan(
+            &state,
+            target,
+            &target_state,
+            ActivationSources {
+                managed: &cache,
+                seeds: Some(&profile.source_root),
+            },
+            home,
+            state_file,
+            ActivationMode::Select,
+        )?
     } else {
-        let packages = state.profiles[target]
-            .packages
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let introduced = install_packages(&packages)?;
-        state.introduced_packages.extend(introduced);
-    }
+        preflight
+    };
 
-    let cache = profile_cache_path(state_file, target)?;
-    let target_state = state.profiles[target].clone();
-    let plan = build_activation_plan(
-        &state,
-        target,
-        &target_state,
-        &cache,
-        home,
-        ActivationMode::Select,
-    )?;
     let backup = apply_activation_plan(&plan, home, state_file)?;
-    state
-        .profiles
-        .get_mut(target)
-        .expect("target Profile was retained")
-        .initialized = true;
+    state.profiles.insert(target.to_owned(), target_state);
     state.active_profile = Some(target.to_owned());
     write_state(state_file, &state)?;
     print_backup(backup);
@@ -193,20 +238,41 @@ fn update_retained_profile(
     let profile = profiles
         .get(target)
         .with_context(|| format!("installed Profile {target} is unavailable or invalid"))?;
-    let introduced = install_packages(&profile.packages)?;
+    let refreshed = ProfileState::from_profile(profile);
+
+    build_activation_plan(
+        &state,
+        target,
+        &refreshed,
+        ActivationSources {
+            managed: &profile.source_root,
+            seeds: None,
+        },
+        home,
+        state_file,
+        ActivationMode::Update,
+    )?;
+
+    let installed_before = if profile.packages.is_empty() {
+        BTreeSet::new()
+    } else {
+        installed_packages()?
+    };
+    let introduced = install_packages(&profile.packages, &installed_before)?;
     state.introduced_packages.extend(introduced);
 
-    let old_state = state.clone();
-    let initialized = state.profiles[target].initialized;
-    let refreshed = ProfileState::from_profile(profile, initialized)?;
     let cache = profile_cache_path(state_file, target)?;
     cache_profile_content(profile, &cache)?;
     let plan = build_activation_plan(
-        &old_state,
+        &state,
         target,
         &refreshed,
-        &cache,
+        ActivationSources {
+            managed: &cache,
+            seeds: None,
+        },
         home,
+        state_file,
         ActivationMode::Update,
     )?;
     let backup = apply_activation_plan(&plan, home, state_file)?;
@@ -253,12 +319,12 @@ fn prune_packages(state_file: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let mut installed = Vec::new();
-    for package in &candidates {
-        if package_installed(package)? {
-            installed.push(package.clone());
-        }
-    }
+    let installed_packages = installed_packages()?;
+    let installed = candidates
+        .iter()
+        .filter(|package| installed_packages.contains(*package))
+        .cloned()
+        .collect::<Vec<_>>();
     if !installed.is_empty() {
         run_sudo_pacman(&["-Rns"], &installed, "prune")?;
     }
@@ -274,15 +340,8 @@ fn prune_packages(state_file: &Path) -> Result<()> {
     Ok(())
 }
 
-fn print_profile(profile: &Profile, retained: bool, active: bool) {
-    let marker = if active {
-        "active"
-    } else if retained {
-        "retained"
-    } else {
-        "available"
-    };
-    println!("{} ({marker})", profile.id);
+fn print_available_profile(profile: &Profile) {
+    println!("{} (available)", profile.id);
     println!("  {}", profile.name);
     if !profile.description.is_empty() {
         println!("  {}", profile.description);
@@ -303,13 +362,26 @@ fn print_profile(profile: &Profile, retained: bool, active: bool) {
     }
 }
 
-fn print_retained_profile(id: &str, profile: &ProfileState, active: bool) {
-    let marker = if active {
-        "active, unavailable"
-    } else {
-        "retained, unavailable"
+fn print_retained_profile(
+    id: &str,
+    profile: &ProfileState,
+    active: bool,
+    installed: Option<&Profile>,
+) {
+    let update_available = installed.is_some_and(|installed| !profile.matches_profile(installed));
+    let marker = match (active, installed.is_some(), update_available) {
+        (true, false, _) => "active, unavailable",
+        (false, false, _) => "retained, unavailable",
+        (true, true, true) => "active, update available",
+        (false, true, true) => "retained, update available",
+        (true, true, false) => "active",
+        (false, true, false) => "retained",
     };
     println!("{id} ({marker})");
+    println!("  {}", profile.name);
+    if !profile.description.is_empty() {
+        println!("  {}", profile.description);
+    }
     if !profile.packages.is_empty() {
         println!(
             "  packages: {}",
@@ -317,6 +389,17 @@ fn print_retained_profile(id: &str, profile: &ProfileState, active: bool) {
                 .packages
                 .iter()
                 .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !profile.manage.is_empty() {
+        println!(
+            "  managed: {}",
+            profile
+                .manage
+                .iter()
+                .map(|path| path.display().to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -360,42 +443,33 @@ pub fn run() -> Result<i32> {
             let registry = installed_registry()?;
             let state = read_state(&state_file)?;
             validate_user_state(&state)?;
-            for profile in registry.valid_profiles.values() {
-                print_profile(
-                    profile,
-                    state.profiles.contains_key(&profile.id),
-                    state.active_profile.as_deref() == Some(&profile.id),
+            for (id, retained) in &state.profiles {
+                print_retained_profile(
+                    id,
+                    retained,
+                    state.active_profile.as_deref() == Some(id),
+                    registry.valid_profiles.get(id),
                 );
             }
-            for (id, profile) in &state.profiles {
-                if !registry.valid_profiles.contains_key(id) {
-                    print_retained_profile(
-                        id,
-                        profile,
-                        state.active_profile.as_deref() == Some(id),
-                    );
+            for profile in registry.valid_profiles.values() {
+                if !state.profiles.contains_key(&profile.id) {
+                    print_available_profile(profile);
                 }
-            }
-            if !registry.diagnostics.is_empty() {
-                bail!("one or more installed Profiles are invalid")
             }
         }
         Cmd::Show { profile } => {
             let registry = installed_registry()?;
             let state = read_state(&state_file)?;
             validate_user_state(&state)?;
-            if let Some(installed) = registry.valid_profiles.get(&profile) {
-                print_profile(
-                    installed,
-                    state.profiles.contains_key(&profile),
-                    state.active_profile.as_deref() == Some(&profile),
-                );
-            } else if let Some(retained) = state.profiles.get(&profile) {
+            if let Some(retained) = state.profiles.get(&profile) {
                 print_retained_profile(
                     &profile,
                     retained,
                     state.active_profile.as_deref() == Some(&profile),
+                    registry.valid_profiles.get(&profile),
                 );
+            } else if let Some(installed) = registry.valid_profiles.get(&profile) {
+                print_available_profile(installed);
             } else {
                 bail!("unknown Profile {profile}")
             }

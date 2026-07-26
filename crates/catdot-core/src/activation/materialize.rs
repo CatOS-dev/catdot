@@ -28,30 +28,44 @@ pub struct ActivationPlan {
     pub writes: Vec<PlannedWrite>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ActivationSources<'a> {
+    pub managed: &'a Path,
+    pub seeds: Option<&'a Path>,
+}
+
 pub fn profile_cache_path(state_path: &Path, profile: &str) -> Result<PathBuf> {
     let parent = state_path
         .parent()
         .ok_or_else(|| Error::Message("state path has no parent".into()))?;
-    Ok(parent.join("profiles").join(profile).join("content"))
+    Ok(parent.join("profiles").join(profile).join("managed"))
 }
 
 pub fn cache_profile_content(profile: &Profile, cache: &Path) -> Result<()> {
     remove_path(cache)?;
-    copy_profile_tree(&profile.source_root, cache)
+    fs::create_dir_all(cache).map_err(|source| Error::Io {
+        path: cache.display().to_string(),
+        source,
+    })?;
+    for relative in &profile.manage {
+        copy_profile_tree(&profile.source_root.join(relative), &cache.join(relative))?;
+    }
+    Ok(())
 }
 
 pub fn build_activation_plan(
     state: &UserState,
     target_profile: &str,
     target_state: &ProfileState,
-    source_root: &Path,
+    sources: ActivationSources<'_>,
     home: &Path,
+    state_path: &Path,
     mode: ActivationMode,
 ) -> Result<ActivationPlan> {
-    if !source_root.is_dir() {
+    if !sources.managed.is_dir() {
         return Err(Error::Message(format!(
-            "profile cache {} does not exist",
-            source_root.display()
+            "profile source {} does not exist",
+            sources.managed.display()
         )));
     }
 
@@ -65,14 +79,14 @@ pub fn build_activation_plan(
                 .and_then(|active| state.profiles.get(active))
             {
                 for relative in &active.manage {
-                    removals.push(checked_target(home, relative)?);
+                    removals.push(checked_target(home, state_path, relative)?);
                 }
             }
         }
         ActivationMode::Update if active_target => {
             if let Some(current) = state.profiles.get(target_profile) {
                 for relative in &current.manage {
-                    removals.push(checked_target(home, relative)?);
+                    removals.push(checked_target(home, state_path, relative)?);
                 }
             }
         }
@@ -81,21 +95,31 @@ pub fn build_activation_plan(
 
     let write_home = mode == ActivationMode::Select || active_target;
     let mut writes = Vec::new();
-    if write_home {
-        for relative in &target_state.manage {
+    for relative in &target_state.manage {
+        let source = sources.managed.join(relative);
+        validate_profile_source(&source)?;
+        let target = checked_target(home, state_path, relative)?;
+        if write_home {
             writes.push(PlannedWrite {
                 relative: relative.clone(),
-                source: source_root.join(relative),
-                target: checked_target(home, relative)?,
+                source,
+                target,
             });
         }
     }
-    if mode == ActivationMode::Select && !target_state.initialized {
-        for relative in seed_files(source_root, &target_state.manage)? {
+
+    if let Some(seed_source_root) = sources.seeds {
+        if !seed_source_root.is_dir() {
+            return Err(Error::Message(format!(
+                "profile seed source {} does not exist",
+                seed_source_root.display()
+            )));
+        }
+        for relative in seed_files(seed_source_root, &target_state.manage)? {
             writes.push(PlannedWrite {
-                relative: relative.clone(),
-                source: source_root.join(&relative),
-                target: checked_target(home, &relative)?,
+                source: seed_source_root.join(&relative),
+                target: checked_target(home, state_path, &relative)?,
+                relative,
             });
         }
     }
@@ -138,6 +162,20 @@ pub fn apply_activation_plan(
     Ok(backup)
 }
 
+fn validate_profile_source(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| Error::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
+        return Err(Error::Message(format!(
+            "unsupported profile content {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn seed_files(root: &Path, managed: &BTreeSet<PathBuf>) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     collect_files(root, root, &mut files)?;
@@ -174,7 +212,7 @@ fn collect_files(root: &Path, path: &Path, files: &mut Vec<PathBuf>) -> Result<(
                 entry
                     .path()
                     .strip_prefix(root)
-                    .map_err(|_| Error::Message("profile cache escaped its root".into()))?
+                    .map_err(|_| Error::Message("profile content escaped its root".into()))?
                     .to_owned(),
             );
         } else {
@@ -187,7 +225,7 @@ fn collect_files(root: &Path, path: &Path, files: &mut Vec<PathBuf>) -> Result<(
     Ok(())
 }
 
-fn checked_target(home: &Path, relative: &Path) -> Result<PathBuf> {
+fn checked_target(home: &Path, state_path: &Path, relative: &Path) -> Result<PathBuf> {
     if relative.as_os_str().is_empty()
         || relative.is_absolute()
         || !relative
@@ -200,6 +238,17 @@ fn checked_target(home: &Path, relative: &Path) -> Result<PathBuf> {
         )));
     }
     let target = home.join(relative);
+    let state_root = state_path
+        .parent()
+        .ok_or_else(|| Error::Message("state path has no parent".into()))?;
+    if target == state_root || target.starts_with(state_root) || state_root.starts_with(&target) {
+        return Err(Error::Message(format!(
+            "configuration path {} overlaps Catdot state {}",
+            target.display(),
+            state_root.display()
+        )));
+    }
+
     let mut current = home.to_owned();
     if let Some(parent) = relative.parent() {
         for component in parent.components() {
