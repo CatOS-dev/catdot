@@ -410,7 +410,7 @@ pub fn install_with_alpm(
         prepared_install_transaction(handle, &plan.install, TransFlag::NONE)?;
     if install != plan.install || remove != plan.remove || replacements != plan.replacements {
         let _ = handle.trans_release();
-        bail!("libalpm transaction changed after confirmation; run catdot resolve again")
+        bail!("libalpm transaction changed after confirmation; run the Catdot command again")
     }
     if let Err(error) = handle.trans_commit() {
         let _ = handle.trans_release();

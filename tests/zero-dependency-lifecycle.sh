@@ -1,39 +1,33 @@
 #!/usr/bin/env bash
-set -euxo pipefail
+set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cargo build --release --locked --manifest-path "$repo_root/Cargo.toml"
 
 podman run --rm --security-opt label=disable \
   -v "$repo_root/target/release:/catdot-bin:ro" archlinux:base-devel \
-  /bin/bash -euxo pipefail -c '
+  /bin/bash -euo pipefail -c '
     pacman -Sy --noconfirm
     install -Dm755 /catdot-bin/catdot /usr/bin/catdot
     install -Dm755 /catdot-bin/catdot-helper /usr/lib/catdot/catdot-helper
     install -Dm755 /catdot-bin/catdot-query-helper /usr/lib/catdot/catdot-query-helper
-    install -d /usr/share/catdot/profiles/lifecycle
-    cat > /usr/share/catdot/profiles/lifecycle/profile.toml <<"EOF"
-schema = 3
-[profile]
-id = "lifecycle"
-name = "Zero dependency lifecycle"
-description = "Exercises activation without package transactions"
-source_root = "/usr/share/lifecycle"
-[defaults]
-tool = "one"
-[[components]]
-id = "one"
-role = "tool"
-[components.exec]
-argv = ["/usr/bin/printf", "one\\n"]
-[[components]]
-id = "two"
-role = "tool"
-[components.exec]
-argv = ["/usr/bin/printf", "two\\n"]
-EOF
 
-    cat > /tmp/pkexec-shim.c <<"EOF"
+    for profile in alpha beta; do
+      install -d "/usr/share/catdot/profiles/$profile" "/usr/share/$profile/.config/demo"
+      cat > "/usr/share/catdot/profiles/$profile/profile.toml" <<PROFILE
+schema = 4
+name = "$profile"
+description = "Complete profile lifecycle test"
+packages = []
+manage = [".config/demo/managed"]
+PROFILE
+    done
+    printf alpha-v1 > /usr/share/alpha/.config/demo/managed
+    printf alpha-seed > /usr/share/alpha/.config/demo/seed
+    printf beta-v1 > /usr/share/beta/.config/demo/managed
+    printf beta-seed > /usr/share/beta/.config/demo/seed
+
+    cat > /tmp/pkexec.c <<"C"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -45,38 +39,47 @@ int main(int argc, char **argv) {
   execv(argv[1], argv + 1);
   return 71;
 }
-EOF
-    cc -O2 -o /usr/bin/pkexec /tmp/pkexec-shim.c
+C
+    cc -O2 /tmp/pkexec.c -o /usr/bin/pkexec
     chown root:root /usr/bin/pkexec
     chmod 4755 /usr/bin/pkexec
 
     useradd --create-home alice
-    useradd --create-home bob
-    alice="HOME=/home/alice XDG_STATE_HOME=/home/alice/.local/state XDG_CONFIG_HOME=/home/alice/.config"
-    bob="HOME=/home/bob XDG_STATE_HOME=/home/bob/.local/state XDG_CONFIG_HOME=/home/bob/.config"
+    envs="HOME=/home/alice XDG_STATE_HOME=/home/alice/.local/state"
+    install -d -o alice -g alice /home/alice/.config/demo
+    printf user-managed > /home/alice/.config/demo/managed
+    printf user-seed > /home/alice/.config/demo/seed
+    chown -R alice:alice /home/alice/.config
 
-    select_output=$(runuser -u alice -- env $alice catdot select lifecycle)
-    printf "%s\n" "$select_output"
-    test "$(printf "%s\n" "$select_output" | grep -c "catdot resolve")" -eq 1
-    resolve_output=$(runuser -u alice -- env $alice catdot resolve --yes)
-    printf "%s\n" "$resolve_output"
-    printf "%s\n" "$resolve_output" | grep -F "No package changes are required."
-    printf "%s\n" "$resolve_output" | grep -F "Activate:"
-    printf "%s\n" "$resolve_output" | grep -F "Profile changes applied successfully."
-    runuser -u alice -- env $alice catdot resolve --yes | grep -F "Catdot is already up to date."
-    runuser -u alice -- env $alice catdot exec tool | grep -Fx one
-    runuser -u alice -- env $alice catdot select tool lifecycle/two
-    runuser -u alice -- env $alice catdot resolve --yes
-    runuser -u alice -- env $alice catdot exec tool | grep -Fx two
-    runuser -u alice -- env $alice catdot disable tool
-    runuser -u alice -- env $alice catdot resolve --yes
-    ! runuser -u alice -- env $alice catdot exec tool
-    runuser -u alice -- env $alice catdot doctor
-    runuser -u alice -- env $alice catdot prune --yes | grep -F "Nothing to prune."
-    runuser -u alice -- env $alice catdot users list | grep -F "uid 1000: valid"
+    runuser -u alice -- env $envs catdot validate /usr/share/catdot/profiles
+    first=$(runuser -u alice -- env $envs catdot select alpha --yes)
+    printf "%s\n" "$first" | grep -F "BACKUP AND OVERWRITE managed"
+    test "$(cat /home/alice/.config/demo/managed)" = alpha-v1
+    test "$(cat /home/alice/.config/demo/seed)" = user-seed
 
-    userdel alice
-    runuser -u bob -- env $bob catdot users list | grep -F "uid 1000: missing"
-    runuser -u bob -- env $bob catdot users prune --yes | grep -F "removing stale record for uid 1000"
-    ! test -e /var/lib/catdot/users/1000.toml
+    current=$(runuser -u alice -- env $envs catdot current)
+    printf "%s\n" "$current" | grep -Fx "Active profile: alpha"
+    printf "%s\n" "$current" | grep -Fx "Retained profiles: alpha"
+
+    printf alpha-v2 > /usr/share/alpha/.config/demo/managed
+    runuser -u alice -- env $envs catdot select beta --yes
+    test "$(cat /home/alice/.config/demo/managed)" = beta-v1
+    test "$(cat /home/alice/.config/demo/seed)" = user-seed
+
+    runuser -u alice -- env $envs catdot select alpha --yes
+    test "$(cat /home/alice/.config/demo/managed)" = alpha-v1
+    runuser -u alice -- env $envs catdot update --yes
+    test "$(cat /home/alice/.config/demo/managed)" = alpha-v2
+    test "$(cat /home/alice/.config/demo/seed)" = user-seed
+
+    runuser -u alice -- env $envs catdot reset alpha --yes
+    test "$(cat /home/alice/.config/demo/seed)" = alpha-seed
+
+    runuser -u alice -- env $envs catdot remove beta --yes
+    ! grep -F "beta" /home/alice/.local/state/catdot/state.toml
+    runuser -u alice -- env $envs catdot prune --yes | grep -F "No packages are eligible"
+
+    for command in resolve disable exec apply; do
+      ! runuser -u alice -- env $envs catdot "$command"
+    done
   '

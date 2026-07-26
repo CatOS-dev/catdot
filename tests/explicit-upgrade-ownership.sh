@@ -1,21 +1,18 @@
 #!/usr/bin/env bash
-set -euxo pipefail
+set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cargo build --release --locked --manifest-path "$repo_root/Cargo.toml"
 
 podman run --rm --security-opt label=disable \
   -v "$repo_root/target/release:/catdot-bin:ro" archlinux:base-devel \
-  /bin/bash -euxo pipefail -c '
+  /bin/bash -euo pipefail -c '
     pacman -Sy --noconfirm
     useradd --create-home builder
     install -d -o builder -g builder /build /repo
 
     make_package() {
-      directory=$1
-      pkgname=$2
-      pkgver=$3
-      depends=$4
+      directory=$1 pkgname=$2 pkgver=$3 depends=$4
       install -d -o builder -g builder "/build/$directory"
       cat > "/build/$directory/PKGBUILD" <<PKG
 pkgname=$pkgname
@@ -24,14 +21,11 @@ pkgrel=1
 arch=(any)
 license=(MIT)
 depends=($depends)
-package() {
-  install -Dm644 /dev/null "\$pkgdir/usr/share/$pkgname/version-$pkgver"
-}
+package() { install -Dm644 /dev/null "\$pkgdir/usr/share/$pkgname/version-$pkgver"; }
 PKG
       chown builder:builder "/build/$directory/PKGBUILD"
       runuser -u builder -- bash -lc "cd /build/$directory && makepkg --noconfirm --nodeps"
     }
-
     make_package base-v1 catdot-upgrade-base 1 ""
     make_package base-v2 catdot-upgrade-base 2 ""
     make_package consumer catdot-upgrade-consumer 1 "catdot-upgrade-base\\>=2"
@@ -49,44 +43,37 @@ PACMAN
     install -Dm755 /catdot-bin/catdot /usr/bin/catdot
     install -Dm755 /catdot-bin/catdot-helper /usr/lib/catdot/catdot-helper
     install -Dm755 /catdot-bin/catdot-query-helper /usr/lib/catdot/catdot-query-helper
-    install -d /usr/share/catdot/profiles/upgrade-test
-    cat > /usr/share/catdot/profiles/upgrade-test/profile.toml <<"PROFILE"
-schema = 2
-[profile]
-id = "upgrade-test"
+    for profile in upgrade-test empty; do
+      install -d "/usr/share/catdot/profiles/$profile" "/usr/share/$profile"
+    done
+    cat > /usr/share/catdot/profiles/upgrade-test/profile.toml <<"P"
+schema = 4
 name = "Explicit upgrade ownership test"
-description = "Ensures pre-existing explicit packages remain user-owned"
-source_root = "/usr/share/upgrade-test"
-[defaults]
-tool = "consumer"
-[[components]]
-id = "consumer"
-role = "tool"
+description = "Preserves a pre-existing explicit dependency after prune"
 packages = ["catdot-upgrade-consumer"]
-PROFILE
+manage = []
+P
+    cat > /usr/share/catdot/profiles/empty/profile.toml <<"P"
+schema = 4
+name = "Empty"
+description = "No packages"
+packages = []
+manage = []
+P
 
-    cat > /tmp/pkexec-shim.c <<"C"
+    cat > /tmp/pkexec.c <<"C"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-int main(int argc, char **argv) {
-  char uid[32];
-  if (argc < 2) return 64;
-  snprintf(uid, sizeof uid, "%u", (unsigned)getuid());
-  if (setenv("PKEXEC_UID", uid, 1) != 0) return 70;
-  execv(argv[1], argv + 1);
-  return 71;
-}
+int main(int argc, char **argv) { char uid[32]; if (argc < 2) return 64; snprintf(uid, sizeof uid, "%u", (unsigned)getuid()); setenv("PKEXEC_UID", uid, 1); execv(argv[1], argv + 1); return 71; }
 C
-    cc -O2 -o /usr/bin/pkexec /tmp/pkexec-shim.c
+    cc -O2 /tmp/pkexec.c -o /usr/bin/pkexec
     chown root:root /usr/bin/pkexec
     chmod 4755 /usr/bin/pkexec
-
     useradd --create-home alice
-    user_env="HOME=/home/alice XDG_STATE_HOME=/home/alice/.local/state"
-    runuser -u alice -- env $user_env catdot select upgrade-test
-    runuser -u alice -- env $user_env catdot resolve --yes
+    envs="HOME=/home/alice XDG_STATE_HOME=/home/alice/.local/state"
 
+    runuser -u alice -- env $envs catdot select upgrade-test --yes
     test "$(pacman -Q catdot-upgrade-base | awk "{print \$2}")" = 2-1
     pacman -Qqe catdot-upgrade-base | grep -Fx catdot-upgrade-base
     python3 - <<"PY"
@@ -99,9 +86,9 @@ assert base["was_missing_before_catdot"] is False
 assert base["install_reason"] == "Explicit"
 PY
 
-    runuser -u alice -- env $user_env catdot disable tool
-    runuser -u alice -- env $user_env catdot resolve --yes
-    runuser -u alice -- env $user_env catdot prune --yes
+    runuser -u alice -- env $envs catdot select empty --yes
+    runuser -u alice -- env $envs catdot remove upgrade-test --yes
+    runuser -u alice -- env $envs catdot prune --yes
     pacman -Q catdot-upgrade-base
     ! pacman -Q catdot-upgrade-consumer
     pacman -Qqe catdot-upgrade-base | grep -Fx catdot-upgrade-base

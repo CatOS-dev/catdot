@@ -126,9 +126,9 @@ impl ActivationJournal {
             source,
         })
     }
-    /// Explicitly undo an activation whose system-side finalize step failed.
+    /// Explicitly undo an activation that failed before its state commit.
     /// Recovery on the next invocation treats a written state as committed, so
-    /// callers that still know finalize failed must request rollback directly.
+    /// callers that still own the failed operation must request rollback directly.
     pub fn rollback(self) -> Result<()> {
         let current = read_state(&self.state_path)?;
         if current != self.old_active_state && current != self.new_active_state {

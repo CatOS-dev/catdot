@@ -2,18 +2,15 @@ use anyhow::{Context, Result, bail};
 use catdot_core::*;
 use clap::{Parser, Subcommand};
 use std::{
-    collections::BTreeSet,
-    io::{self, Write},
+    fs,
+    io::{self, IsTerminal, Write},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 mod runtime;
-
-use runtime::{
-    apply, clear_profile_custom, component_for, exec_role, package_present, profiles, state_file,
-    unresolved_packages,
-};
 
 const MANAGE_HELPER: &str = "/usr/lib/catdot/catdot-helper";
 const QUERY_HELPER: &str = "/usr/lib/catdot/catdot-query-helper";
@@ -21,8 +18,8 @@ const QUERY_HELPER: &str = "/usr/lib/catdot/catdot-query-helper";
 #[derive(Parser)]
 #[command(
     name = "catdot",
-    about = "Manage CatOS desktop profiles safely",
-    long_about = "Select, activate, diagnose, and remove CatOS desktop profile components while preserving the last working configuration until activation succeeds."
+    about = "Switch complete CatOS configuration profiles safely",
+    long_about = "Install packages, initialize seed files, and transactionally switch complete managed configuration profiles."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -31,131 +28,75 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Validate all profile declarations under an explicit root.
-    #[command(about = "Validate profile packages without changing user state")]
+    /// Validate profile declarations under an explicit metadata root.
     Validate {
-        /// Directory containing one subdirectory per profile.
         #[arg(value_name = "PROFILE_ROOT")]
         profile_root: PathBuf,
     },
-    /// List installed profiles or inspect one profile.
-    #[command(about = "List installed profiles")]
-    List {
-        /// Profile ID to inspect.
-        #[arg(value_name = "PROFILE")]
-        profile: Option<String>,
-    },
-    /// Show selected and active components.
-    #[command(about = "Show selected and active components")]
-    Current {
-        /// Include state generation numbers.
-        #[arg(long)]
-        verbose: bool,
-    },
-    /// Select a complete profile or replace one component role.
-    #[command(
-        about = "Select a profile or component",
-        after_help = "Examples:
-  catdot select <PROFILE>
-  catdot select <ROLE> <PROFILE/COMPONENT>"
-    )]
+    /// List installed profiles.
+    List,
+    /// Show one installed profile.
+    Show { profile: String },
+    /// Show the active and retained profiles.
+    Current,
+    /// Select and activate a complete profile.
     Select {
-        /// Profile ID, or the role when selecting one component.
-        #[arg(value_name = "PROFILE_OR_ROLE")]
-        profile_or_role: String,
-        /// Component reference used with the role form.
-        #[arg(value_name = "PROFILE/COMPONENT")]
-        component: Option<String>,
-    },
-    /// Stop selecting a component role after the next resolve.
-    #[command(about = "Disable a selected component role")]
-    Disable {
-        /// Component role, such as terminal or bar.
-        role: String,
-    },
-    /// Reapply the current active configuration without changing selection.
-    #[command(about = "Reapply the active configuration")]
-    Apply,
-    /// Check a system profile generation and reapply the active profile.
-    #[command(about = "Reapply changed active profile inputs without installing packages")]
-    Update,
-    /// Reset the current active profile's custom areas and managed files.
-    #[command(about = "Reset the current active profile")]
-    Reset {
-        /// Active profile ID to reset.
         profile: String,
-    },
-    /// Execute the active provider for a role.
-    #[command(about = "Execute an active component role")]
-    Exec {
-        /// Active role to execute.
-        role: String,
-        /// Arguments appended directly to the component argv.
-        #[arg(trailing_var_arg = true)]
-        arguments: Vec<String>,
-    },
-    /// Validate dependencies and activate the desired configuration.
-    #[command(about = "Resolve dependencies and activate selections")]
-    Resolve {
-        /// Show the complete plan without changing the system.
         #[arg(long)]
         dry_run: bool,
-        /// Accept the displayed plan without an interactive prompt.
         #[arg(long)]
         yes: bool,
     },
-    /// Remove unreferenced packages originally installed by Catdot.
-    #[command(about = "Remove unused Catdot-managed packages")]
+    /// Explicitly refresh a retained profile's packages and managed files.
+    Update {
+        profile: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Reinstall an active profile's managed and seed files.
+    Reset {
+        profile: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Forget an inactive retained profile. Packages remain until prune.
+    Remove {
+        profile: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove unreferenced packages originally introduced by Catdot.
     Prune {
-        /// Show the safe removal plan without changing the system.
         #[arg(long)]
         dry_run: bool,
-        /// Accept the displayed removal plan without a prompt.
         #[arg(long)]
         yes: bool,
     },
-    /// Inspect and resolve uncertain package transaction journals.
-    #[command(about = "Recover an interrupted Catdot package transaction")]
+    /// Inspect or resolve interrupted package transactions.
     Recover {
         #[command(subcommand)]
         command: RecoverCmd,
     },
-    /// Diagnose user configuration and privileged system records.
-    #[command(about = "Diagnose user and system state")]
+    /// Diagnose user configuration and privileged package records.
     Doctor,
-    /// Inspect or remove Catdot records for system users.
-    #[command(about = "Manage multi-user Catdot records")]
-    Users {
-        #[command(subcommand)]
-        command: UsersCmd,
-    },
 }
 
 #[derive(Subcommand)]
 enum RecoverCmd {
-    /// List package transactions that require an explicit decision.
     List,
-    /// Accept the observed package result and commit Catdot records.
     Accept {
         transaction: String,
         #[arg(long)]
         yes: bool,
     },
-    /// Discard an uncommitted transaction journal.
     Discard {
         transaction: String,
-        #[arg(long)]
-        yes: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum UsersCmd {
-    /// List users known to Catdot.
-    List,
-    /// Remove records for users that no longer exist.
-    Prune {
-        /// Accept removal without an interactive prompt.
         #[arg(long)]
         yes: bool,
     },
@@ -184,1106 +125,625 @@ fn validate_profile_root(root: &Path) -> Result<i32> {
     })
 }
 
+fn installed_profiles() -> Result<std::collections::BTreeMap<String, Profile>> {
+    let registry = runtime::profiles()?;
+    if !registry.diagnostics.is_empty() {
+        for diagnostic in &registry.diagnostics {
+            eprintln!(
+                "invalid profile {}: {}",
+                diagnostic.manifest_path.display(),
+                diagnostic.message
+            );
+        }
+        bail!("installed profile declarations are invalid")
+    }
+    Ok(registry.valid_profiles)
+}
+
 fn confirm(yes: bool) -> Result<()> {
     if yes {
         return Ok(());
     }
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        bail!("refusing non-interactive transaction without --yes")
+    if !io::stdin().is_terminal() {
+        bail!("confirmation requires a terminal; pass --yes")
     }
-    eprint!("Proceed? [Y/n] ");
-    let mut s = String::new();
-    std::io::stdin().read_line(&mut s)?;
-    if s.trim().is_empty() || s.trim().eq_ignore_ascii_case("y") {
-        Ok(())
-    } else {
+    print!("Proceed? [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
         bail!("cancelled")
     }
+    Ok(())
 }
 
-fn query_helper(args: &[&str], context: &str) -> Result<std::process::Output> {
+fn uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+fn pkexec(helper: &str, arguments: &[String], context: &str) -> Result<Output> {
     let output = Command::new("pkexec")
-        .arg(QUERY_HELPER)
-        .args(args)
+        .arg(helper)
+        .args(arguments)
         .output()
-        .with_context(|| format!("{context} through the Catdot query helper"))?;
+        .with_context(|| format!("launch {context}"))?;
     if !output.status.success() {
-        bail!(
-            "{context}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
+        let message = String::from_utf8_lossy(&output.stderr);
+        bail!("{context} failed: {}", message.trim())
     }
     Ok(output)
 }
 
-fn system_doctor_report() -> Result<SystemDoctorReport> {
-    match std::fs::symlink_metadata("/var/lib/catdot") {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(SystemDoctorReport::default());
+struct PreviewState {
+    path: PathBuf,
+}
+
+impl PreviewState {
+    fn create(state: &UserState) -> Result<Self> {
+        let directory = std::env::temp_dir();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before the Unix epoch")?
+            .as_nanos();
+        let contents = toml::to_string_pretty(state)?;
+        for attempt in 0..32 {
+            let path = directory.join(format!(
+                "catdot-preview-{}-{stamp}-{attempt}.toml",
+                std::process::id()
+            ));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    file.write_all(contents.as_bytes())?;
+                    file.sync_all()?;
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
         }
-        Ok(_) | Err(_) => {}
+        bail!("cannot create a unique package-plan preview file")
     }
-    let uid = unsafe { libc::geteuid() }.to_string();
-    let output = query_helper(
-        &["doctor-system", "--uid", &uid],
-        "helper could not inspect system Catdot state",
-    )?;
-    toml::from_str(&String::from_utf8_lossy(&output.stdout))
-        .context("parse system Catdot diagnostics")
 }
 
-fn user_update_service_active() -> Option<bool> {
-    let unit = std::env::var_os("CATDOT_USER_UPDATE_UNIT")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| "/usr/lib/systemd/user/catdot-update.path".into());
-    if !unit.exists() {
-        return None;
+impl Drop for PreviewState {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
-    Command::new("systemctl")
-        .args(["--user", "is-active", "--quiet", "catdot-update.path"])
-        .status()
-        .ok()
-        .map(|status| status.success())
 }
 
-fn print_missing_packages(
-    profiles: &std::collections::BTreeMap<String, Profile>,
-    state: &UserState,
+fn package_preview(
+    state_file: &Path,
+    prospective: &UserState,
+    preview: &PreviewState,
+) -> Result<PackagePlanPreview> {
+    let arguments = vec![
+        "resolve-plan".into(),
+        "--uid".into(),
+        uid().to_string(),
+        "--generation".into(),
+        prospective.generation.to_string(),
+        "--state-path".into(),
+        state_file.display().to_string(),
+        "--preview-path".into(),
+        preview.path.display().to_string(),
+    ];
+    let output = pkexec(QUERY_HELPER, &arguments, "package plan")?;
+    toml::from_str(&String::from_utf8(output.stdout)?).context("parse package plan")
+}
+
+fn apply_package_plan(
+    state_file: &Path,
+    generation: u64,
+    plan: &PackagePlan,
+    preview: &PreviewState,
 ) -> Result<()> {
-    let missing = unresolved_packages(profiles, state)?;
-    if !missing.is_empty() {
-        println!("Missing packages:");
-        for package in missing {
-            println!("  {package}");
-        }
-    }
+    let arguments = vec![
+        "resolve".into(),
+        "--uid".into(),
+        uid().to_string(),
+        "--generation".into(),
+        generation.to_string(),
+        "--digest".into(),
+        plan.digest(),
+        "--state-path".into(),
+        state_file.display().to_string(),
+        "--preview-path".into(),
+        preview.path.display().to_string(),
+    ];
+    pkexec(MANAGE_HELPER, &arguments, "package synchronization")?;
     Ok(())
 }
 
-fn package_changes(plan: &PackagePlan) -> bool {
-    !plan.install.is_empty() || !plan.remove.is_empty() || !plan.replacements.is_empty()
+fn synchronize_package_record(state_file: &Path, state: &UserState) -> Result<()> {
+    let preview_state = PreviewState::create(state)?;
+    let package = package_preview(state_file, state, &preview_state)?;
+    apply_package_plan(state_file, state.generation, &package.plan, &preview_state)
 }
 
 fn print_package_plan(preview: &PackagePlanPreview) {
-    let plan = &preview.plan;
-    if !package_changes(plan) {
-        println!("No package changes are required.");
+    if preview.plan.install.is_empty() && preview.plan.replacements.is_empty() {
+        println!("Packages: no installation required");
+    } else {
+        if !preview.plan.install.is_empty() {
+            println!("Install packages:");
+            for package in &preview.plan.install {
+                println!("  {package}");
+            }
+        }
+        if !preview.plan.replacements.is_empty() {
+            println!("Replace packages:");
+            for replacement in &preview.plan.replacements {
+                println!("  {} -> {}", replacement.remove, replacement.install);
+            }
+        }
     }
-    if !plan.install.is_empty() {
-        println!("Install:");
-        for package in &plan.install {
-            println!("  {package}");
-            if let Some(requirement) = preview.requirements.get(package) {
-                for reference in &requirement.references {
-                    println!(
-                        "    required by uid {}: {}",
-                        reference.uid, reference.component
-                    );
+    if preview.system_update_required {
+        println!("Update Catdot package ownership records.");
+    }
+}
+
+fn print_activation_plan(plan: &ActivationPlan) {
+    let mut printed = false;
+    for removal in &plan.removals {
+        if removal.exists() {
+            if !printed {
+                println!("Configuration:");
+                printed = true;
+            }
+            println!("  remove managed {}", removal.display());
+        }
+    }
+    for entry in &plan.entries {
+        if entry.cache {
+            println!("  refresh managed snapshot for {}", plan.target_profile);
+            printed = true;
+            continue;
+        }
+        if !printed {
+            println!("Configuration:");
+            printed = true;
+        }
+        match &entry.materialization {
+            Materialization::Managed { .. } => {
+                if entry.target.exists() {
+                    println!("  BACKUP AND OVERWRITE managed {}", entry.target.display());
+                } else {
+                    println!("  install managed {}", entry.target.display());
                 }
             }
+            Materialization::Seed { overwrite, .. } => {
+                if *overwrite {
+                    println!("  BACKUP AND RESET seed {}", entry.target.display());
+                } else if entry.target.exists() {
+                    println!("  preserve existing seed {}", entry.target.display());
+                } else {
+                    println!("  initialize seed {}", entry.target.display());
+                }
+            }
+            Materialization::ManagedCache { .. } => unreachable!("cache entry handled above"),
         }
     }
-    if !plan.satisfied.is_empty() {
-        println!("Already available:");
-        for package in &plan.satisfied {
-            println!("  {package}");
-        }
-    }
-    if !plan.replacements.is_empty() {
-        println!("Replace:");
-        for replacement in &plan.replacements {
-            println!(
-                "  {} -> {} ({})",
-                replacement.remove, replacement.install, replacement.reason
-            );
-        }
-    } else if !plan.remove.is_empty() {
-        println!("Remove for installation:");
-        for package in &plan.remove {
-            println!("  {package}");
-        }
+    if !printed {
+        println!("Configuration: no file changes required");
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ActivationIdentity {
-    configuration: String,
-    xdg: String,
-}
-
-#[derive(Debug, Clone)]
-struct ActivationPreview {
-    changes: bool,
-    identity: ActivationIdentity,
-}
-
-#[derive(Debug, Clone)]
-struct ResolvePreview {
-    package: PackagePlanPreview,
-    activation: ActivationPreview,
-}
-
-fn print_activation_plan(
+fn run_profile_operation(
     profiles: &std::collections::BTreeMap<String, Profile>,
-    state: &UserState,
-    state_path: &std::path::Path,
-) -> Result<ActivationPreview> {
-    let roles = state
-        .components
-        .keys()
-        .chain(state.active_components.keys())
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let mut activate = Vec::new();
-    let mut change = Vec::new();
-    let mut deactivate = Vec::new();
-    for role in roles {
-        match (
-            state.active_components.get(&role),
-            state.components.get(&role),
-        ) {
-            (None, Some(desired)) => activate.push((role, desired.clone())),
-            (Some(active), Some(desired)) if active != desired => {
-                change.push((role, active.clone(), desired.clone()))
-            }
-            (Some(active), None) => deactivate.push((role, active.clone())),
-            _ => {}
-        }
-    }
-    if !activate.is_empty() {
-        println!("Activate:");
-        for (role, reference) in &activate {
-            println!("  {role}: {reference}");
-        }
-    }
-    if !change.is_empty() {
-        println!("Change:");
-        for (role, active, desired) in &change {
-            println!("  {role}: {active} -> {desired}");
-        }
-    }
-    if !deactivate.is_empty() {
-        println!("Deactivate:");
-        for (role, active) in &deactivate {
-            println!("  {role}: {active}");
-        }
-    }
-    let home = runtime::home()?;
-    let registry_path = managed_targets_path(state_path)?;
-    let plan = build_activation_preview(profiles, state, &home, &registry_path)?;
-    for entry in &plan.entries {
-        match &entry.materialization {
-            Materialization::Generate { .. } => {
-                println!("  generate: {} ({})", entry.target.display(), entry.owner)
-            }
-            Materialization::Symlink { source } => println!(
-                "  symlink: {} -> {} ({})",
-                entry.target.display(),
-                source.display(),
-                entry.owner
-            ),
-            Materialization::File { source } => println!(
-                "  generate: {} -> {} ({})",
-                source.display(),
-                entry.target.display(),
-                entry.owner
-            ),
-            Materialization::Merge { source, .. } => println!(
-                "  merge: {} -> {} ({})",
-                source.display(),
-                entry.target.display(),
-                entry.owner
-            ),
-            Materialization::User { .. } => {
-                println!(
-                    "  preserve user: {} ({})",
-                    entry.target.display(),
-                    entry.owner
-                )
-            }
-        }
-    }
-    for target in &plan.removals {
-        println!("  delete managed target: {}", target.display());
-    }
-    let xdg_plan = build_xdg_plan(profiles, state, &runtime::xdg_config_home(&home))?;
-    for warning in &xdg_plan.warnings {
-        println!("warning: {warning}");
-    }
-    if xdg_plan.has_changes() {
-        for (association, desktop) in &xdg_plan.defaults {
-            println!("  xdg default: {association} -> {desktop}");
-        }
-        for association in xdg_plan.restore.keys() {
-            println!("  xdg restore: {association}");
-        }
-        for (key, command) in &xdg_plan.environment {
-            println!("  xdg environment: {key}={command}");
-        }
-        if xdg_plan.environment_restore {
-            println!(
-                "  restore xdg environment: {}",
-                xdg_plan.environment_path.display()
-            );
-        } else if xdg_plan.environment_remove {
-            println!(
-                "  remove xdg environment: {}",
-                xdg_plan.environment_path.display()
-            );
-        }
-    }
-    let configuration_changes = plan.has_changes();
-    let selection_changes = !activate.is_empty() || !change.is_empty() || !deactivate.is_empty();
-    let xdg_changes = xdg_plan.has_changes();
-    Ok(ActivationPreview {
-        changes: selection_changes || configuration_changes || xdg_changes,
-        identity: ActivationIdentity {
-            configuration: plan.identity_digest(),
-            xdg: xdg_plan.identity_digest(),
-        },
-    })
-}
-
-fn resolve_helper(
-    profiles: &std::collections::BTreeMap<String, Profile>,
-    state: &UserState,
-    state_path: &std::path::Path,
+    target: &str,
+    mode: ActivationMode,
     dry_run: bool,
     yes: bool,
-) -> Result<Option<ResolvePreview>> {
-    let uid = unsafe { libc::geteuid() }.to_string();
-    let generation = state.generation.to_string();
-    let state_path_text = state_path
-        .to_str()
-        .context("state path is not valid UTF-8")?;
-    println!("Checking package requirements...");
-    io::stdout().flush()?;
-    let output = query_helper(
-        &[
-            "resolve-plan",
-            "--uid",
-            &uid,
-            "--generation",
-            &generation,
-            "--state-path",
-            state_path_text,
-        ],
-        "helper could not create package plan",
-    )?;
-    let preview: PackagePlanPreview = toml::from_str(&String::from_utf8_lossy(&output.stdout))
-        .context("parse canonical package plan from helper")?;
-    print_package_plan(&preview);
-    let activation = print_activation_plan(profiles, state, state_path)?;
-    let needs_work =
-        package_changes(&preview.plan) || activation.changes || preview.system_update_required;
-    if !needs_work {
-        println!("Catdot is already up to date.");
-        return Ok(None);
+) -> Result<()> {
+    let profile = profiles
+        .get(target)
+        .with_context(|| format!("unknown profile {target}"))?;
+    let home = runtime::home()?;
+    let state_file = runtime::state_file()?;
+    recover_activation_journals(&state_file)?;
+    let _lock = lock(&state_lock_path(&state_file)?)?;
+    let old = read_state(&state_file)?;
+    validate_user_state(&old, profiles)?;
+    let mut prospective = old.clone();
+
+    match mode {
+        ActivationMode::Select => {
+            let inserted = retain_profile(&mut prospective, profile)?;
+            if !inserted && old.active_profile.as_deref() != Some(target) {
+                prospective.generation += 1;
+            }
+        }
+        ActivationMode::Update => {
+            if !old.profiles.contains_key(target) {
+                bail!("profile {target} is not retained")
+            }
+            prospective.generation += 1;
+        }
+        ActivationMode::Reset => {
+            if old.active_profile.as_deref() != Some(target) {
+                bail!("profile {target} is not active")
+            }
+            prospective.generation += 1;
+        }
     }
-    if preview.system_update_required && !package_changes(&preview.plan) && !activation.changes {
-        println!("System records need synchronization.");
+    prepare_profile_state(&mut prospective, profile, mode)?;
+
+    let registry_path = managed_targets_path(&state_file)?;
+    let plan =
+        build_activation_preview(profiles, &prospective, target, &home, &registry_path, mode)?;
+    let preview_state = PreviewState::create(&prospective)?;
+    let package = package_preview(&state_file, &prospective, &preview_state)?;
+
+    println!("Profile: {target}");
+    print_package_plan(&package);
+    print_activation_plan(&plan);
+    let package_changes = !package.plan.install.is_empty()
+        || !package.plan.remove.is_empty()
+        || !package.plan.replacements.is_empty()
+        || package.system_update_required;
+    if !plan.has_changes() && !package_changes {
+        println!("No changes are required.");
+        return Ok(());
     }
     if dry_run {
-        return Ok(Some(ResolvePreview {
-            package: preview,
-            activation,
-        }));
-    }
-    if package_changes(&preview.plan) || activation.changes {
-        confirm(yes)?;
-    }
-    if package_changes(&preview.plan) {
-        println!("Applying package transaction...");
-    } else {
-        println!("Registering profile requirements...");
-    }
-    io::stdout().flush()?;
-    let digest = preview.plan.digest();
-    let status = Command::new("pkexec")
-        .arg(MANAGE_HELPER)
-        .args([
-            "resolve",
-            "--uid",
-            &uid,
-            "--generation",
-            &generation,
-            "--state-path",
-            state_path_text,
-            "--digest",
-            &digest,
-        ])
-        .status()
-        .context("start Catdot package transaction")?;
-    if !status.success() {
-        bail!("helper transaction failed")
-    }
-    Ok(Some(ResolvePreview {
-        package: preview,
-        activation,
-    }))
-}
-
-fn recovery_list() -> Result<String> {
-    let uid = unsafe { libc::geteuid() }.to_string();
-    let output = query_helper(
-        &["recovery-list", "--uid", &uid],
-        "helper could not inspect package recovery state",
-    )?;
-    String::from_utf8(output.stdout).context("recovery output is not valid UTF-8")
-}
-
-fn recover_helper(transaction: &str, accept: bool, yes: bool) -> Result<()> {
-    let report = recovery_list()?;
-    print!("{report}");
-    if !report.contains(&format!("transaction {transaction}")) {
-        bail!("unknown package transaction {transaction}")
+        return Ok(());
     }
     confirm(yes)?;
-    let uid = unsafe { libc::geteuid() }.to_string();
-    let action = if accept {
-        "recovery-accept"
-    } else {
-        "recovery-discard"
+
+    apply_package_plan(
+        &state_file,
+        prospective.generation,
+        &package.plan,
+        &preview_state,
+    )?;
+
+    let verified = match build_activation_plan(
+        profiles,
+        &prospective,
+        target,
+        &home,
+        &registry_path,
+        mode,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let reconcile = synchronize_package_record(&state_file, &old);
+            return match reconcile {
+                Ok(()) => Err(error.into()),
+                Err(reconcile) => Err(anyhow::anyhow!(
+                    "configuration planning failed: {error}; package ownership rollback also failed: {reconcile:#}"
+                )),
+            };
+        }
     };
-    let status = Command::new("pkexec")
-        .arg(MANAGE_HELPER)
-        .args([action, "--uid", &uid, "--transaction", transaction])
-        .status()
-        .context("start Catdot package recovery")?;
-    if !status.success() {
-        bail!("package recovery decision was rejected")
+    if verified.identity_digest() != plan.identity_digest() {
+        let reconcile = synchronize_package_record(&state_file, &old);
+        return match reconcile {
+            Ok(()) => Err(anyhow::anyhow!(
+                "configuration plan changed after confirmation; run the command again"
+            )),
+            Err(reconcile) => Err(anyhow::anyhow!(
+                "configuration plan changed after confirmation; package ownership rollback also failed: {reconcile:#}"
+            )),
+        };
     }
-    println!(
-        "Recovered package transaction {transaction} by {} its observed result.",
-        if accept { "accepting" } else { "discarding" }
-    );
+
+    let mut final_state = prospective.clone();
+    verified.record_applied_state(&mut final_state)?;
+    if mode != ActivationMode::Update {
+        final_state.active_profile = Some(target.to_owned());
+    }
+    let mut journal = match ActivationJournal::begin(&state_file, old.clone(), final_state.clone())
+    {
+        Ok(journal) => journal,
+        Err(error) => {
+            let reconcile = synchronize_package_record(&state_file, &old);
+            return match reconcile {
+                Ok(()) => Err(error.into()),
+                Err(reconcile) => Err(anyhow::anyhow!(
+                    "cannot create activation journal: {error}; package ownership rollback also failed: {reconcile:#}"
+                )),
+            };
+        }
+    };
+    let activation = journal
+        .mark_applying()
+        .and_then(|_| activate_configuration(&verified, &registry_path, &mut journal))
+        .and_then(|_| write_state(&state_file, &final_state))
+        .and_then(|_| journal.mark_state_written());
+    if let Err(error) = activation {
+        let rollback = journal.rollback();
+        if let Err(rollback) = rollback {
+            return Err(anyhow::anyhow!(
+                "activation failed: {error}; rollback also failed: {rollback}"
+            ));
+        }
+        let reconcile = synchronize_package_record(&state_file, &old);
+        return match reconcile {
+            Ok(()) => Err(error.into()),
+            Err(reconcile) => Err(anyhow::anyhow!(
+                "activation failed: {error}; package ownership rollback also failed: {reconcile:#}"
+            )),
+        };
+    }
+    journal.complete()?;
+    if final_state.active_profile.as_deref() == Some(target) {
+        println!("Profile {target} is active.");
+    } else {
+        println!("Profile {target} was updated without changing the active profile.");
+    }
     Ok(())
 }
 
-fn prune_helper(dry_run: bool, yes: bool) -> Result<()> {
-    let uid = unsafe { libc::geteuid() }.to_string();
-    println!("Checking for unused Catdot packages...");
-    io::stdout().flush()?;
-    let output = query_helper(
-        &["prune-plan", "--uid", &uid],
-        "helper could not create prune plan",
+fn remove_profile_command(
+    profiles: &std::collections::BTreeMap<String, Profile>,
+    target: &str,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    let state_file = runtime::state_file()?;
+    recover_activation_journals(&state_file)?;
+    let _lock = lock(&state_lock_path(&state_file)?)?;
+    let old = read_state(&state_file)?;
+    validate_user_state(&old, profiles)?;
+    if !old.profiles.contains_key(target) {
+        bail!("profile {target} is not retained")
+    }
+    let mut prospective = old.clone();
+    remove_profile(&mut prospective, target)?;
+    let preview_state = PreviewState::create(&prospective)?;
+    let package = package_preview(&state_file, &prospective, &preview_state)?;
+    println!("Forget retained profile {target}.");
+    print_package_plan(&package);
+    println!("Seed files in HOME are preserved. Package removal requires catdot prune.");
+    if dry_run {
+        return Ok(());
+    }
+    confirm(yes)?;
+    apply_package_plan(
+        &state_file,
+        prospective.generation,
+        &package.plan,
+        &preview_state,
     )?;
-    let preview: PackagePlanPreview = toml::from_str(&String::from_utf8_lossy(&output.stdout))
-        .context("parse canonical prune plan from helper")?;
-    let plan = preview.plan;
-    if plan.remove.is_empty() {
-        if preview.system_update_required {
-            println!(
-                "No packages are currently removable; an interrupted transaction needs recovery."
-            );
-            if dry_run {
-                return Ok(());
-            }
-            println!("Recovering package records...");
-        } else {
-            println!("Nothing to prune.");
+    if let Err(error) = write_state(&state_file, &prospective) {
+        let reconcile = synchronize_package_record(&state_file, &old);
+        return match reconcile {
+            Ok(()) => Err(error.into()),
+            Err(reconcile) => Err(anyhow::anyhow!(
+                "cannot commit profile removal: {error}; package ownership rollback also failed: {reconcile:#}"
+            )),
+        };
+    }
+    let cache = profile_managed_cache(&managed_targets_path(&state_file)?, target)?;
+    match fs::remove_dir_all(&cache) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!(
+            "warning: could not remove cached managed revision {}: {error}",
+            cache.display()
+        ),
+    }
+    println!("Profile {target} was forgotten.");
+    Ok(())
+}
+
+fn prune(dry_run: bool, yes: bool) -> Result<()> {
+    let query = vec!["prune-plan".into(), "--uid".into(), uid().to_string()];
+    let output = pkexec(QUERY_HELPER, &query, "prune plan")?;
+    let preview: PackagePlanPreview = toml::from_str(&String::from_utf8(output.stdout)?)?;
+    if preview.plan.remove.is_empty() {
+        println!("No packages are eligible for Catdot prune.");
+        if !preview.system_update_required {
             return Ok(());
         }
+        println!("Pending package transaction metadata will be recovered.");
     } else {
-        println!("Remove:");
-        for package in &plan.remove {
+        println!("Remove packages:");
+        for package in &preview.plan.remove {
             println!("  {package}");
         }
-        if dry_run {
-            return Ok(());
+    }
+    if dry_run {
+        return Ok(());
+    }
+    confirm(yes)?;
+    let state = read_state(&runtime::state_file()?)?;
+    let arguments = vec![
+        "prune".into(),
+        "--uid".into(),
+        uid().to_string(),
+        "--generation".into(),
+        state.generation.to_string(),
+        "--digest".into(),
+        preview.plan.digest(),
+    ];
+    pkexec(MANAGE_HELPER, &arguments, "package prune")?;
+    println!("Unused Catdot packages were removed.");
+    Ok(())
+}
+
+fn recover(command: RecoverCmd) -> Result<()> {
+    match command {
+        RecoverCmd::List => {
+            let args = vec!["recovery-list".into(), "--uid".into(), uid().to_string()];
+            let output = pkexec(QUERY_HELPER, &args, "package recovery list")?;
+            print!("{}", String::from_utf8_lossy(&output.stdout));
         }
-        confirm(yes)?;
-        println!("Removing {} package(s)...", plan.remove.len());
-    }
-    io::stdout().flush()?;
-    let digest = plan.digest();
-    let status = Command::new("pkexec")
-        .arg(MANAGE_HELPER)
-        .args([
-            "prune",
-            "--uid",
-            &uid,
-            "--generation",
-            "0",
-            "--digest",
-            &digest,
-        ])
-        .status()
-        .context("start Catdot prune transaction")?;
-    if !status.success() {
-        bail!("helper prune transaction failed")
-    }
-    if !plan.remove.is_empty() {
-        println!("Pruned {} package(s).", plan.remove.len());
-    } else {
-        println!("Package records recovered.");
+        RecoverCmd::Accept { transaction, yes } => {
+            confirm(yes)?;
+            let args = vec![
+                "recovery-accept".into(),
+                "--uid".into(),
+                uid().to_string(),
+                "--transaction".into(),
+                transaction,
+            ];
+            pkexec(MANAGE_HELPER, &args, "package recovery")?;
+        }
+        RecoverCmd::Discard { transaction, yes } => {
+            confirm(yes)?;
+            let args = vec![
+                "recovery-discard".into(),
+                "--uid".into(),
+                uid().to_string(),
+                "--transaction".into(),
+                transaction,
+            ];
+            pkexec(MANAGE_HELPER, &args, "package recovery")?;
+        }
     }
     Ok(())
 }
 
-fn print_current(state: &UserState, verbose: bool) {
-    if state.components.is_empty() && state.active_components.is_empty() {
-        println!("No profile components are selected.");
-        println!("Run `catdot list` to see installed profiles.");
-        return;
+fn doctor(profiles: &std::collections::BTreeMap<String, Profile>) -> Result<i32> {
+    let state_file = runtime::state_file()?;
+    let mut errors = 0;
+    if let Err(error) = recover_activation_journals(&state_file) {
+        eprintln!("error: activation recovery: {error}");
+        errors += 1;
     }
-    if verbose {
-        println!("Desired generation: {}", state.generation);
-        println!("Active generation: {}", state.active_generation);
-    }
-    let pending =
-        state.components != state.active_components || state.generation != state.active_generation;
-    if !state.active_components.is_empty() {
-        println!("Active components:");
-        for (role, reference) in &state.active_components {
-            println!("  {role}: {reference}");
+    match read_state(&state_file).and_then(|state| validate_user_state(&state, profiles)) {
+        Ok(()) => println!("user state: valid"),
+        Err(error) => {
+            eprintln!("error: user state: {error}");
+            errors += 1;
         }
     }
-    if pending {
-        println!("Pending selection:");
-        for (role, reference) in &state.components {
-            match state.active_components.get(role) {
-                Some(active) if active == reference => {}
-                Some(active) => println!("  {role}: {active} -> {reference}"),
-                None => println!("  {role}: activate {reference}"),
+    let args = vec!["doctor-system".into(), "--uid".into(), uid().to_string()];
+    match pkexec(QUERY_HELPER, &args, "system doctor").and_then(|output| {
+        let text = String::from_utf8(output.stdout)?;
+        toml::from_str::<SystemDoctorReport>(&text).map_err(Into::into)
+    }) {
+        Ok(report) => {
+            for line in report.lines {
+                println!("{line}");
             }
+            errors += report.errors;
         }
-        for (role, active) in &state.active_components {
-            if !state.components.contains_key(role) {
-                println!("  {role}: deactivate {active}");
-            }
+        Err(error) => {
+            eprintln!("error: system doctor: {error:#}");
+            errors += 1;
         }
-        println!("Run `catdot resolve` to apply pending changes.");
     }
+    Ok(if errors == 0 { 0 } else { 2 })
 }
 
-fn print_success_summary(old: &UserState, new: &UserState, plan: &PackagePlan) {
-    println!("Profile changes applied successfully.");
-    let changed = old.active_components != new.active_components;
-    if changed && !new.active_components.is_empty() {
-        println!("Active components:");
-        for (role, reference) in &new.active_components {
-            println!("  {role}: {reference}");
-        }
+fn print_profile(profile: &Profile, retained: bool, active: bool) {
+    let marker = if active {
+        "active"
+    } else if retained {
+        "retained"
+    } else {
+        "available"
+    };
+    println!("{} ({marker})", profile.id);
+    println!("  {}", profile.name);
+    if !profile.description.is_empty() {
+        println!("  {}", profile.description);
     }
-    if !plan.install.is_empty() {
-        println!("Installed or upgraded: {} package(s).", plan.install.len());
+    if !profile.packages.is_empty() {
+        println!("  packages: {}", profile.packages.join(", "));
     }
-    if !plan.replacements.is_empty() {
-        println!("Replaced: {} package(s).", plan.replacements.len());
+    if !profile.manage.is_empty() {
+        println!(
+            "  managed: {}",
+            profile
+                .manage
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
-}
-
-fn retain_available_active_components(
-    state: &mut UserState,
-    profiles: &std::collections::BTreeMap<String, Profile>,
-) -> bool {
-    let before = state.active_components.clone();
-    state.active_components.retain(|role, reference| {
-        let Some((profile_id, component_id)) = reference.split_once('/') else {
-            return false;
-        };
-        profiles
-            .get(profile_id)
-            .and_then(|profile| profile.components.get(component_id))
-            .is_some_and(|component| component.role == *role)
-    });
-    state
-        .activation_digests
-        .retain(|role, _| state.active_components.contains_key(role));
-    state
-        .active_package_digests
-        .retain(|role, _| state.active_components.contains_key(role));
-    before != state.active_components
 }
 
 pub fn run() -> Result<i32> {
-    let cli = Cli::parse();
-    if let Cmd::Validate { profile_root } = &cli.command {
-        return validate_profile_root(profile_root);
+    let command = Cli::parse().command;
+    if let Cmd::Validate { profile_root } = command {
+        return validate_profile_root(&profile_root);
     }
-    let registry = profiles()?;
-    let ps = &registry.valid_profiles;
-    let path = state_file()?;
-    let is_doctor = matches!(&cli.command, Cmd::Doctor);
-    let dry_run = matches!(&cli.command, Cmd::Resolve { dry_run: true, .. });
-    let mutates_state = !dry_run
-        && matches!(
-            &cli.command,
-            Cmd::Select { .. }
-                | Cmd::Disable { .. }
-                | Cmd::Apply
-                | Cmd::Update
-                | Cmd::Reset { .. }
-                | Cmd::Resolve { .. }
-        );
-    let _state_lock = if mutates_state {
-        Some(lock(&state_lock_path(&path)?)?)
-    } else {
-        None
-    };
-    if mutates_state {
-        recover_activation_journals(&path)?;
-    }
-    let mut state_read_broken = false;
-    let mut state = match if mutates_state {
-        initialize_state_from_default(&path, &default_declaration_path(), ps)
-    } else {
-        preview_state_from_default(&path, &default_declaration_path(), ps)
-    } {
-        Ok(state) => state,
-        Err(error) if is_doctor => {
-            println!("error: broken state: {error}");
-            state_read_broken = true;
-            UserState::default()
-        }
-        Err(error) => return Err(error.into()),
-    };
-    if !is_doctor {
-        match &cli.command {
-            Cmd::Apply | Cmd::Update | Cmd::Reset { .. } | Cmd::Resolve { .. } => {
-                validate_user_state(&state, ps)?;
+
+    let profiles = installed_profiles()?;
+    match command {
+        Cmd::Validate { .. } => unreachable!(),
+        Cmd::List => {
+            let state = read_state(&runtime::state_file()?)?;
+            for profile in profiles.values() {
+                print_profile(
+                    profile,
+                    state.profiles.contains_key(&profile.id),
+                    state.active_profile.as_deref() == Some(&profile.id),
+                );
             }
-            Cmd::Exec { role, .. } => {
-                if let Err(error) = validate_user_state(&state, ps) {
-                    if let Some(reference) = state.active_components.get(role)
-                        && let Some((profile_id, _)) = reference.split_once('/')
-                        && let Some(diagnostic) = registry.diagnostics.iter().find(|diagnostic| {
-                            diagnostic
-                                .profile_directory
-                                .file_name()
-                                .is_some_and(|name| name == std::ffi::OsStr::new(profile_id))
-                        })
-                    {
-                        bail!(
-                            "active component {reference} has an invalid provider declaration: {}",
-                            diagnostic.message
-                        );
-                    }
-                    return Err(error.into());
-                }
-            }
-            _ => {}
         }
-    }
-    match cli.command {
-        Cmd::Validate { .. } => unreachable!("handled before user state initialization"),
-        Cmd::List { profile } => {
-            if let Some(id) = profile {
-                let p = match ps.get(&id) {
-                    Some(profile) => profile,
-                    None => {
-                        if let Some(diagnostic) = registry.diagnostics.iter().find(|diagnostic| {
-                            diagnostic
-                                .profile_directory
-                                .file_name()
-                                .is_some_and(|name| name == std::ffi::OsStr::new(&id))
-                        }) {
-                            bail!("invalid profile {id}: {}", diagnostic.message);
-                        }
-                        bail!("unknown profile {id}");
-                    }
-                };
-                println!("{} — {}", p.id, p.name);
-                println!("{}", p.description);
-                println!("Components:");
-                for (id, component) in &p.components {
-                    let default = p
-                        .defaults
-                        .get(&component.role)
-                        .is_some_and(|selected| selected == id);
-                    println!(
-                        "  {}: {}{}",
-                        component.role,
-                        id,
-                        if default { " (default)" } else { "" }
-                    );
-                }
+        Cmd::Show { profile } => {
+            let state = read_state(&runtime::state_file()?)?;
+            let profile = profiles
+                .get(&profile)
+                .with_context(|| format!("unknown profile {profile}"))?;
+            print_profile(
+                profile,
+                state.profiles.contains_key(&profile.id),
+                state.active_profile.as_deref() == Some(&profile.id),
+            );
+        }
+        Cmd::Current => {
+            let state = read_state(&runtime::state_file()?)?;
+            println!(
+                "Active profile: {}",
+                state.active_profile.as_deref().unwrap_or("none")
+            );
+            if state.profiles.is_empty() {
+                println!("Retained profiles: none");
             } else {
-                if ps.is_empty() {
-                    println!("No Catdot profiles are installed.");
-                }
-                for p in ps.values() {
-                    println!("{} — {}", p.id, p.name)
-                }
-                if !registry.diagnostics.is_empty() {
-                    println!(
-                        "Invalid profiles: {} (run: catdot doctor)",
-                        registry.diagnostics.len()
-                    );
-                }
+                println!(
+                    "Retained profiles: {}",
+                    state
+                        .profiles
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
         }
-        Cmd::Current { verbose } => print_current(&state, verbose),
         Cmd::Select {
-            profile_or_role,
-            component,
+            profile,
+            dry_run,
+            yes,
+        } => run_profile_operation(&profiles, &profile, ActivationMode::Select, dry_run, yes)?,
+        Cmd::Update {
+            profile,
+            dry_run,
+            yes,
         } => {
-            let before = state.clone();
-            retain_available_active_components(&mut state, ps);
-            if let Some(reference) = component {
-                select_component(&mut state, ps, &profile_or_role, &reference)?;
-            } else {
-                let p = ps.get(&profile_or_role).context("unknown profile")?;
-                let desired = select_profile(p)?;
-                if state.components != desired.components {
-                    state.components = desired.components;
-                    state.generation += 1;
-                }
-            }
-            if state != before {
-                write_state(&path, &state)?;
-            }
-            if state.components == before.components {
-                println!("Desired selection is unchanged.");
-            } else {
-                for (role, reference) in &state.components {
-                    println!("Selected desired {role}: {reference}");
-                    match state.active_components.get(role) {
-                        Some(active) => println!("Active {role} remains: {active}"),
-                        None => println!("Active {role} remains: none"),
-                    }
-                }
-                print_missing_packages(ps, &state)?;
-                println!("Next: catdot resolve");
-            }
-        }
-        Cmd::Disable { role } => {
-            let before = state.clone();
-            retain_available_active_components(&mut state, ps);
-            if state.components.remove(&role).is_some() {
-                state.generation += 1;
-            }
-            if state != before {
-                write_state(&path, &state)?;
-            }
-            if before.components.contains_key(&role) {
-                println!("Disabled desired {role}; run: catdot resolve");
-            } else {
-                println!("Desired role {role} is already disabled.");
-            }
-        }
-        Cmd::Apply | Cmd::Update => {
-            let system_generation = read_system_generation()?;
-            let mut active = state.clone();
-            active.components = active.active_components.clone();
-            let package_inputs = package_digests(ps, &active)?;
-            let activation_inputs = activation_digests(ps, &active)?;
-            if matches!(cli.command, Cmd::Update)
-                && system_generation == state.active_system_generation
-                && activation_inputs == state.activation_digests
-                && package_inputs == state.active_package_digests
-                && !state.needs_resolve
-            {
-                println!("Active profile is current.");
-                return Ok(0);
-            }
-            let declares_packages = active.components.keys().any(|role| {
-                component_for(ps, &active, role)
-                    .is_ok_and(|(_, component, _)| !component.packages.is_empty())
-            });
-            let package_declaration_changed = package_inputs != state.active_package_digests
-                && (!state.active_package_digests.is_empty() || declares_packages);
-            if package_declaration_changed {
-                state.needs_resolve = true;
-                write_state(&path, &state)?;
-                bail!("active profile dependency declarations changed; run: catdot resolve");
-            }
-            let missing = unresolved_packages(ps, &active)?;
-            if !missing.is_empty() {
-                state.needs_resolve = true;
-                write_state(&path, &state)?;
-                bail!(
-                    "active profile needs resolve; missing {}",
-                    missing.into_iter().collect::<Vec<_>>().join(", ")
-                );
-            }
-            if matches!(cli.command, Cmd::Update)
-                && activation_inputs == state.activation_digests
-                && package_inputs == state.active_package_digests
-                && !state.needs_resolve
-            {
-                state.active_system_generation = system_generation;
-                write_state(&path, &state)?;
-                println!("Active profile is current.");
-                return Ok(0);
-            }
-            let mut new_state = state.clone();
-            new_state.activation_digests = activation_inputs;
-            new_state.active_package_digests = package_inputs;
-            new_state.active_system_generation = system_generation;
-            new_state.needs_resolve = false;
-            let mut journal = ActivationJournal::begin(&path, state.clone(), new_state.clone())?;
-            journal.mark_applying()?;
-            if let Err(error) = apply(ps, &active, &mut journal) {
-                recover_activation_journals(&path)?;
-                return Err(error);
-            }
-            write_state(&path, &new_state)?;
-            journal.mark_state_written()?;
-            journal.complete()?;
-            println!("Reapplied active configuration");
-        }
-        Cmd::Reset { profile } => {
-            let mut active = state.clone();
-            active.components = active.active_components.clone();
-            let mut journal = ActivationJournal::begin(&path, state.clone(), state.clone())?;
-            journal.mark_applying()?;
-            let reset =
-                clear_profile_custom(ps, &state, &profile, &mut journal).and_then(|targets| {
-                    let registry = managed_targets_path(&path)?;
-                    journal.track_path(&registry)?;
-                    forget_user_initialization(&registry, targets)?;
-                    apply(ps, &active, &mut journal)
-                });
-            if let Err(error) = reset {
-                recover_activation_journals(&path)?;
-                return Err(error);
-            }
-            journal.complete()?;
-            println!("Reset active profile {profile}");
-        }
-        Cmd::Exec { role, arguments } => {
-            exec_role(ps, &state, &role, &arguments)?;
-            return Ok(0);
-        }
-        Cmd::Resolve { dry_run, yes } => {
-            let Some(preview) = resolve_helper(ps, &state, &path, dry_run, yes)? else {
-                return Ok(0);
+            let selected = match profile {
+                Some(profile) => profile,
+                None => read_state(&runtime::state_file()?)?
+                    .active_profile
+                    .context("no active profile")?,
             };
-            if !dry_run {
-                let old_state = state.clone();
-                // Packages may have installed the profile's content tree or
-                // changed its declarations. Never activate against the
-                // pre-transaction registry.
-                let refreshed_registry = profiles()?;
-                let refreshed_profiles = &refreshed_registry.valid_profiles;
-                validate_user_state(&state, refreshed_profiles)?;
-                let missing = unresolved_packages(refreshed_profiles, &state)?;
-                if !missing.is_empty() {
-                    bail!(
-                        "installed profile declarations require additional packages: {}; run catdot resolve again",
-                        missing.into_iter().collect::<Vec<_>>().join(", ")
-                    )
-                }
-                let home = runtime::home()?;
-                let registry_path = managed_targets_path(&path)?;
-                let configuration_plan =
-                    build_activation_plan(refreshed_profiles, &state, &home, &registry_path)?;
-                let xdg_plan =
-                    build_xdg_plan(refreshed_profiles, &state, &runtime::xdg_config_home(&home))?;
-                let actual_identity = ActivationIdentity {
-                    configuration: configuration_plan.identity_digest(),
-                    xdg: xdg_plan.identity_digest(),
-                };
-                if actual_identity != preview.activation.identity {
-                    bail!("activation plan changed after confirmation; run catdot resolve again")
-                }
-
-                let selection_changes = state.active_components != state.components
-                    || state.active_generation != state.generation;
-                let activation_inputs = activation_digests(refreshed_profiles, &state)?;
-                let package_inputs = package_digests(refreshed_profiles, &state)?;
-                let activation_inputs_changed = activation_inputs != state.activation_digests;
-                let package_inputs_changed = package_inputs != state.active_package_digests;
-                let state_commit_needed = selection_changes
-                    || preview.activation.changes
-                    || activation_inputs_changed
-                    || package_inputs_changed
-                    || state.needs_resolve;
-
-                if state_commit_needed {
-                    println!("Applying user configuration...");
-                    io::stdout().flush()?;
-                    let mut new_state = state.clone();
-                    new_state.active_components = new_state.components.clone();
-                    new_state.active_generation = new_state.generation;
-                    new_state.activation_digests = activation_inputs;
-                    new_state.active_package_digests = package_inputs;
-                    new_state.active_system_generation = read_system_generation()?;
-                    new_state.needs_resolve = false;
-                    let mut journal =
-                        ActivationJournal::begin(&path, old_state.clone(), new_state.clone())?;
-                    journal.mark_applying()?;
-                    if preview.activation.changes || activation_inputs_changed {
-                        let applied = activate_configuration(
-                            &configuration_plan,
-                            &registry_path,
-                            &mut journal,
-                        )
-                        .and_then(|_| activate_xdg(&xdg_plan, &mut journal))
-                        .and_then(|_| journal.mark_applied());
-                        if let Err(error) = applied {
-                            recover_activation_journals(&path)?;
-                            return Err(error.into());
-                        }
-                    }
-                    if let Err(error) = write_state(&path, &new_state) {
-                        recover_activation_journals(&path)?;
-                        return Err(error.into());
-                    }
-                    journal.mark_state_written()?;
-                    state = new_state;
-                    println!("Finalizing system records...");
-                    io::stdout().flush()?;
-                    let uid = unsafe { libc::geteuid() }.to_string();
-                    let generation = state.generation.to_string();
-                    let state_path = path.to_str().context("state path is not valid UTF-8")?;
-                    let status = Command::new("pkexec")
-                        .arg(MANAGE_HELPER)
-                        .args([
-                            "finalize",
-                            "--uid",
-                            &uid,
-                            "--generation",
-                            &generation,
-                            "--state-path",
-                            state_path,
-                        ])
-                        .status()
-                        .context("finalize Catdot activation");
-                    let status = match status {
-                        Ok(status) => status,
-                        Err(error) => {
-                            journal.rollback()?;
-                            return Err(error);
-                        }
-                    };
-                    if !status.success() {
-                        journal.rollback()?;
-                        bail!("helper finalize failed; activation was rolled back")
-                    }
-                    journal.complete()?;
-                } else {
-                    println!("Finalizing system records...");
-                    io::stdout().flush()?;
-                    let uid = unsafe { libc::geteuid() }.to_string();
-                    let generation = state.generation.to_string();
-                    let state_path = path.to_str().context("state path is not valid UTF-8")?;
-                    let status = Command::new("pkexec")
-                        .arg(MANAGE_HELPER)
-                        .args([
-                            "finalize",
-                            "--uid",
-                            &uid,
-                            "--generation",
-                            &generation,
-                            "--state-path",
-                            state_path,
-                        ])
-                        .status()
-                        .context("finalize Catdot activation")?;
-                    if !status.success() {
-                        bail!("helper finalize failed; pending requirements were retained")
-                    }
-                }
-                print_success_summary(&old_state, &state, &preview.package.plan);
-            }
+            run_profile_operation(&profiles, &selected, ActivationMode::Update, dry_run, yes)?;
         }
-        Cmd::Prune { dry_run, yes } => prune_helper(dry_run, yes)?,
-        Cmd::Recover { command } => match command {
-            RecoverCmd::List => print!("{}", recovery_list()?),
-            RecoverCmd::Accept { transaction, yes } => recover_helper(&transaction, true, yes)?,
-            RecoverCmd::Discard { transaction, yes } => recover_helper(&transaction, false, yes)?,
-        },
-        Cmd::Doctor => {
-            let mut warnings = false;
-            let mut errors = state_read_broken;
-            let transactions = activation_transactions_path(&path)?;
-            if transactions.exists()
-                && std::fs::read_dir(&transactions)?.any(|entry| {
-                    entry.ok().is_some_and(|entry| {
-                        entry
-                            .path()
-                            .extension()
-                            .is_some_and(|extension| extension == "toml")
-                    })
-                })
-            {
-                println!("warning: unfinished activation transaction; run catdot resolve or apply");
-                warnings = true;
-            }
-            for diagnostic in &registry.diagnostics {
-                println!(
-                    "warning: invalid profile {} ({:?}): {}",
-                    diagnostic.manifest_path.display(),
-                    diagnostic.kind,
-                    diagnostic.message
-                );
-                warnings = true;
-            }
-            if let Err(error) = validate_user_state(&state, ps) {
-                println!("error: broken state: {error}");
-                errors = true;
-            }
-            if state.generation != state.active_generation {
-                println!(
-                    "warning: pending activation (desired generation {}, active generation {})",
-                    state.generation, state.active_generation
-                );
-                warnings = true;
-            }
-            let system_generation = read_system_generation()?;
-            if system_generation != state.active_system_generation {
-                println!(
-                    "warning: system profile generation changed (system {system_generation}, user {})",
-                    state.active_system_generation
-                );
-                warnings = true;
-            }
-            if state.needs_resolve {
-                println!("warning: active profile needs resolve before it can be updated");
-                warnings = true;
-            }
-            match user_update_service_active() {
-                Some(true) => println!("ok: user update service is active"),
-                Some(false) => {
-                    println!("warning: user update service is inactive");
-                    warnings = true;
-                }
-                None => println!("user update service status: not installed"),
-            }
-            if !state.active_components.is_empty() {
-                let mut active = state.clone();
-                active.components = active.active_components.clone();
-                match activation_digests(ps, &active) {
-                    Ok(digests) if digests != state.activation_digests => {
-                        println!("warning: active profile inputs changed; run catdot update");
-                        warnings = true;
-                    }
-                    Err(error) => {
-                        println!("error: cannot read active profile inputs: {error}");
-                        errors = true;
-                    }
-                    _ => {}
-                }
-            }
-            for (target, managed) in read_managed_registry(&managed_targets_path(&path)?)?.entries {
-                let metadata = std::fs::symlink_metadata(&target).ok();
-                let matches = match managed.lifecycle.as_str() {
-                    "symlink" | "overwrite/symlink" => {
-                        metadata.is_some_and(|metadata| metadata.file_type().is_symlink())
-                            && managed.source.as_ref().is_some_and(|source| {
-                                std::fs::read_link(&target).ok().as_ref() == Some(source)
-                            })
-                    }
-                    "generate" | "merge" | "overwrite/file" => {
-                        metadata.is_some_and(|metadata| !metadata.file_type().is_symlink())
-                    }
-                    _ => false,
-                };
-                if !matches {
-                    println!("warning: missing or damaged managed target: {target}");
-                    warnings = true;
-                }
-            }
-            let pending_components = state.components != state.active_components;
-            let mut inspected = Vec::new();
-            if pending_components {
-                let mut active = state.clone();
-                active.components = active.active_components.clone();
-                inspected.push(("active", active));
-                inspected.push(("desired", state.clone()));
-            } else {
-                inspected.push(("", state.clone()));
-            }
-            for (label, inspected_state) in inspected {
-                for role in inspected_state.components.keys() {
-                    match component_for(ps, &inspected_state, role) {
-                        Ok((_profile, component, reference)) => {
-                            let missing: Vec<_> = component
-                                .packages
-                                .iter()
-                                .filter(|package| !package_present(package))
-                                .map(String::as_str)
-                                .collect();
-                            let prefix = if label.is_empty() {
-                                String::new()
-                            } else {
-                                format!("{label} ")
-                            };
-                            if missing.is_empty() {
-                                println!("ok: {prefix}{role} = {reference}")
-                            } else {
-                                println!(
-                                    "error: unresolved {prefix}{role} = {reference}; missing {}",
-                                    missing.join(", ")
-                                );
-                                errors = true;
-                            }
-                        }
-                        Err(error) => {
-                            let prefix = if label.is_empty() {
-                                String::new()
-                            } else {
-                                format!("{label} ")
-                            };
-                            println!("error: broken {prefix}{role}: {error}");
-                            errors = true;
-                        }
-                    }
-                }
-            }
-            let system = system_doctor_report()?;
-            let has_system_output = !system.lines.is_empty();
-            for line in system.lines {
-                println!("{line}");
-            }
-            warnings |= system.warnings != 0;
-            errors |= system.errors != 0;
-            if !warnings
-                && !errors
-                && state.components.is_empty()
-                && state.active_components.is_empty()
-                && !has_system_output
-            {
-                println!("ok: Catdot is healthy; no profile components are selected");
-            }
-            return Ok(if errors {
-                2
-            } else if warnings {
-                1
-            } else {
-                0
-            });
-        }
-        Cmd::Users { command } => match command {
-            UsersCmd::List => {
-                let uid = unsafe { libc::geteuid() }.to_string();
-                let status = Command::new("pkexec")
-                    .arg(QUERY_HELPER)
-                    .args(["users-list", "--uid", &uid])
-                    .status()
-                    .context("start catdot helper through pkexec")?;
-                if !status.success() {
-                    bail!("helper users list failed")
-                }
-            }
-            UsersCmd::Prune { yes } => {
-                let plan = Command::new("pkexec")
-                    .arg(QUERY_HELPER)
-                    .arg("users-prune-plan")
-                    .output()
-                    .context("obtain stale user-record plan")?;
-                if !plan.status.success() {
-                    bail!("helper stale user-record plan failed")
-                }
-                let plan_text = String::from_utf8_lossy(&plan.stdout);
-                print!("{plan_text}");
-                if plan_text.contains("No stale user records.") {
-                    return Ok(0);
-                }
-                confirm(yes)?;
-                let status = Command::new("pkexec")
-                    .arg(MANAGE_HELPER)
-                    .arg("users-prune")
-                    .status()
-                    .context("start catdot helper through pkexec")?;
-                if !status.success() {
-                    bail!("helper users prune failed")
-                }
-            }
-        },
+        Cmd::Reset {
+            profile,
+            dry_run,
+            yes,
+        } => run_profile_operation(&profiles, &profile, ActivationMode::Reset, dry_run, yes)?,
+        Cmd::Remove {
+            profile,
+            dry_run,
+            yes,
+        } => remove_profile_command(&profiles, &profile, dry_run, yes)?,
+        Cmd::Prune { dry_run, yes } => prune(dry_run, yes)?,
+        Cmd::Recover { command } => recover(command)?,
+        Cmd::Doctor => return doctor(&profiles),
     }
     Ok(0)
 }

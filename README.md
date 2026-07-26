@@ -1,267 +1,135 @@
 # Catdot
 
-Catdot is CatOS's Rust desktop Profile and component manager. Profile metadata
-installed below `/usr/share/catdot/profiles` defines replaceable desktop
-components, configuration lifecycle, argv-based launch commands, XDG defaults,
-and package requirements.
+Catdot is CatOS's complete user-configuration Profile switcher. It installs the
+packages declared by a Profile, initializes user-owned defaults once, and
+transactionally switches the files that the Profile explicitly manages.
 
-The `catdot` package always ships the GTK-only `catos-default` Profile and its
-new-user default declaration. The `catos-gtk-settings` package owns the GTK
-source files under `/etc/skel`. Selecting another complete Profile replaces
-`catos-default`; it is the guaranteed initial Profile, not a permanent layer.
-Desktop Profiles such as `catos-niri-dms` are supplied by their own packages.
+Catdot does not understand desktop components, roles, window-manager syntax,
+XDG providers, or systemd units. Those are ordinary files supplied by a
+Profile. Catdot does not run hooks, reload applications, merge user edits, or
+update a Profile automatically after its package changes.
 
-## User workflow
+## Profile layout
 
-List installed profiles and inspect one before selecting it:
-
-```sh
-catdot list
-catdot list catos-default
-```
-
-Select a complete profile, or replace one role with a component from another
-profile:
-
-```sh
-catdot select catos-default
-catdot select terminal catos-common/foot
-```
-
-Selection changes the **desired** configuration only. The previous **active**
-configuration remains usable until dependency resolution and activation finish
-successfully. Review and apply pending changes with:
-
-```sh
-catdot resolve --dry-run
-catdot resolve
-```
-
-`resolve` displays package installation, replacement, removal, and component
-activation changes before confirmation. Profile `packages` accept normal Arch
-dependency expressions, including versions and virtual providers. A successful
-run installs required packages, applies user configuration, switches the active
-components, and finalizes the multi-user package records. Repeating it when
-nothing changed prints `Catdot is already up to date.`
-
-Inspect current state and launch the active provider for a role:
-
-```sh
-catdot current
-catdot current --verbose
-catdot exec terminal
-catdot exec browser https://catos.dev/
-```
-
-The default `current` output is user-oriented. `--verbose` additionally shows
-state generations used for transaction diagnosis.
-
-Other common operations:
+Profile metadata and content are installed separately but use the same stable
+Profile ID:
 
 ```text
-catdot disable <role>              Stop selecting a role after resolve
-catdot apply                       Reapply the active configuration
-catdot prune [--dry-run] [--yes]   Remove safe, unused Catdot packages
-catdot doctor                      Diagnose user and system state
-catdot users list                  List system user records
-catdot users prune [--yes]         Remove records for deleted users
-catdot validate PROFILE_ROOT       Validate profile packages without user state
+/usr/share/catdot/profiles/catos-niri-dms/profile.toml
+/usr/share/catos-niri-dms/.config/niri/config.kdl
+/usr/share/catos-niri-dms/.config/ghostty/config
 ```
 
-Schema 3 has four configuration lifecycles:
-
-- `generate` owns a writable result produced from an inline template, a source
-  file, or a backend result. User edits are allowed but are overwritten on the
-  next apply.
-- `symlink` exposes an immutable file or directory from the Profile source tree.
-- `merge` installs an editable text default and performs a best-effort three-way
-  merge when that default changes. A conflict preserves the live file and writes
-  `base`, `local`, `upstream`, and `merged` recovery inputs below Catdot state.
-- `user` seeds a file or directory once and does not update it afterward.
-
-Lifecycle-managed targets are backed up and replaced transactionally during
-`resolve`; there is no separate adoption workflow. Switching away from a
-`merge` target backs it up and removes the live target. Selecting that Profile
-again installs the current packaged default as a fresh configuration. Schema 2
-`overwrite/file` and `overwrite/symlink` declarations remain readable only for
-compatibility with already published Profiles.
-
-## Reliability model
-
-Catdot guarantees the safe installation and switching mechanics for valid
-Profiles: a failed activation does not advance active state, and the previous
-working configuration remains available. Official Profile defaults are checked
-for target ownership conflicts, XDG single-value conflicts, invalid WM startup
-orders, and selected startup roles without executable providers. Package builds
-and CI can run `catdot validate PROFILE_ROOT` without creating user state.
-
-Arbitrary cross-Profile component mixing, automatic three-way merge results,
-and migration of heavily modified old configurations are best-effort features.
-Catdot attempts them deterministically, reports warnings or conflicts, and must
-not sacrifice the previous active configuration to force a result. WM startup
-ordering guarantees emitted command order, not process readiness.
-
-Catdot keeps desired and active selections separate. Package and activation
-plans are regenerated from installed manifests, tied to a state generation,
-and checked by digest before a privileged transaction. The helper never accepts
-an arbitrary shell command or a client-supplied package list.
-
-User configuration changes use atomic files, a per-user lock, a managed-target
-registry, and an activation journal. Package installation, finalization, and
-pruning use root-owned records and recovery journals under `/var/lib/catdot`.
-If a process or machine stops after an ALPM transaction but before record
-commit, the next mutating operation completes only a provably safe recovery.
-An uncertain `Prepared` journal remains blocked and is inspected with:
-
-```sh
-catdot recover list
-```
-
-When every package expected from the confirmed transaction is installed and
-every confirmed replacement target is absent, an administrator may commit the
-recorded result with:
-
-```sh
-catdot recover accept TRANSACTION --yes
-```
-
-When no newly introduced package exists and every package scheduled for removal
-is still present, the untouched journal may instead be discarded with:
-
-```sh
-catdot recover discard TRANSACTION --yes
-```
-
-Partial package states and journals created before the recovery metadata schema
-are never guessed; both decisions remain unavailable until manually inspected.
-
-Catdot only claims ownership of packages that were absent before its
-transaction. Pre-existing explicit packages remain explicit even when ALPM
-upgrades them as part of resolving a profile. `prune` removes only packages
-introduced by Catdot that are now unreferenced, still dependency-installed, not
-protected by `HoldPkg`, and safe to remove according to libalpm.
-
-## Privilege boundary
-
-Two separate privileged executables are installed:
-
-- `/usr/lib/catdot/catdot-query-helper` implements read-only plan and diagnostic
-  operations. Its Polkit action allows an active local session without an
-  administrator prompt.
-- `/usr/lib/catdot/catdot-helper` implements package transactions, finalization,
-  stale-record deletion, and recovery writes. Its Polkit action requires
-  administrator authentication.
-
-Both helpers verify the original caller UID. The query helper rejects every
-mutating subcommand, while the management helper rejects read-only subcommands.
-The command-line client still asks for confirmation after displaying a
-mutating plan unless `--yes` is supplied. Non-interactive mutation without
-`--yes` is refused.
-
-## Profile manifest example
+The metadata directory name is the Profile ID. Every path below
+`/usr/share/<profile-id>` maps directly to the same path below the user's HOME.
+The manifest therefore contains no source or target paths:
 
 ```toml
-schema = 3
-
-[profile]
-id = "catos-niri-dms"
+schema = 4
 name = "CatOS Niri DMS"
-description = "Complete CatOS Niri desktop Profile"
-source_root = "/usr/share/catos-niri-dms"
+description = "CatOS Niri desktop powered by DMS"
 
-[defaults]
-desktop = "niri"
-bar = "dms"
-terminal = "ghostty"
+packages = [
+  "niri",
+  "dms-shell-niri>=1.5.1",
+  "ghostty",
+]
 
-[[components]]
-id = "niri"
-role = "desktop"
-packages = ["xdg-desktop-portal-gtk"]
-
-[components.wm]
-autostart_target = ".config/niri/autostart.kdl"
-autostart_template = 'spawn-at-startup "catdot" "exec" "{role}"'
-
-[[components.wm.autostart]]
-role = "bar"
-
-[[components.wm.autostart]]
-role = "xwayland"
-before = ["bar"]
-
-[[components.configuration]]
-target = ".config/niri/config.kdl"
-lifecycle = "generate"
-source = ".config/niri/config.kdl"
-
-[[components.configuration]]
-target = ".config/niri/binds.kdl"
-lifecycle = "merge"
-source = ".config/niri/binds.kdl"
-
-[[components.configuration]]
-target = ".config/niri/static"
-lifecycle = "symlink"
-source = ".config/niri/static"
-
-[[components.configuration]]
-target = ".config/niri/custom"
-lifecycle = "user"
-seed = ".config/niri/custom"
-
-[[components]]
-id = "dms"
-role = "bar"
-
-[components.exec]
-argv = ["dms", "run", "--session"]
-
-[[components]]
-id = "ghostty"
-role = "terminal"
-
-[components.exec]
-argv = ["ghostty"]
-
-[components.xdg]
-command = "ghostty"
-environment = ["TERMINAL"]
+manage = [
+  ".config/niri/config.kdl",
+  ".config/environment.d/80-catos-niri.conf",
+]
 ```
 
-The WM declaration compiles only selected autostart roles, applies stable
-`before`/`after` topological ordering, and rejects cycles. Role names are not
-hard-coded by Catdot. Binds can call `catdot exec <role>` and therefore do not
-need regeneration when only the provider changes. XDG declarations use an
-explicit real executable name; `command` does not accept arguments or wrappers.
-MIME types, URI schemes, and desktop entries remain part of the same XDG slot.
+A path in `manage` may be a file or a directory. Directories are managed
+recursively. Managed declarations may not overlap each other.
 
-External component files must be named explicitly in `component_files`;
-Catdot does not discover arbitrary TOML files. Manifest commands are argv
-arrays and never use `/bin/sh -c`.
+## File ownership
 
-## Development checks
+Catdot derives two behaviors from the Profile content tree:
 
-Run the normal Rust and clean-source package checks with:
+- **Managed**: content covered by `manage`. Catdot backs up an existing target,
+  overwrites it during activation, removes obsolete managed targets during a
+  switch, and restores the previous state if activation fails.
+- **Seed**: every other file in the Profile content tree. Catdot processes it
+  once per Profile. A missing target is copied; an existing target is preserved.
+  The result is then user-owned and is neither removed nor updated by switching.
+
+Paths absent from the Profile content tree are outside Catdot's ownership.
+Profile content may contain only real files and directories; symbolic links,
+FIFOs, sockets, and device nodes are rejected.
+
+## Explicit updates
+
+Package upgrades do not modify an active or retained Profile. Catdot keeps a
+per-user snapshot of each Profile's managed revision. Switching away and back
+uses that snapshot.
 
 ```sh
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
-./packaging/verify-local-source.sh
+catdot update
+catdot update catos-niri-dms
 ```
 
-The rootless integration matrix performs real Arch Linux package transactions
-inside disposable Podman containers:
+`update` is the only normal command that refreshes a retained Profile's package
+declaration and managed snapshot from `/usr/share/<profile-id>`. Updating the
+active Profile also backs up and overwrites its managed HOME targets. Updating
+an inactive Profile refreshes only its cached revision and does not switch to
+it. Neither form changes seed files.
+
+`reset PROFILE` is stronger: it backs up and reinstalls both managed and seed
+content from the currently installed Profile package.
+
+## Package ownership
+
+All retained Profiles keep package references, even when inactive. Catdot
+records which packages it introduced and which were already installed. It never
+removes a package that predates Catdot.
+
+Switching does not remove old packages. `remove PROFILE` forgets an inactive
+Profile and releases its references. Actual package removal is a separate,
+explicit operation:
 
 ```sh
-./tests/run-rootless.sh
+catdot prune --dry-run
+catdot prune
 ```
 
-It covers zero-package activation, strict-umask multi-user state, real libalpm
-installation and pruning, explicit-package upgrades, transaction recovery,
-conflict replacement, stale users, and privileged helper separation. It never
-modifies host packages.
+Prune also respects references held by other system users and dependencies from
+packages outside Catdot.
 
-The release PKGBUILD intentionally references a future tagged source archive.
-A real tag and checksum are added only when the project is ready for release.
+## Commands
+
+```text
+catdot list
+catdot show PROFILE
+catdot current
+catdot select PROFILE
+catdot update [PROFILE]
+catdot reset PROFILE
+catdot remove PROFILE
+catdot prune
+catdot doctor
+catdot recover list|accept|discard
+catdot validate PROFILE_ROOT
+```
+
+`select`, `update`, `reset`, `remove`, and `prune` display their plan and require
+confirmation. `--dry-run` is read-only; `--yes` accepts a displayed plan in
+non-interactive use.
+
+A Profile switch may require logging out and back in. Catdot deliberately does
+not call `systemctl --user`, restart the desktop, or execute Profile hooks.
+
+## Reliability boundary
+
+Catdot retains the safety mechanisms needed by a file switcher:
+
+- HOME-relative path validation and symbolic-link-parent rejection;
+- package and file plan confirmation;
+- binary-safe backups preserving modes, directories, and existing symlinks;
+- journaled file activation and interrupted-operation recovery;
+- bounded backup retention;
+- multi-user package reference tracking and conservative prune.
+
+It intentionally provides no component mixing, automatic configuration update,
+three-way merge, generated desktop integration, or command-provider runtime.

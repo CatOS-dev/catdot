@@ -12,6 +12,7 @@ mkdir -p "$source_tree"
 tar -C "$repository" \
   --exclude=.git \
   --exclude=target \
+  --exclude=.omo \
   --exclude='packaging/pkg' \
   --exclude='packaging/src' \
   --exclude='packaging/*.pkg.tar.*' \
@@ -24,38 +25,17 @@ sh packaging/install.sh "$source_tree" "$stage"
 test -x "$stage/usr/bin/catdot"
 test -x "$stage/usr/lib/catdot/catdot-helper"
 test -x "$stage/usr/lib/catdot/catdot-query-helper"
-test -x "$stage/usr/lib/catdot/mark-generation"
-test -f "$stage/usr/share/libalpm/hooks/catdot-profile-generation.hook"
-test -f "$stage/usr/lib/systemd/user/catdot-update.service"
-test -f "$stage/usr/lib/systemd/user/catdot-update.path"
+test -f "$stage/usr/share/polkit-1/actions/org.catos.catdot.policy"
 test -f "$stage/usr/share/licenses/catdot/LICENSE"
 test -f "$stage/usr/share/doc/catdot/README.md"
 
-test -f "$stage/usr/share/catdot/profiles/catos-default/profile.toml"
-test -f "$stage/etc/skel/.config/catdot/default.toml"
-test ! -e "$stage/etc/skel/.gtkrc-2.0"
-test ! -e "$stage/etc/skel/.config/gtk-3.0"
-test ! -e "$stage/etc/skel/.config/gtk-4.0"
-test ! -e "$stage/usr/share/catos-default"
+test ! -e "$stage/usr/lib/catdot/mark-generation"
+test ! -e "$stage/usr/share/libalpm/hooks/catdot-profile-generation.hook"
+test ! -e "$stage/usr/lib/systemd/user/catdot-update.service"
+test ! -e "$stage/usr/lib/systemd/user/catdot-update.path"
+test ! -e "$stage/usr/share/catdot/profiles/catos-default"
+test ! -e "$stage/etc/skel/.config/catdot/default.toml"
 
-profile_root="$stage/usr/share/catdot/profiles"
-profile_count=$(find "$profile_root" -mindepth 1 -maxdepth 1 -type d | wc -l)
-test "$profile_count" -eq 1
-"$stage/usr/bin/catdot" validate "$profile_root" | grep -Fx 'validated profile catos-default'
-
-home="$temporary/home"
-mkdir -p "$home"
-HOME="$home" \
-XDG_STATE_HOME="$home/.local/state" \
-CATDOT_PROFILE_ROOT="$profile_root" \
-CATDOT_DEFAULT_DECLARATION="$stage/etc/skel/.config/catdot/default.toml" \
-  "$stage/usr/bin/catdot" list | grep -Fx 'catos-default — CatOS Default'
-
-current=$(HOME="$home" \
-  XDG_STATE_HOME="$home/.local/state" \
-  CATDOT_PROFILE_ROOT="$profile_root" \
-  CATDOT_DEFAULT_DECLARATION="$stage/etc/skel/.config/catdot/default.toml" \
-  "$stage/usr/bin/catdot" current)
-printf '%s\n' "$current" | grep -Fx 'Pending selection:'
-printf '%s\n' "$current" | grep -Fx '  gtk-theme: activate catos-default/gtk'
-! printf '%s\n' "$current" | grep -F 'qt-theme'
+"$stage/usr/bin/catdot" --help | grep -F 'transactionally switch complete managed configuration profiles'
+! "$stage/usr/bin/catdot" resolve >/dev/null 2>&1
+! "$stage/usr/bin/catdot" exec terminal >/dev/null 2>&1

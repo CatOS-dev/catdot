@@ -19,8 +19,13 @@ struct ResolveContext {
     system_update_required: bool,
 }
 
-pub(super) fn print_plan(uid: u32, generation: u64, state_path: &Path) -> Result<()> {
-    let context = prepare(uid, generation, state_path, true)?;
+pub(super) fn print_plan(
+    uid: u32,
+    generation: u64,
+    state_path: &Path,
+    preview_path: Option<&Path>,
+) -> Result<()> {
+    let context = prepare(uid, generation, state_path, preview_path)?;
     let preview = PackagePlanPreview {
         plan: context.plan,
         requirements: aggregate_requirements(&context.records),
@@ -30,16 +35,22 @@ pub(super) fn print_plan(uid: u32, generation: u64, state_path: &Path) -> Result
     Ok(())
 }
 
-pub(super) fn apply(uid: u32, generation: u64, state_path: &Path, digest: &str) -> Result<()> {
+pub(super) fn apply(
+    uid: u32,
+    generation: u64,
+    state_path: &Path,
+    digest: &str,
+    preview_path: Option<&Path>,
+) -> Result<()> {
     caller_uid(uid)?;
     ensure_system_database(Path::new(DB))?;
     let _lock = lock(&Path::new(DB).join("lock"))?;
     let database = Path::new(DB);
     let mut handle = open_handle()?;
     recover_pending(database, |name| handle.localdb().pkg(name).is_ok())?;
-    let context = prepare(uid, generation, state_path, false)?;
+    let context = prepare(uid, generation, state_path, preview_path)?;
     if context.plan.digest() != digest {
-        bail!("plan changed; run catdot resolve again")
+        bail!("plan changed; run the Catdot command again")
     }
     let transaction_packages = context.plan.install.iter().cloned().collect();
     let previously_present = context
@@ -57,7 +68,7 @@ pub(super) fn apply(uid: u32, generation: u64, state_path: &Path, digest: &str) 
         PreparedTransaction {
             uid,
             generation,
-            direct_requirements: context.record.pending_requirements.clone(),
+            direct_requirements: context.record.requirements.clone(),
             transaction_packages,
             previously_present: previously_present.clone(),
             expected_record: context.record.clone(),
@@ -77,53 +88,13 @@ pub(super) fn apply(uid: u32, generation: u64, state_path: &Path, digest: &str) 
     Ok(())
 }
 
-pub(super) fn finalize(uid: u32, generation: u64, state_path: &Path) -> Result<()> {
-    caller_uid(uid)?;
-    ensure_system_database(Path::new(DB))?;
-    let _lock = lock(&Path::new(DB).join("lock"))?;
-    let handle = open_handle()?;
-    recover_pending(Path::new(DB), |name| handle.localdb().pkg(name).is_ok())?;
-    let state = read_trusted_user_state(uid, state_path)?;
-    if state.active_generation != generation || state.active_generation != state.generation {
-        bail!("active state is not ready to finalize")
-    }
-    let database = Path::new(DB);
-    let mut records = load_records(database)?;
-    let record = records
-        .iter()
-        .find(|record| record.uid == uid)
-        .ok_or_else(|| anyhow::anyhow!("pending user record is missing"))?;
-    if record.pending_generation != generation || record.state_path != state_path {
-        bail!("pending record generation does not match active state")
-    }
-    let profiles = discover_profile_registry(Path::new(DEFAULT_PROFILE_ROOT))?.valid_profiles;
-    let mut finalized = UserRecord::from_state(uid, state_path, &state, &profiles)?;
-    normalize_requirement_providers(std::slice::from_mut(&mut finalized), &handle)?;
-    replace_record(&mut records, finalized.clone());
-    let requirements = aggregate_requirements(&records);
-    let mut packages = read_system_packages(&database.join("packages.toml"))?;
-    for package in packages.packages.values_mut() {
-        package.references = requirements
-            .get(&package.name)
-            .map_or_else(Vec::new, |requirement| requirement.references.clone());
-    }
-    let mut journal = PackageJournal::records_prepared(database, packages, finalized)?;
-    commit_records(
-        database,
-        journal.expected_packages(),
-        journal.expected_record(),
-    )?;
-    journal.mark_records_committed()?;
-    journal.complete()?;
-    Ok(())
-}
-
 fn prepare(
     uid: u32,
     generation: u64,
     state_path: &Path,
-    default_preview: bool,
+    preview_path: Option<&Path>,
 ) -> Result<ResolveContext> {
+    caller_uid(uid)?;
     let profiles = discover_profile_registry(Path::new(DEFAULT_PROFILE_ROOT))?.valid_profiles;
     let database = Path::new(DB);
     let existing_records = load_records(database)?;
@@ -136,17 +107,10 @@ fn prepare(
     {
         bail!("state path does not match the path registered for uid {uid}")
     }
-    let state = if default_preview && !state_path.exists() {
-        if !state_path.is_absolute() {
-            bail!("default preview state path must be absolute")
-        }
-        preview_state_from_default(state_path, &default_declaration_path(), &profiles)?
-    } else {
-        read_trusted_user_state(uid, state_path)?
-    };
+    let state = read_trusted_user_state(uid, preview_path.unwrap_or(state_path))?;
     validate_user_state(&state, &profiles)?;
     if state.generation != generation {
-        bail!("state changed; run catdot resolve again")
+        bail!("state changed; run the Catdot command again")
     }
     let record = UserRecord::from_state(uid, state_path, &state, &profiles)?;
     let mut records = valid_records(existing_records, |record_uid| user_home(record_uid).is_ok());
@@ -171,15 +135,14 @@ fn prepare(
 
 fn normalize_requirement_providers(records: &mut [UserRecord], handle: &alpm::Alpm) -> Result<()> {
     for record in records {
-        for requirements in [
-            &mut record.active_requirements,
-            &mut record.pending_requirements,
-        ] {
-            let pending = std::mem::take(requirements);
-            for (dependency, components) in pending {
-                let package = satisfier_name(handle, &dependency)?;
-                requirements.entry(package).or_default().extend(components);
-            }
+        let pending = std::mem::take(&mut record.requirements);
+        for (dependency, profiles) in pending {
+            let package = satisfier_name(handle, &dependency)?;
+            record
+                .requirements
+                .entry(package)
+                .or_default()
+                .extend(profiles);
         }
     }
     Ok(())
@@ -234,11 +197,12 @@ fn planned_package_state(
                 references: vec![],
             });
     }
-    for (name, package) in previous {
+    for (name, mut package) in previous {
         if plan.remove.contains(&name) {
             continue;
         }
         if package.catdot_installed && !packages.contains_key(&name) {
+            package.references.clear();
             packages.insert(name, package);
         }
     }

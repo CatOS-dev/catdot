@@ -6,9 +6,8 @@ for test in \
   strict-umask-multi-user.sh \
   real-libalpm-install.sh \
   explicit-upgrade-ownership.sh \
-  prune-recovery.sh \
-  finalize-retry.sh \
   multi-user-prune.sh \
+  prune-recovery.sh \
   prune-maximal-safe-set.sh \
   install-conflict-plan.sh \
   doctor-system-state.sh \

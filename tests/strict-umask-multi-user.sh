@@ -1,48 +1,26 @@
 #!/usr/bin/env bash
-set -euxo pipefail
+set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cargo build --release --locked --manifest-path "$repo_root/Cargo.toml"
 
 podman run --rm --security-opt label=disable \
   -v "$repo_root/target/release:/catdot-bin:ro" archlinux:base-devel \
-  /bin/bash -euxo pipefail -c '
+  /bin/bash -euo pipefail -c '
     pacman -Sy --noconfirm
     install -Dm755 /catdot-bin/catdot /usr/bin/catdot
     install -Dm755 /catdot-bin/catdot-helper /usr/lib/catdot/catdot-helper
     install -Dm755 /catdot-bin/catdot-query-helper /usr/lib/catdot/catdot-query-helper
-
-    install -d /usr/share/catdot/profiles/{jq-test,bash-test}
-    cat > /usr/share/catdot/profiles/jq-test/profile.toml <<"EOF"
-schema = 2
-[profile]
-id = "jq-test"
+    install -d /usr/share/catdot/profiles/jq-test /usr/share/jq-test
+    cat > /usr/share/catdot/profiles/jq-test/profile.toml <<"P"
+schema = 4
 name = "JQ transaction test"
-description = "Exercises a real libalpm transaction"
-source_root = "/usr/share/jq-test"
-[defaults]
-tool = "jq"
-[[components]]
-id = "jq"
-role = "tool"
+description = "Strict umask and privileged record test"
 packages = ["jq"]
-EOF
-    cat > /usr/share/catdot/profiles/bash-test/profile.toml <<"EOF"
-schema = 2
-[profile]
-id = "bash-test"
-name = "Bash aggregation test"
-description = "Exercises multi-user package aggregation"
-source_root = "/usr/share/bash-test"
-[defaults]
-shell = "bash"
-[[components]]
-id = "bash"
-role = "shell"
-packages = ["bash"]
-EOF
+manage = []
+P
 
-    cat > /tmp/pkexec-shim.c <<"EOF"
+    cat > /tmp/pkexec.c <<"C"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -50,41 +28,27 @@ int main(int argc, char **argv) {
   char uid[32];
   if (argc < 2) return 64;
   snprintf(uid, sizeof uid, "%u", (unsigned)getuid());
-  if (setenv("PKEXEC_UID", uid, 1) != 0) return 70;
+  setenv("PKEXEC_UID", uid, 1);
   execv(argv[1], argv + 1);
   return 71;
 }
-EOF
-    cc -O2 -o /usr/bin/pkexec /tmp/pkexec-shim.c
+C
+    cc -O2 /tmp/pkexec.c -o /usr/bin/pkexec
     chown root:root /usr/bin/pkexec
     chmod 4755 /usr/bin/pkexec
-
     useradd --create-home alice
     useradd --create-home bob
-    pacman -Sy --noconfirm
 
-    runuser -u alice -- /bin/bash -c "
-      umask 077
-      HOME=/home/alice XDG_STATE_HOME=/home/alice/.local/state catdot select jq-test
-      HOME=/home/alice XDG_STATE_HOME=/home/alice/.local/state catdot resolve --yes
-    "
+    runuser -u alice -- /bin/bash -c "umask 077; HOME=/home/alice XDG_STATE_HOME=/home/alice/.local/state catdot select jq-test --yes"
     test "$(stat -c %a /var/lib/catdot)" = 755
     test "$(stat -c %U:%G /var/lib/catdot)" = root:root
-    runuser -u alice -- test -x /var/lib/catdot
-    ! runuser -u alice -- test -r /var/lib/catdot/users/1000.toml
     test "$(stat -c %a /var/lib/catdot/users)" = 700
-    test "$(stat -c %U:%G /var/lib/catdot/users/1000.toml)" = root:root
     test "$(stat -c %a /var/lib/catdot/users/1000.toml)" = 600
+    test "$(stat -c %U:%G /var/lib/catdot/users/1000.toml)" = root:root
+    ! runuser -u alice -- test -r /var/lib/catdot/users/1000.toml
 
-    runuser -u bob -- env HOME=/home/bob XDG_STATE_HOME=/home/bob/.local/state \
-      catdot select bash-test
-    preview=$(runuser -u bob -- env HOME=/home/bob XDG_STATE_HOME=/home/bob/.local/state \
-      catdot resolve --dry-run)
-    printf "%s\n" "$preview" | grep -Fx "  jq"
-    if runuser -u bob -- /usr/lib/catdot/catdot-helper resolve-plan \
+    if runuser -u bob -- /usr/lib/catdot/catdot-query-helper resolve-plan \
       --uid 1001 --generation 1 --state-path /home/bob/.local/state/catdot/state.toml; then
       exit 1
     fi
-    runuser -u bob -- env HOME=/home/bob XDG_STATE_HOME=/home/bob/.local/state \
-      catdot resolve --yes
   '

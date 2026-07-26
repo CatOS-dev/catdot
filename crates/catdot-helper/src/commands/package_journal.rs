@@ -167,32 +167,6 @@ impl PackageJournal {
         Ok(journal)
     }
 
-    pub(super) fn records_prepared(
-        database: &Path,
-        expected_packages: SystemPackageState,
-        expected_record: UserRecord,
-    ) -> Result<Self> {
-        let id = journal_id(expected_record.uid, expected_record.active_generation)?;
-        let path = journal_directory(database)?.join(format!("finalize-{id}.toml"));
-        let journal = Self {
-            id,
-            plan_digest: "finalize".into(),
-            recovery_schema: 1,
-            uid: expected_record.uid,
-            generation: expected_record.active_generation,
-            direct_requirements: expected_record.active_requirements.clone(),
-            transaction_packages: BTreeSet::new(),
-            previously_present: BTreeSet::new(),
-            removed_packages: BTreeSet::new(),
-            expected_record,
-            expected_packages,
-            stage: JournalStage::RecordsPrepared,
-            path,
-        };
-        journal.persist()?;
-        Ok(journal)
-    }
-
     pub(super) fn verify(&self, uid: u32, generation: u64, digest: &str) -> Result<()> {
         if self.uid != uid || self.generation != generation || self.plan_digest != digest {
             bail!("package transaction journal does not match the requested plan")
@@ -562,13 +536,10 @@ mod tests {
     fn record() -> UserRecord {
         UserRecord {
             uid: 1000,
-            pending_generation: 2,
-            active_generation: 1,
+            generation: 2,
             state_path: PathBuf::from("/home/test/.local/state/catdot/state.toml"),
-            components: BTreeMap::new(),
-            active_components: BTreeMap::new(),
-            active_requirements: BTreeMap::new(),
-            pending_requirements: BTreeMap::new(),
+            profiles: BTreeSet::new(),
+            requirements: BTreeMap::new(),
         }
     }
 
@@ -678,35 +649,6 @@ mod tests {
 
         assert!(journal.verify(1000, 3, &plan().digest()).is_err());
         assert!(journal.verify(1000, 2, "different digest").is_err());
-    }
-
-    #[test]
-    fn interrupted_finalize_replays_the_matching_user_and_package_records() {
-        let directory = tempdir().unwrap();
-        let database = directory.path();
-        let expected_record = record();
-        let expected_packages = packages();
-
-        PackageJournal::records_prepared(
-            database,
-            expected_packages.clone(),
-            expected_record.clone(),
-        )
-        .unwrap();
-        recover_pending(database, |_| false).unwrap();
-
-        assert_eq!(
-            fs::read_to_string(database.join("users/1000.toml")).unwrap(),
-            toml::to_string_pretty(&expected_record).unwrap()
-        );
-        assert_eq!(
-            fs::read_to_string(database.join("packages.toml")).unwrap(),
-            toml::to_string_pretty(&expected_packages).unwrap()
-        );
-        assert_eq!(
-            fs::read_dir(database.join("transactions")).unwrap().count(),
-            0
-        );
     }
 
     #[test]

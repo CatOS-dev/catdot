@@ -185,13 +185,10 @@ mod tests {
             .into_iter()
             .map(|uid| UserRecord {
                 uid,
-                pending_generation: 1,
-                active_generation: 1,
+                generation: 1,
                 state_path: PathBuf::from("/home/test/.local/state/catdot/state.toml"),
-                components: BTreeMap::new(),
-                active_components: BTreeMap::new(),
-                active_requirements: BTreeMap::new(),
-                pending_requirements: BTreeMap::new(),
+                profiles: std::collections::BTreeSet::new(),
+                requirements: BTreeMap::new(),
             })
             .collect();
         let active = valid_records(records, |uid| uid == 1000);
@@ -207,13 +204,10 @@ mod tests {
         let owner = fs::metadata(&users).unwrap().uid();
         let record = UserRecord {
             uid: 1000,
-            pending_generation: 1,
-            active_generation: 1,
+            generation: 1,
             state_path: PathBuf::from("/home/test/.local/state/catdot/state.toml"),
-            components: BTreeMap::new(),
-            active_components: BTreeMap::new(),
-            active_requirements: BTreeMap::new(),
-            pending_requirements: BTreeMap::new(),
+            profiles: std::collections::BTreeSet::new(),
+            requirements: BTreeMap::new(),
         };
         let source = directory.path().join("source.toml");
         fs::write(&source, toml::to_string(&record).unwrap()).unwrap();

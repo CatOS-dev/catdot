@@ -1,7 +1,7 @@
 pkgname=catdot
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='CatOS desktop profile manager'
+pkgdesc='CatOS complete configuration profile switcher'
 arch=('x86_64')
 url='https://github.com/CatOS-dev/catdot'
 license=('GPL-3.0-or-later')

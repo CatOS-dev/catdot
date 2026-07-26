@@ -1,38 +1,38 @@
 #!/usr/bin/env bash
-set -euxo pipefail
+set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cargo build --release --locked --manifest-path "$repo_root/Cargo.toml"
 
 podman run --rm --security-opt label=disable \
   -v "$repo_root/target/release:/catdot-bin:ro" archlinux:base-devel \
-  /bin/bash -euxo pipefail -c '
+  /bin/bash -euo pipefail -c '
     pacman -Sy --noconfirm
     install -Dm755 /catdot-bin/catdot /usr/bin/catdot
     install -Dm755 /catdot-bin/catdot-helper /usr/lib/catdot/catdot-helper
     install -Dm755 /catdot-bin/catdot-query-helper /usr/lib/catdot/catdot-query-helper
 
-    for profile in jq-alice jq-bob; do
-      install -d "/usr/share/catdot/profiles/$profile"
-      cat > "/usr/share/catdot/profiles/$profile/profile.toml" <<EOF
-schema = 2
-[profile]
-id = "$profile"
-name = "Multi-user prune $profile"
-description = "Exercises real shared package ownership"
-source_root = "/usr/share/$profile"
-[defaults]
-tool = "jq"
-[[components]]
-id = "jq"
-role = "tool"
-packages = ["jq"]
-[components.exec]
-argv = ["/usr/bin/jq", "--version"]
-EOF
+    for profile in jq-alice jq-bob empty; do
+      install -d "/usr/share/catdot/profiles/$profile" "/usr/share/$profile"
     done
+    for profile in jq-alice jq-bob; do
+      cat > "/usr/share/catdot/profiles/$profile/profile.toml" <<P
+schema = 4
+name = "$profile"
+description = "Multi-user package ownership"
+packages = ["jq"]
+manage = []
+P
+    done
+    cat > /usr/share/catdot/profiles/empty/profile.toml <<"P"
+schema = 4
+name = "Empty"
+description = "Profile used before removing a retained profile"
+packages = []
+manage = []
+P
 
-    cat > /tmp/pkexec-shim.c <<"EOF"
+    cat > /tmp/pkexec.c <<"C"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -40,39 +40,35 @@ int main(int argc, char **argv) {
   char uid[32];
   if (argc < 2) return 64;
   snprintf(uid, sizeof uid, "%u", (unsigned)getuid());
-  if (setenv("PKEXEC_UID", uid, 1) != 0) return 70;
+  setenv("PKEXEC_UID", uid, 1);
   execv(argv[1], argv + 1);
   return 71;
 }
-EOF
-    cc -O2 -o /usr/bin/pkexec /tmp/pkexec-shim.c
+C
+    cc -O2 /tmp/pkexec.c -o /usr/bin/pkexec
     chown root:root /usr/bin/pkexec
     chmod 4755 /usr/bin/pkexec
-
     useradd --create-home alice
     useradd --create-home bob
     alice="HOME=/home/alice XDG_STATE_HOME=/home/alice/.local/state"
     bob="HOME=/home/bob XDG_STATE_HOME=/home/bob/.local/state"
 
-    runuser -u alice -- env $alice catdot select jq-alice
-    runuser -u alice -- env $alice catdot resolve --yes
-    pacman -Q jq oniguruma
-    runuser -u bob -- env $bob catdot select jq-bob
-    runuser -u bob -- env $bob catdot resolve --yes
-
-    runuser -u alice -- env $alice catdot disable tool
-    runuser -u alice -- env $alice catdot resolve --yes
-    ! grep -F "jq-alice/jq" /var/lib/catdot/users/1000.toml
-    ! grep -F "uid = 1000" /var/lib/catdot/packages.toml
-    grep -F "uid = 1001" /var/lib/catdot/packages.toml
-    runuser -u alice -- env $alice catdot prune --dry-run > /tmp/alice-prune.toml
-    ! grep -E "^(jq|oniguruma)$" /tmp/alice-prune.toml
+    runuser -u alice -- env $alice catdot select jq-alice --yes
+    runuser -u bob -- env $bob catdot select jq-bob --yes
     pacman -Q jq oniguruma
 
-    runuser -u bob -- env $bob catdot disable tool
-    runuser -u bob -- env $bob catdot resolve --yes
-    runuser -u bob -- env $bob catdot prune --dry-run > /tmp/bob-prune.toml
-    grep -E "^  (jq|oniguruma)$" /tmp/bob-prune.toml
+    runuser -u alice -- env $alice catdot select empty --yes
+    runuser -u alice -- env $alice catdot remove jq-alice --yes
+    ! grep -F "profile = \"jq-alice\"" /var/lib/catdot/packages.toml
+    grep -F "profile = \"jq-bob\"" /var/lib/catdot/packages.toml
+    alice_plan=$(runuser -u alice -- env $alice catdot prune --dry-run)
+    ! printf "%s\n" "$alice_plan" | grep -E "^  (jq|oniguruma)$"
+    pacman -Q jq oniguruma
+
+    runuser -u bob -- env $bob catdot select empty --yes
+    runuser -u bob -- env $bob catdot remove jq-bob --yes
+    bob_plan=$(runuser -u bob -- env $bob catdot prune --dry-run)
+    printf "%s\n" "$bob_plan" | grep -E "^  (jq|oniguruma)$"
     runuser -u bob -- env $bob catdot prune --yes
     ! pacman -Q jq
     ! pacman -Q oniguruma

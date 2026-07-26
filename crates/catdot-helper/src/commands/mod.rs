@@ -37,6 +37,8 @@ enum Cmd {
         digest: String,
         #[arg(long)]
         state_path: PathBuf,
+        #[arg(long)]
+        preview_path: Option<PathBuf>,
     },
     ResolvePlan {
         #[arg(long)]
@@ -45,14 +47,8 @@ enum Cmd {
         generation: u64,
         #[arg(long)]
         state_path: PathBuf,
-    },
-    Finalize {
         #[arg(long)]
-        uid: u32,
-        #[arg(long)]
-        generation: u64,
-        #[arg(long)]
-        state_path: PathBuf,
+        preview_path: Option<PathBuf>,
     },
     Prune {
         #[arg(long)]
@@ -104,10 +100,11 @@ pub fn run(mode: HelperMode) -> Result<()> {
             uid,
             generation,
             state_path,
+            preview_path,
         } => {
             require_root()?;
             caller_uid(uid)?;
-            resolve::print_plan(uid, generation, &state_path)
+            resolve::print_plan(uid, generation, &state_path, preview_path.as_deref())
         }
         Cmd::PrunePlan { uid } => {
             require_root()?;
@@ -147,17 +144,16 @@ pub fn run(mode: HelperMode) -> Result<()> {
             generation,
             digest,
             state_path,
+            preview_path,
         } => {
             require_root()?;
-            resolve::apply(uid, generation, &state_path, &digest)
-        }
-        Cmd::Finalize {
-            uid,
-            generation,
-            state_path,
-        } => {
-            require_root()?;
-            resolve::finalize(uid, generation, &state_path)
+            resolve::apply(
+                uid,
+                generation,
+                &state_path,
+                &digest,
+                preview_path.as_deref(),
+            )
         }
         Cmd::Prune {
             uid,
@@ -394,18 +390,9 @@ fn system_doctor(_caller: u32) -> Result<()> {
                     .push(format!("system user record: uid {}: valid", record.uid));
                 match read_trusted_user_state(record.uid, &record.state_path) {
                     Ok(state) => {
-                        if state.active_generation != record.active_generation
-                            || state.generation != record.pending_generation
-                        {
+                        if state.generation != record.generation {
                             report.lines.push(format!(
                                 "warning: uid {} state generations differ from the system record",
-                                record.uid
-                            ));
-                            report.warnings += 1;
-                        }
-                        if !record.pending_requirements.is_empty() {
-                            report.lines.push(format!(
-                                "warning: uid {} has pending package requirements",
                                 record.uid
                             ));
                             report.warnings += 1;
@@ -579,6 +566,7 @@ mod tests {
             uid: 1000,
             generation: 1,
             state_path: PathBuf::from("/home/test/state.toml"),
+            preview_path: None,
         };
         assert!(validate_mode(HelperMode::Query, &resolve).is_ok());
 

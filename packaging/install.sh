@@ -10,27 +10,9 @@ install -Dm755 "$source_root/target/release/catdot-helper" \
   "$destdir/usr/lib/catdot/catdot-helper"
 install -Dm755 "$source_root/target/release/catdot-query-helper" \
   "$destdir/usr/lib/catdot/catdot-query-helper"
-install -Dm755 "$source_root/packaging/mark-generation" \
-  "$destdir/usr/lib/catdot/mark-generation"
-install -Dm644 "$source_root/packaging/catdot-profile-generation.hook" \
-  "$destdir/usr/share/libalpm/hooks/catdot-profile-generation.hook"
-install -Dm644 "$source_root/packaging/catdot-update.service" \
-  "$destdir/usr/lib/systemd/user/catdot-update.service"
-install -Dm644 "$source_root/packaging/catdot-update.path" \
-  "$destdir/usr/lib/systemd/user/catdot-update.path"
-install -d "$destdir/usr/lib/systemd/user/default.target.wants"
-ln -sf ../catdot-update.service \
-  "$destdir/usr/lib/systemd/user/default.target.wants/catdot-update.service"
-ln -sf ../catdot-update.path \
-  "$destdir/usr/lib/systemd/user/default.target.wants/catdot-update.path"
 install -Dm644 "$source_root/packaging/org.catos.catdot.policy" \
   "$destdir/usr/share/polkit-1/actions/org.catos.catdot.policy"
 install -Dm644 "$source_root/LICENSE" \
   "$destdir/usr/share/licenses/catdot/LICENSE"
 install -Dm644 "$source_root/README.md" \
   "$destdir/usr/share/doc/catdot/README.md"
-install -Dm644 "$source_root/profiles/catos-default/profile.toml" \
-  "$destdir/usr/share/catdot/profiles/catos-default/profile.toml"
-install -Dm644 \
-  "$source_root/profiles/catos-default/skel/.config/catdot/default.toml" \
-  "$destdir/etc/skel/.config/catdot/default.toml"

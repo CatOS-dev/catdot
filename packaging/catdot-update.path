@@ -1,9 +1,0 @@
-[Unit]
-Description=Watch the Catdot system profile generation
-
-[Path]
-PathChanged=/var/lib/catdot/generation
-Unit=catdot-update.service
-
-[Install]
-WantedBy=default.target

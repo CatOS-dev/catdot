@@ -74,7 +74,13 @@ mod tests {
     fn state_file_must_be_owned_regular_and_absolute() {
         let directory = tempdir().unwrap();
         let state = directory.path().join("state.toml");
-        fs::write(&state, "generation = 1").unwrap();
+        fs::write(
+            &state,
+            "schema = 3
+generation = 1
+",
+        )
+        .unwrap();
         let uid = fs::metadata(&state).unwrap().uid();
         assert!(read_trusted_user_state(uid, &state).is_ok());
         assert!(read_trusted_user_state(uid, directory.path()).is_err());
