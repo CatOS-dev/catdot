@@ -1,329 +1,204 @@
-use crate::{ActivationJournal, Error, Profile, Result, UserState, atomic_write};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use crate::{Error, Profile, ProfileState, Result, UserState};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs,
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
-    path::{Path, PathBuf},
+    os::unix::fs::symlink,
+    path::{Component, Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
+
+const BACKUP_RETENTION: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivationMode {
     Select,
     Update,
-    Reset,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ManagedTarget {
-    pub owner: String,
-    pub source: PathBuf,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ManagedRegistry {
-    #[serde(default)]
-    pub active_profile: Option<String>,
-    #[serde(default)]
-    pub entries: BTreeMap<String, ManagedTarget>,
-}
-
-#[derive(Debug, Clone)]
-pub enum Materialization {
-    Managed {
-        source: PathBuf,
-    },
-    ManagedCache {
-        source_root: PathBuf,
-        managed: BTreeSet<PathBuf>,
-    },
-    Seed {
-        source: PathBuf,
-        overwrite: bool,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub struct PlannedTarget {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedWrite {
     pub relative: PathBuf,
+    pub source: PathBuf,
     pub target: PathBuf,
-    pub owner: String,
-    pub cache: bool,
-    pub materialization: Materialization,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivationPlan {
-    pub target_profile: String,
-    pub mode: ActivationMode,
-    pub entries: Vec<PlannedTarget>,
     pub removals: Vec<PathBuf>,
-    pub seeded_paths: BTreeSet<PathBuf>,
-    registry: ManagedRegistry,
-    registry_changed: bool,
+    pub writes: Vec<PlannedWrite>,
 }
 
-impl ActivationPlan {
-    pub fn has_changes(&self) -> bool {
-        self.registry_changed
-            || !self.seeded_paths.is_empty()
-            || self.removals.iter().any(|target| target.exists())
-            || self.entries.iter().any(entry_has_changes)
-    }
-
-    pub fn identity_digest(&self) -> String {
-        let mut digest = Sha256::new();
-        digest.update(self.target_profile.as_bytes());
-        digest.update([self.mode as u8]);
-        for removal in &self.removals {
-            digest.update(b"remove\0");
-            digest.update(removal.as_os_str().as_bytes());
-            digest.update([0xff]);
-        }
-        for entry in &self.entries {
-            digest.update(b"entry\0");
-            digest.update(entry.relative.as_os_str().as_bytes());
-            digest.update([entry.cache as u8]);
-            digest.update(entry.owner.as_bytes());
-            digest.update([0]);
-            match &entry.materialization {
-                Materialization::Managed { source } => {
-                    digest.update(b"managed\0");
-                    hash_source(source, &mut digest);
-                }
-                Materialization::ManagedCache {
-                    source_root,
-                    managed,
-                } => {
-                    digest.update(b"managed-cache\0");
-                    for relative in managed {
-                        digest.update(relative.as_os_str().as_bytes());
-                        digest.update([0]);
-                        hash_source(&source_root.join(relative), &mut digest);
-                        digest.update([0xff]);
-                    }
-                }
-                Materialization::Seed { source, overwrite } => {
-                    digest.update(b"seed\0");
-                    digest.update([*overwrite as u8]);
-                    hash_source(source, &mut digest);
-                }
-            }
-            digest.update([0xff]);
-        }
-        for seeded in &self.seeded_paths {
-            digest.update(b"seeded\0");
-            digest.update(seeded.as_os_str().as_bytes());
-            digest.update([0xff]);
-        }
-        format!("{:x}", digest.finalize())
-    }
-
-    pub fn record_applied_state(&self, state: &mut UserState) -> Result<()> {
-        let profile = state
-            .profiles
-            .get_mut(&self.target_profile)
-            .ok_or_else(|| {
-                Error::Message(format!(
-                    "profile {} is not retained in user state",
-                    self.target_profile
-                ))
-            })?;
-        profile.seeded.extend(self.seeded_paths.iter().cloned());
-        profile.initialized = true;
-        Ok(())
-    }
-
-    pub fn record_seeded_paths(&self, state: &mut UserState) -> Result<()> {
-        self.record_applied_state(state)
-    }
-}
-
-pub fn managed_targets_path(state_path: &Path) -> Result<PathBuf> {
+pub fn profile_cache_path(state_path: &Path, profile: &str) -> Result<PathBuf> {
     let parent = state_path
         .parent()
         .ok_or_else(|| Error::Message("state path has no parent".into()))?;
-    Ok(parent.join("managed.toml"))
+    Ok(parent.join("profiles").join(profile).join("content"))
 }
 
-pub fn profile_managed_cache(registry_path: &Path, profile: &str) -> Result<PathBuf> {
-    let parent = registry_path
-        .parent()
-        .ok_or_else(|| Error::Message("managed registry has no parent".into()))?;
-    Ok(parent.join("profiles").join(profile).join("managed"))
-}
-
-pub fn read_managed_registry(path: &Path) -> Result<ManagedRegistry> {
-    if !path.exists() {
-        return Ok(ManagedRegistry::default());
-    }
-    toml::from_str(&fs::read_to_string(path).map_err(|source| Error::Io {
-        path: path.display().to_string(),
-        source,
-    })?)
-    .map_err(|source| Error::Toml {
-        path: path.display().to_string(),
-        source,
-    })
+pub fn cache_profile_content(profile: &Profile, cache: &Path) -> Result<()> {
+    remove_path(cache)?;
+    copy_profile_tree(&profile.source_root, cache)
 }
 
 pub fn build_activation_plan(
-    profiles: &BTreeMap<String, Profile>,
     state: &UserState,
     target_profile: &str,
+    target_state: &ProfileState,
+    source_root: &Path,
     home: &Path,
-    registry_path: &Path,
     mode: ActivationMode,
 ) -> Result<ActivationPlan> {
-    let profile = profiles
-        .get(target_profile)
-        .ok_or_else(|| Error::Message(format!("unknown profile {target_profile}")))?;
-    let profile_state = state
-        .profiles
-        .get(target_profile)
-        .ok_or_else(|| Error::Message(format!("profile {target_profile} is not retained")))?;
-    if mode == ActivationMode::Reset && state.active_profile.as_deref() != Some(target_profile) {
+    if !source_root.is_dir() {
         return Err(Error::Message(format!(
-            "profile {target_profile} is not active"
-        )));
-    }
-    if profile_state.managed != profile.manage
-        && !matches!(mode, ActivationMode::Update | ActivationMode::Reset)
-        && !profile_state.initialized
-    {
-        return Err(Error::Message(format!(
-            "profile {target_profile} declaration was not prepared"
+            "profile cache {} does not exist",
+            source_root.display()
         )));
     }
 
-    let current_registry = read_managed_registry(registry_path)?;
-    let switching = state.active_profile.as_deref() != Some(target_profile)
-        || current_registry.active_profile.as_deref() != Some(target_profile);
-    let refresh_cache = !profile_state.initialized
-        || matches!(mode, ActivationMode::Update | ActivationMode::Reset);
-    let refresh_home = match mode {
-        ActivationMode::Select => switching,
-        ActivationMode::Update => state.active_profile.as_deref() == Some(target_profile),
-        ActivationMode::Reset => true,
-    };
-    let cache_root = profile_managed_cache(registry_path, target_profile)?;
+    let active_target = state.active_profile.as_deref() == Some(target_profile);
+    let mut removals = Vec::new();
+    match mode {
+        ActivationMode::Select => {
+            if let Some(active) = state
+                .active_profile
+                .as_ref()
+                .and_then(|active| state.profiles.get(active))
+            {
+                for relative in &active.manage {
+                    removals.push(checked_target(home, relative)?);
+                }
+            }
+        }
+        ActivationMode::Update if active_target => {
+            if let Some(current) = state.profiles.get(target_profile) {
+                for relative in &current.manage {
+                    removals.push(checked_target(home, relative)?);
+                }
+            }
+        }
+        ActivationMode::Update => {}
+    }
 
-    let mut registry = current_registry.clone();
-    if refresh_home {
-        registry = ManagedRegistry {
-            active_profile: Some(target_profile.to_owned()),
-            entries: BTreeMap::new(),
-        };
-        for relative in &profile_state.managed {
-            registry.entries.insert(
-                relative.display().to_string(),
-                ManagedTarget {
-                    owner: target_profile.to_owned(),
-                    source: cache_root.join(relative),
-                },
-            );
+    let write_home = mode == ActivationMode::Select || active_target;
+    let mut writes = Vec::new();
+    if write_home {
+        for relative in &target_state.manage {
+            writes.push(PlannedWrite {
+                relative: relative.clone(),
+                source: source_root.join(relative),
+                target: checked_target(home, relative)?,
+            });
         }
     }
-
-    let mut entries = Vec::new();
-    if refresh_cache {
-        entries.push(PlannedTarget {
-            relative: PathBuf::new(),
-            target: cache_root.clone(),
-            owner: target_profile.to_owned(),
-            cache: true,
-            materialization: Materialization::ManagedCache {
-                source_root: profile.source_root.clone(),
-                managed: profile_state.managed.clone(),
-            },
-        });
-    }
-    if refresh_home {
-        for relative in &profile_state.managed {
-            entries.push(PlannedTarget {
+    if mode == ActivationMode::Select && !target_state.initialized {
+        for relative in seed_files(source_root, &target_state.manage)? {
+            writes.push(PlannedWrite {
                 relative: relative.clone(),
-                target: checked_target(home, relative)?,
-                owner: target_profile.to_owned(),
-                cache: false,
-                materialization: Materialization::Managed {
-                    source: if refresh_cache {
-                        profile.source_root.join(relative)
-                    } else {
-                        cache_root.join(relative)
-                    },
-                },
+                source: source_root.join(&relative),
+                target: checked_target(home, &relative)?,
             });
         }
     }
 
-    let mut seeded_paths = BTreeSet::new();
-    if !matches!(mode, ActivationMode::Update) {
-        for relative in &profile_state.seeds {
-            let overwrite = mode == ActivationMode::Reset;
-            if overwrite || !profile_state.seeded.contains(relative) {
-                entries.push(PlannedTarget {
-                    target: checked_target(home, relative)?,
-                    relative: relative.clone(),
-                    owner: target_profile.to_owned(),
-                    cache: false,
-                    materialization: Materialization::Seed {
-                        source: profile.source_root.join(relative),
-                        overwrite,
-                    },
-                });
-                seeded_paths.insert(relative.clone());
-            }
-        }
-    }
-
-    let mut removals = Vec::new();
-    if refresh_home && mode != ActivationMode::Update {
-        for old in current_registry.entries.keys() {
-            let old = PathBuf::from(old);
-            let covered_by_new_managed = profile_state
-                .managed
-                .iter()
-                .any(|new| old == *new || old.starts_with(new));
-            let becomes_seed = profile_state
-                .seeds
-                .iter()
-                .any(|seed| seed == &old || seed.starts_with(&old) || old.starts_with(seed));
-            if !covered_by_new_managed && !becomes_seed {
-                removals.push(checked_target(home, &old)?);
-            }
-        }
-    }
     removals.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    entries
-        .sort_by(|left, right| (left.cache, &left.relative).cmp(&(right.cache, &right.relative)));
-    validate_plan_targets(&entries, &removals, home, &cache_root)?;
-
-    let registry_changed = registry != current_registry;
-    Ok(ActivationPlan {
-        target_profile: target_profile.to_owned(),
-        mode,
-        entries,
-        removals,
-        seeded_paths,
-        registry,
-        registry_changed,
-    })
+    removals.dedup();
+    writes.sort_by(|left, right| left.relative.cmp(&right.relative));
+    Ok(ActivationPlan { removals, writes })
 }
 
-pub fn build_activation_preview(
-    profiles: &BTreeMap<String, Profile>,
-    state: &UserState,
-    target_profile: &str,
+pub fn apply_activation_plan(
+    plan: &ActivationPlan,
     home: &Path,
-    registry_path: &Path,
-    mode: ActivationMode,
-) -> Result<ActivationPlan> {
-    build_activation_plan(profiles, state, target_profile, home, registry_path, mode)
+    state_path: &Path,
+) -> Result<Option<PathBuf>> {
+    let backup_targets = backup_targets(plan, home)?;
+    let backup = if backup_targets.is_empty() {
+        None
+    } else {
+        let root = new_backup_root(state_path)?;
+        for target in &backup_targets {
+            let relative = target.strip_prefix(home).map_err(|_| {
+                Error::Message(format!("backup target {} escapes HOME", target.display()))
+            })?;
+            copy_existing(target, &root.join("home").join(relative))?;
+        }
+        Some(root)
+    };
+
+    for target in &plan.removals {
+        remove_path(target)?;
+    }
+    for write in &plan.writes {
+        remove_path(&write.target)?;
+        copy_profile_tree(&write.source, &write.target)?;
+    }
+    if backup.is_some() {
+        prune_backups(state_path)?;
+    }
+    Ok(backup)
+}
+
+fn seed_files(root: &Path, managed: &BTreeSet<PathBuf>) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_files(root, root, &mut files)?;
+    files.retain(|relative| {
+        !managed
+            .iter()
+            .any(|path| relative == path || relative.starts_with(path))
+    });
+    files.sort();
+    Ok(files)
+}
+
+fn collect_files(root: &Path, path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    let mut entries = fs::read_dir(path)
+        .map_err(|source| Error::Io {
+            path: path.display().to_string(),
+            source,
+        })?
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|source| Error::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|source| Error::Io {
+            path: entry.path().display().to_string(),
+            source,
+        })?;
+        if metadata.is_dir() {
+            collect_files(root, &entry.path(), files)?;
+        } else if metadata.is_file() {
+            files.push(
+                entry
+                    .path()
+                    .strip_prefix(root)
+                    .map_err(|_| Error::Message("profile cache escaped its root".into()))?
+                    .to_owned(),
+            );
+        } else {
+            return Err(Error::Message(format!(
+                "unsupported profile content {}",
+                entry.path().display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn checked_target(home: &Path, relative: &Path) -> Result<PathBuf> {
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(Error::Message(format!(
+            "invalid HOME-relative path {}",
+            relative.display()
+        )));
+    }
     let target = home.join(relative);
     let mut current = home.to_owned();
     if let Some(parent) = relative.parent() {
@@ -343,204 +218,74 @@ fn checked_target(home: &Path, relative: &Path) -> Result<PathBuf> {
     Ok(target)
 }
 
-fn validate_plan_targets(
-    entries: &[PlannedTarget],
-    removals: &[PathBuf],
-    home: &Path,
-    cache_root: &Path,
-) -> Result<()> {
-    let mut home_targets = Vec::new();
-    let mut cache_targets = Vec::new();
-    for entry in entries {
-        let (root, targets) = if entry.cache {
-            (cache_root, &mut cache_targets)
-        } else {
-            (home, &mut home_targets)
-        };
-        if !entry.target.starts_with(root) {
+fn backup_targets(plan: &ActivationPlan, home: &Path) -> Result<Vec<PathBuf>> {
+    let mut candidates = plan.removals.clone();
+    candidates.extend(plan.writes.iter().map(|write| write.target.clone()));
+    candidates.sort_by_key(|path| path.components().count());
+    let mut selected = Vec::<PathBuf>::new();
+    for candidate in candidates {
+        if !candidate.starts_with(home) {
             return Err(Error::Message(format!(
-                "configuration target {} escapes {}",
-                entry.target.display(),
-                root.display()
+                "backup target {} escapes HOME",
+                candidate.display()
             )));
         }
-        if targets.iter().any(|other: &PathBuf| {
-            entry.target == *other
-                || entry.target.starts_with(other)
-                || other.starts_with(&entry.target)
-        }) {
-            return Err(Error::Message(format!(
-                "configuration target {} overlaps another target",
-                entry.target.display()
-            )));
+        if fs::symlink_metadata(&candidate).is_err() {
+            continue;
         }
-        targets.push(entry.target.clone());
+        if selected
+            .iter()
+            .any(|parent| candidate == *parent || candidate.starts_with(parent))
+        {
+            continue;
+        }
+        selected.push(candidate);
     }
-    for removal in removals {
-        if !removal.starts_with(home) {
-            return Err(Error::Message(format!(
-                "configuration removal {} escapes HOME",
-                removal.display()
-            )));
-        }
+    Ok(selected)
+}
+
+fn new_backup_root(state_path: &Path) -> Result<PathBuf> {
+    let catdot = state_path
+        .parent()
+        .ok_or_else(|| Error::Message("state path has no parent".into()))?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| Error::Message(error.to_string()))?
+        .as_nanos();
+    let root = catdot
+        .join("backups")
+        .join(format!("{stamp}-{}", std::process::id()));
+    fs::create_dir_all(&root).map_err(|source| Error::Io {
+        path: root.display().to_string(),
+        source,
+    })?;
+    Ok(root)
+}
+
+fn prune_backups(state_path: &Path) -> Result<()> {
+    let backups = state_path
+        .parent()
+        .ok_or_else(|| Error::Message("state path has no parent".into()))?
+        .join("backups");
+    let mut entries = fs::read_dir(&backups)
+        .map_err(|source| Error::Io {
+            path: backups.display().to_string(),
+            source,
+        })?
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|source| Error::Io {
+            path: backups.display().to_string(),
+            source,
+        })?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let remove_count = entries.len().saturating_sub(BACKUP_RETENTION);
+    for entry in entries.into_iter().take(remove_count) {
+        remove_path(&entry.path())?;
     }
     Ok(())
 }
 
-fn entry_has_changes(entry: &PlannedTarget) -> bool {
-    match &entry.materialization {
-        Materialization::Managed { source } => !paths_equal(source, &entry.target),
-        Materialization::ManagedCache { .. } => true,
-        Materialization::Seed { source, overwrite } => {
-            if *overwrite {
-                !paths_equal(source, &entry.target)
-            } else {
-                !entry.target.exists()
-            }
-        }
-    }
-}
-
-fn paths_equal(source: &Path, target: &Path) -> bool {
-    let Ok(source_metadata) = fs::symlink_metadata(source) else {
-        return false;
-    };
-    let Ok(target_metadata) = fs::symlink_metadata(target) else {
-        return false;
-    };
-    if source_metadata.file_type().is_symlink() || target_metadata.file_type().is_symlink() {
-        return false;
-    }
-    if source_metadata.is_file() && target_metadata.is_file() {
-        return source_metadata.permissions().mode() == target_metadata.permissions().mode()
-            && fs::read(source).ok() == fs::read(target).ok();
-    }
-    if source_metadata.is_dir() && target_metadata.is_dir() {
-        let Ok(source_entries) = directory_entries(source) else {
-            return false;
-        };
-        let Ok(target_entries) = directory_entries(target) else {
-            return false;
-        };
-        return source_entries == target_entries
-            && source_entries
-                .iter()
-                .all(|name| paths_equal(&source.join(name), &target.join(name)));
-    }
-    false
-}
-
-fn directory_entries(path: &Path) -> std::io::Result<BTreeSet<std::ffi::OsString>> {
-    fs::read_dir(path)?
-        .map(|entry| entry.map(|entry| entry.file_name()))
-        .collect()
-}
-
-pub fn activate_configuration(
-    plan: &ActivationPlan,
-    registry_path: &Path,
-    journal: &mut ActivationJournal,
-) -> Result<()> {
-    for target in &plan.removals {
-        journal.track_path(target)?;
-    }
-    for entry in &plan.entries {
-        journal.track_path(&entry.target)?;
-    }
-    journal.track_path(registry_path)?;
-
-    for target in &plan.removals {
-        remove_path(target)?;
-        journal.mark_applied()?;
-    }
-    for entry in &plan.entries {
-        apply_entry(entry)?;
-        journal.mark_applied()?;
-    }
-    atomic_write(
-        registry_path,
-        &toml::to_string_pretty(&plan.registry)
-            .map_err(|error| Error::Message(error.to_string()))?,
-    )?;
-    journal.mark_applied()
-}
-
-fn apply_entry(entry: &PlannedTarget) -> Result<()> {
-    match &entry.materialization {
-        Materialization::Managed { source } => replace_from(source, &entry.target),
-        Materialization::ManagedCache {
-            source_root,
-            managed,
-        } => replace_managed_cache(source_root, managed, &entry.target),
-        Materialization::Seed { source, overwrite } => {
-            if *overwrite {
-                replace_from(source, &entry.target)
-            } else if entry.target.exists() {
-                Ok(())
-            } else {
-                replace_from(source, &entry.target)
-            }
-        }
-    }
-}
-
-fn replace_managed_cache(
-    source_root: &Path,
-    managed: &BTreeSet<PathBuf>,
-    target: &Path,
-) -> Result<()> {
-    parent(target)?;
-    let temporary = sibling(target, "new");
-    remove_path(&temporary)?;
-    fs::create_dir_all(&temporary).map_err(|source| Error::Io {
-        path: temporary.display().to_string(),
-        source,
-    })?;
-    for relative in managed {
-        copy_tree(&source_root.join(relative), &temporary.join(relative))?;
-    }
-    rename_staged(&temporary, target)
-}
-
-fn replace_from(source: &Path, target: &Path) -> Result<()> {
-    parent(target)?;
-    let temporary = sibling(target, "new");
-    remove_path(&temporary)?;
-    copy_tree(source, &temporary)?;
-    rename_staged(&temporary, target)
-}
-
-fn rename_staged(temporary: &Path, target: &Path) -> Result<()> {
-    if fs::symlink_metadata(target).is_ok() {
-        let temporary_c = std::ffi::CString::new(temporary.as_os_str().as_bytes())
-            .map_err(|_| Error::Message("temporary path contains NUL".into()))?;
-        let target_c = std::ffi::CString::new(target.as_os_str().as_bytes())
-            .map_err(|_| Error::Message("target path contains NUL".into()))?;
-        let exchanged = unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                libc::AT_FDCWD,
-                temporary_c.as_ptr(),
-                libc::AT_FDCWD,
-                target_c.as_ptr(),
-                libc::RENAME_EXCHANGE,
-            )
-        };
-        if exchanged == 0 {
-            return remove_path(temporary);
-        }
-        return Err(Error::Io {
-            path: target.display().to_string(),
-            source: std::io::Error::last_os_error(),
-        });
-    }
-    fs::rename(temporary, target).map_err(|source| Error::Io {
-        path: target.display().to_string(),
-        source,
-    })
-}
-
-fn copy_tree(source: &Path, target: &Path) -> Result<()> {
+fn copy_profile_tree(source: &Path, target: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(source).map_err(|source_error| Error::Io {
         path: source.display().to_string(),
         source: source_error,
@@ -552,17 +297,16 @@ fn copy_tree(source: &Path, target: &Path) -> Result<()> {
         )));
     }
     if metadata.is_file() {
-        parent(target)?;
+        create_parent(target)?;
         fs::copy(source, target).map_err(|source_error| Error::Io {
             path: target.display().to_string(),
             source: source_error,
         })?;
-        return fs::set_permissions(target, metadata.permissions()).map_err(|source_error| {
-            Error::Io {
-                path: target.display().to_string(),
-                source: source_error,
-            }
-        });
+        fs::set_permissions(target, metadata.permissions()).map_err(|source_error| Error::Io {
+            path: target.display().to_string(),
+            source: source_error,
+        })?;
+        return Ok(());
     }
     if metadata.is_dir() {
         fs::create_dir_all(target).map_err(|source_error| Error::Io {
@@ -585,7 +329,7 @@ fn copy_tree(source: &Path, target: &Path) -> Result<()> {
             })?;
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
-            copy_tree(&entry.path(), &target.join(entry.file_name()))?;
+            copy_profile_tree(&entry.path(), &target.join(entry.file_name()))?;
         }
         return Ok(());
     }
@@ -595,38 +339,70 @@ fn copy_tree(source: &Path, target: &Path) -> Result<()> {
     )))
 }
 
-fn hash_source(path: &Path, digest: &mut Sha256) {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        digest.update(b"missing");
-        return;
-    };
-    digest.update(metadata.permissions().mode().to_le_bytes());
-    if metadata.is_file() {
-        digest.update(b"file\0");
-        if let Ok(contents) = fs::read(path) {
-            digest.update(contents);
-        }
-    } else if metadata.is_dir() {
-        digest.update(b"dir\0");
-        if let Ok(mut entries) =
-            fs::read_dir(path).and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>())
-        {
-            entries.sort_by_key(|entry: &fs::DirEntry| entry.file_name());
-            for entry in entries {
-                digest.update(entry.file_name().as_bytes());
-                digest.update([0]);
-                hash_source(&entry.path(), digest);
-            }
-        }
-    } else {
-        digest.update(b"unsupported");
+fn copy_existing(source: &Path, target: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source).map_err(|source_error| Error::Io {
+        path: source.display().to_string(),
+        source: source_error,
+    })?;
+    if metadata.file_type().is_symlink() {
+        create_parent(target)?;
+        let link = fs::read_link(source).map_err(|source_error| Error::Io {
+            path: source.display().to_string(),
+            source: source_error,
+        })?;
+        symlink(link, target).map_err(|source_error| Error::Io {
+            path: target.display().to_string(),
+            source: source_error,
+        })?;
+        return Ok(());
     }
+    if metadata.is_file() {
+        create_parent(target)?;
+        fs::copy(source, target).map_err(|source_error| Error::Io {
+            path: target.display().to_string(),
+            source: source_error,
+        })?;
+        fs::set_permissions(target, metadata.permissions()).map_err(|source_error| Error::Io {
+            path: target.display().to_string(),
+            source: source_error,
+        })?;
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        fs::create_dir_all(target).map_err(|source_error| Error::Io {
+            path: target.display().to_string(),
+            source: source_error,
+        })?;
+        let mut entries = fs::read_dir(source)
+            .map_err(|source_error| Error::Io {
+                path: source.display().to_string(),
+                source: source_error,
+            })?
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|source_error| Error::Io {
+                path: source.display().to_string(),
+                source: source_error,
+            })?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            copy_existing(&entry.path(), &target.join(entry.file_name()))?;
+        }
+        fs::set_permissions(target, metadata.permissions()).map_err(|source_error| Error::Io {
+            path: target.display().to_string(),
+            source: source_error,
+        })?;
+        return Ok(());
+    }
+    Err(Error::Message(format!(
+        "unsupported backup target {}",
+        source.display()
+    )))
 }
 
-fn parent(path: &Path) -> Result<()> {
+fn create_parent(path: &Path) -> Result<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| Error::Message("configuration target has no parent".into()))?;
+        .ok_or_else(|| Error::Message("path has no parent".into()))?;
     fs::create_dir_all(parent).map_err(|source| Error::Io {
         path: parent.display().to_string(),
         source,
@@ -651,9 +427,4 @@ fn remove_path(path: &Path) -> Result<()> {
             source,
         }),
     }
-}
-
-fn sibling(path: &Path, suffix: &str) -> PathBuf {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    path.with_file_name(format!(".{name}.catdot-{}-{suffix}", std::process::id()))
 }

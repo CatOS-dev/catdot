@@ -8,7 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const USER_STATE_SCHEMA: u32 = 3;
+pub const USER_STATE_SCHEMA: u32 = 4;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,21 +18,15 @@ pub struct ProfileState {
     #[serde(default)]
     pub packages: BTreeSet<String>,
     #[serde(default)]
-    pub managed: BTreeSet<PathBuf>,
-    #[serde(default)]
-    pub seeds: BTreeSet<PathBuf>,
-    #[serde(default)]
-    pub seeded: BTreeSet<PathBuf>,
+    pub manage: BTreeSet<PathBuf>,
 }
 
 impl ProfileState {
-    fn from_profile(profile: &Profile) -> Result<Self> {
+    pub fn from_profile(profile: &Profile, initialized: bool) -> Result<Self> {
         Ok(Self {
-            initialized: false,
+            initialized,
             packages: profile.packages.iter().cloned().collect(),
-            managed: profile.manage.clone(),
-            seeds: profile.seed_files()?.into_iter().collect(),
-            seeded: BTreeSet::new(),
+            manage: profile.manage.clone(),
         })
     }
 }
@@ -41,9 +35,10 @@ impl ProfileState {
 #[serde(deny_unknown_fields)]
 pub struct UserState {
     pub schema: u32,
-    pub generation: u64,
     #[serde(default)]
     pub active_profile: Option<String>,
+    #[serde(default)]
+    pub introduced_packages: BTreeSet<String>,
     #[serde(default)]
     pub profiles: BTreeMap<String, ProfileState>,
 }
@@ -52,8 +47,8 @@ impl Default for UserState {
     fn default() -> Self {
         Self {
             schema: USER_STATE_SCHEMA,
-            generation: 0,
             active_profile: None,
+            introduced_packages: BTreeSet::new(),
             profiles: BTreeMap::new(),
         }
     }
@@ -157,7 +152,7 @@ pub fn write_state(path: &Path, state: &UserState) -> Result<()> {
     )
 }
 
-pub fn validate_user_state(state: &UserState, profiles: &BTreeMap<String, Profile>) -> Result<()> {
+pub fn validate_user_state(state: &UserState) -> Result<()> {
     if state.schema != USER_STATE_SCHEMA {
         return Err(Error::Message("invalid user state schema".into()));
     }
@@ -168,45 +163,65 @@ pub fn validate_user_state(state: &UserState, profiles: &BTreeMap<String, Profil
             "active profile {active} is not retained"
         )));
     }
-    for (id, profile_state) in &state.profiles {
+    for package in &state.introduced_packages {
+        validate_package(package)?;
+    }
+    for (id, profile) in &state.profiles {
         if !valid_id(id) {
             return Err(Error::Message(format!("invalid saved profile {id}")));
         }
-        if !profiles.contains_key(id) {
-            return Err(Error::Message(format!(
-                "profile {id} is no longer installed"
-            )));
+        for package in &profile.packages {
+            validate_package(package)?;
         }
-        for path in profile_state
-            .managed
-            .iter()
-            .chain(&profile_state.seeds)
-            .chain(&profile_state.seeded)
-        {
+        for path in &profile.manage {
             if !safe_relative(path) {
                 return Err(Error::Message(format!(
-                    "invalid saved path {} for profile {id}",
+                    "invalid managed path {} for profile {id}",
                     path.display()
                 )));
             }
         }
-        if !profile_state.seeded.is_subset(&profile_state.seeds) {
-            return Err(Error::Message(format!(
-                "profile {id} records seeded paths outside its seed declaration"
-            )));
-        }
-        if profile_state.seeds.iter().any(|seed| {
-            profile_state
-                .managed
+        for path in &profile.manage {
+            if profile
+                .manage
                 .iter()
-                .any(|managed| seed.starts_with(managed))
-        }) {
-            return Err(Error::Message(format!(
-                "profile {id} records a seed below a managed path"
-            )));
+                .any(|other| path != other && (path.starts_with(other) || other.starts_with(path)))
+            {
+                return Err(Error::Message(format!(
+                    "overlapping managed path {} for profile {id}",
+                    path.display()
+                )));
+            }
         }
     }
     Ok(())
+}
+
+pub fn remove_profile(state: &mut UserState, profile: &str) -> Result<bool> {
+    if state.active_profile.as_deref() == Some(profile) {
+        return Err(Error::Message(format!(
+            "cannot remove active profile {profile}"
+        )));
+    }
+    let removed = state.profiles.remove(profile).is_some();
+    Ok(removed)
+}
+
+pub fn retained_packages(state: &UserState) -> BTreeSet<String> {
+    state
+        .profiles
+        .values()
+        .flat_map(|profile| profile.packages.iter().cloned())
+        .collect()
+}
+
+pub fn prune_candidates(state: &UserState) -> BTreeSet<String> {
+    let retained = retained_packages(state);
+    state
+        .introduced_packages
+        .difference(&retained)
+        .cloned()
+        .collect()
 }
 
 fn valid_id(value: &str) -> bool {
@@ -225,63 +240,15 @@ fn safe_relative(path: &Path) -> bool {
             .all(|part| matches!(part, Component::Normal(_)))
 }
 
-pub fn retain_profile(state: &mut UserState, profile: &Profile) -> Result<bool> {
-    if state.profiles.contains_key(&profile.id) {
-        return Ok(false);
-    }
-    state
-        .profiles
-        .insert(profile.id.clone(), ProfileState::from_profile(profile)?);
-    state.generation += 1;
-    Ok(true)
-}
-
-pub fn prepare_profile_state(
-    state: &mut UserState,
-    profile: &Profile,
-    mode: crate::ActivationMode,
-) -> Result<()> {
-    let current = state
-        .profiles
-        .get_mut(&profile.id)
-        .ok_or_else(|| Error::Message(format!("profile {} is not retained", profile.id)))?;
-    if !current.initialized
-        || matches!(
-            mode,
-            crate::ActivationMode::Update | crate::ActivationMode::Reset
-        )
+fn validate_package(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 255
+        || !value.is_ascii()
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'@' | b'_' | b'+' | b'.' | b'-')
+        })
     {
-        current.packages = profile.packages.iter().cloned().collect();
-        current.managed = profile.manage.clone();
-        current.seeds.retain(|path| !profile.is_managed(path));
-        current.seeded.retain(|path| current.seeds.contains(path));
-    }
-    if !current.initialized || mode == crate::ActivationMode::Reset {
-        current.seeds = profile.seed_files()?.into_iter().collect();
-        current.seeded.retain(|path| current.seeds.contains(path));
+        return Err(Error::Message(format!("invalid package name {value}")));
     }
     Ok(())
-}
-
-pub fn remove_profile(state: &mut UserState, profile: &str) -> Result<bool> {
-    if state.active_profile.as_deref() == Some(profile) {
-        return Err(Error::Message(format!(
-            "cannot remove active profile {profile}"
-        )));
-    }
-    let removed = state.profiles.remove(profile).is_some();
-    if removed {
-        state.generation += 1;
-    }
-    Ok(removed)
-}
-
-pub fn read_system_packages(path: &Path) -> Result<crate::SystemPackageState> {
-    if !path.exists() {
-        return Ok(crate::SystemPackageState::default());
-    }
-    toml::from_str(&io(path, fs::read_to_string(path))?).map_err(|source| Error::Toml {
-        path: path.display().to_string(),
-        source,
-    })
 }

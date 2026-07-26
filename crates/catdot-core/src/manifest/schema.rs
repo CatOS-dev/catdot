@@ -38,21 +38,6 @@ impl Profile {
             .iter()
             .any(|managed| relative == managed || relative.starts_with(managed))
     }
-
-    pub fn content_files(&self) -> Result<Vec<PathBuf>> {
-        let mut files = Vec::new();
-        collect_content_files(&self.source_root, &self.source_root, &mut files)?;
-        files.sort();
-        Ok(files)
-    }
-
-    pub fn seed_files(&self) -> Result<Vec<PathBuf>> {
-        Ok(self
-            .content_files()?
-            .into_iter()
-            .filter(|path| !self.is_managed(path))
-            .collect())
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,47 +78,12 @@ fn safe_relative(path: &Path) -> bool {
 }
 
 fn valid_package(value: &str) -> bool {
-    if value.is_empty()
-        || value.len() > 255
-        || !value.is_ascii()
-        || value
-            .bytes()
-            .any(|byte| byte.is_ascii_whitespace() || byte == 0 || byte == b'/')
-    {
-        return false;
-    }
-    let operator = value
-        .char_indices()
-        .find(|(_, character)| matches!(character, '<' | '>' | '='));
-    let (name, constraint) = match operator {
-        Some((index, _)) => (&value[..index], Some(&value[index..])),
-        None => (value, None),
-    };
-    if name.is_empty()
-        || !name.bytes().all(|byte| {
+    !value.is_empty()
+        && value.len() <= 255
+        && value.is_ascii()
+        && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'@' | b'_' | b'+' | b'.' | b'-')
         })
-    {
-        return false;
-    }
-    match constraint {
-        None => true,
-        Some(constraint) => {
-            let value = constraint
-                .strip_prefix(">=")
-                .or_else(|| constraint.strip_prefix("<="))
-                .or_else(|| constraint.strip_prefix('='))
-                .or_else(|| constraint.strip_prefix('>'))
-                .or_else(|| constraint.strip_prefix('<'));
-            value.is_some_and(|value| {
-                !value.is_empty()
-                    && value.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric()
-                            || matches!(byte, b'_' | b'+' | b'.' | b':' | b'~' | b'-')
-                    })
-            })
-        }
-    }
 }
 
 pub fn profile_root() -> PathBuf {
@@ -240,14 +190,10 @@ fn load_profile(root: &Path, directory: &Path, manifest_path: &Path) -> Result<P
     let mut seen_packages = BTreeSet::new();
     for package in raw.packages {
         if !valid_package(&package) {
-            return Err(Error::Message(format!(
-                "invalid package requirement {package}"
-            )));
+            return Err(Error::Message(format!("invalid package name {package}")));
         }
         if !seen_packages.insert(package.clone()) {
-            return Err(Error::Message(format!(
-                "duplicate package requirement {package}"
-            )));
+            return Err(Error::Message(format!("duplicate package name {package}")));
         }
         packages.push(package);
     }
@@ -312,30 +258,6 @@ fn validate_content_tree(path: &Path) -> Result<()> {
         if metadata.is_dir() {
             validate_content_tree(&entry.path())?;
         } else if !metadata.is_file() {
-            return Err(Error::Message(format!(
-                "unsupported profile content {}",
-                entry.path().display()
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn collect_content_files(root: &Path, path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in io(path, fs::read_dir(path))? {
-        let entry = io(path, entry)?;
-        let metadata = io(&entry.path(), fs::symlink_metadata(entry.path()))?;
-        if metadata.is_dir() {
-            collect_content_files(root, &entry.path(), files)?;
-        } else if metadata.is_file() {
-            files.push(
-                entry
-                    .path()
-                    .strip_prefix(root)
-                    .map_err(|_| Error::Message("profile content escaped its root".into()))?
-                    .to_owned(),
-            );
-        } else {
             return Err(Error::Message(format!(
                 "unsupported profile content {}",
                 entry.path().display()

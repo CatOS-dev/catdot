@@ -1,18 +1,16 @@
 # Catdot
 
-Catdot is CatOS's complete user-configuration Profile switcher. It installs the
-packages declared by a Profile, initializes user-owned defaults once, and
-transactionally switches the files that the Profile explicitly manages.
+Catdot switches complete CatOS user-configuration Profiles. A Profile declares
+exact pacman package names and a set of HOME-relative paths that Catdot manages.
+Everything else in the Profile content tree is a one-time seed.
 
-Catdot does not understand desktop components, roles, window-manager syntax,
-XDG providers, or systemd units. Those are ordinary files supplied by a
-Profile. Catdot does not run hooks, reload applications, merge user edits, or
-update a Profile automatically after its package changes.
+Catdot deliberately does not understand desktop components, roles, XDG
+providers, window-manager syntax, systemd units, hooks, reload actions, or
+configuration merges.
 
 ## Profile layout
 
-Profile metadata and content are installed separately but use the same stable
-Profile ID:
+Metadata and content use the same Profile ID:
 
 ```text
 /usr/share/catdot/profiles/catos-niri-dms/profile.toml
@@ -20,9 +18,8 @@ Profile ID:
 /usr/share/catos-niri-dms/.config/ghostty/config
 ```
 
-The metadata directory name is the Profile ID. Every path below
-`/usr/share/<profile-id>` maps directly to the same path below the user's HOME.
-The manifest therefore contains no source or target paths:
+Every path below `/usr/share/<profile-id>` maps to the same path below HOME.
+The manifest therefore needs no source or target declarations:
 
 ```toml
 schema = 4
@@ -31,7 +28,7 @@ description = "CatOS Niri desktop powered by DMS"
 
 packages = [
   "niri",
-  "dms-shell-niri>=1.5.1",
+  "dms-shell-niri",
   "ghostty",
 ]
 
@@ -41,61 +38,82 @@ manage = [
 ]
 ```
 
-A path in `manage` may be a file or a directory. Directories are managed
-recursively. Managed declarations may not overlap each other.
+Package entries are exact package names. Version expressions and dependency
+syntax are rejected. Pacman resolves dependencies, providers, replacements,
+and conflicts.
 
-## File ownership
+A path in `manage` may be a file or directory. Directory ownership is recursive,
+and managed declarations may not overlap. Profile content may contain only real
+files and directories; symbolic links, FIFOs, sockets, and device nodes are
+rejected.
 
-Catdot derives two behaviors from the Profile content tree:
+## Managed and seed files
 
-- **Managed**: content covered by `manage`. Catdot backs up an existing target,
-  overwrites it during activation, removes obsolete managed targets during a
-  switch, and restores the previous state if activation fails.
-- **Seed**: every other file in the Profile content tree. Catdot processes it
-  once per Profile. A missing target is copied; an existing target is preserved.
-  The result is then user-owned and is neither removed nor updated by switching.
+Before Catdot deletes or overwrites an existing HOME target, it copies the old
+content into one operation backup:
 
-Paths absent from the Profile content tree are outside Catdot's ownership.
-Profile content may contain only real files and directories; symbolic links,
-FIFOs, sockets, and device nodes are rejected.
+```text
+~/.local/state/catdot/backups/<operation>/home/...
+```
+
+The five most recent backup generations are retained.
+
+- **Managed** content is covered by `manage`. Selecting a Profile always removes
+  the previous active Profile's managed paths and overwrites the target
+  Profile's managed paths from its accepted cache.
+- **Seed** content is every other file in the Profile tree. On the first
+  activation of that Profile, Catdot backs up and overwrites the corresponding
+  HOME files. Later selections and updates do not touch seed content.
+- Paths absent from the Profile tree are outside Catdot's ownership.
+
+There is no activation journal or automatic rollback. If an operating-system
+error interrupts copying, the backup remains available and the command can be
+run again after the underlying problem is fixed.
 
 ## Explicit updates
 
-Package upgrades do not modify an active or retained Profile. Catdot keeps a
-per-user snapshot of each Profile's managed revision. Switching away and back
-uses that snapshot.
+Catdot caches each retained Profile under its user state directory. Package
+upgrades alone do not change the accepted configuration revision.
 
 ```sh
 catdot update
 catdot update catos-niri-dms
 ```
 
-`update` is the only normal command that refreshes a retained Profile's package
-declaration and managed snapshot from `/usr/share/<profile-id>`. Updating the
-active Profile also backs up and overwrites its managed HOME targets. Updating
-an inactive Profile refreshes only its cached revision and does not switch to
-it. Neither form changes seed files.
+`update` refreshes the retained Profile's package declaration and complete
+content cache from `/usr/share/<profile-id>`. If it is active, its old managed
+paths are backed up and replaced. Updating an inactive Profile does not switch
+to it or modify HOME. Seed content is never reapplied by update.
 
-`reset PROFILE` is stronger: it backs up and reinstalls both managed and seed
-content from the currently installed Profile package.
+## Package installation and prune
 
-## Package ownership
+Installation is delegated directly to pacman:
 
-All retained Profiles keep package references, even when inactive. Catdot
-records which packages it introduced and which were already installed. It never
-removes a package that predates Catdot.
-
-Switching does not remove old packages. `remove PROFILE` forgets an inactive
-Profile and releases its references. Actual package removal is a separate,
-explicit operation:
-
-```sh
-catdot prune --dry-run
-catdot prune
+```text
+sudo pacman -S --needed -- <Profile packages...>
 ```
 
-Prune also respects references held by other system users and dependencies from
-packages outside Catdot.
+Before installation, Catdot queries which direct package names are already
+installed. Only direct packages missing before a successful install are added
+to `introduced_packages`; dependency packages remain pacman's responsibility.
+
+`remove PROFILE` forgets an inactive Profile and removes its cached content. It
+does not uninstall packages. `prune` computes:
+
+```text
+introduced direct packages - packages referenced by retained Profiles
+```
+
+and delegates those candidates to:
+
+```text
+sudo pacman -Rns -- <candidates...>
+```
+
+Pacman displays and confirms the final removal transaction, calculates the
+dependency closure, and rejects unsafe removals. Catdot removes package records
+only after pacman succeeds. Packages that were already installed before Catdot
+first requested them are never added to the prune set.
 
 ## Commands
 
@@ -105,31 +123,10 @@ catdot show PROFILE
 catdot current
 catdot select PROFILE
 catdot update [PROFILE]
-catdot reset PROFILE
 catdot remove PROFILE
 catdot prune
-catdot doctor
-catdot recover list|accept|discard
 catdot validate PROFILE_ROOT
 ```
 
-`select`, `update`, `reset`, `remove`, and `prune` display their plan and require
-confirmation. `--dry-run` is read-only; `--yes` accepts a displayed plan in
-non-interactive use.
-
-A Profile switch may require logging out and back in. Catdot deliberately does
-not call `systemctl --user`, restart the desktop, or execute Profile hooks.
-
-## Reliability boundary
-
-Catdot retains the safety mechanisms needed by a file switcher:
-
-- HOME-relative path validation and symbolic-link-parent rejection;
-- package and file plan confirmation;
-- binary-safe backups preserving modes, directories, and existing symlinks;
-- journaled file activation and interrupted-operation recovery;
-- bounded backup retention;
-- multi-user package reference tracking and conservative prune.
-
-It intentionally provides no component mixing, automatic configuration update,
-three-way merge, generated desktop integration, or command-provider runtime.
+A Profile switch may require logging out and back in. Catdot does not restart
+applications, reload services, or execute Profile hooks.

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/catdot-core", "crates/catdot-cli", "crates/catdot-helper"]
+members = ["crates/catdot-core", "crates/catdot-cli"]
 resolver = "2"
 
 [workspace.package]
@@ -13,9 +13,7 @@ repository = "https://github.com/CatOS-dev/catdot"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 fs2 = "0.4"
-libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
-sha2 = "0.10"
 tempfile = "3.15"
 thiserror = "2.0"
 toml = "0.8"

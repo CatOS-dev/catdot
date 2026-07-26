@@ -5,7 +5,7 @@ pkgdesc='CatOS complete configuration profile switcher'
 arch=('x86_64')
 url='https://github.com/CatOS-dev/catdot'
 license=('GPL-3.0-or-later')
-depends=('pacman' 'polkit' 'libalpm.so=16-64')
+depends=('pacman' 'sudo')
 makedepends=('cargo')
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
 # The v${pkgver} archive does not exist yet. Replace SKIP with its verified

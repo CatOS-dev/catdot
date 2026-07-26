@@ -38,4 +38,5 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
-Run the ignored read-only libalpm smoke test when changes affect libalpm configuration or transaction planning. Never run a test that installs or removes real system packages.
+Never run a test that installs or removes real packages on the host. Package
+installation and prune integration tests must run inside a disposable container.
