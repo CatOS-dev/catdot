@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use catdot_core::*;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -35,13 +35,26 @@ enum Cmd {
     /// Show the active and retained Profiles.
     Current,
     /// Select and activate a complete Profile.
-    Select { profile: String },
+    Select {
+        profile: String,
+        /// How Profile packages are handled before activation.
+        #[arg(long = "packages", value_enum, default_value_t = PackageMode::Install)]
+        package_mode: PackageMode,
+    },
     /// Refresh a retained Profile from /usr/share.
     Update { profile: Option<String> },
     /// Forget an inactive retained Profile. Packages remain until prune.
     Remove { profile: String },
     /// Remove unreferenced direct packages introduced by Catdot.
     Prune,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum PackageMode {
+    /// Install declared packages with sudo pacman before activation.
+    Install,
+    /// Require every declared package to be installed without invoking sudo.
+    Verify,
 }
 
 fn validate_profile_root(root: &Path) -> Result<i32> {
@@ -129,6 +142,27 @@ fn install_packages(
         .collect())
 }
 
+fn prepare_packages(
+    packages: &[String],
+    installed_before: &BTreeSet<String>,
+    mode: PackageMode,
+) -> Result<BTreeSet<String>> {
+    match mode {
+        PackageMode::Install => install_packages(packages, installed_before),
+        PackageMode::Verify => {
+            let missing = packages
+                .iter()
+                .filter(|package| !installed_before.contains(*package))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                bail!("Profile packages are not installed: {}", missing.join(", "))
+            }
+            Ok(BTreeSet::new())
+        }
+    }
+}
+
 fn print_backup(backup: Option<PathBuf>) {
     if let Some(backup) = backup {
         println!("Backup: {}", backup.display());
@@ -140,6 +174,7 @@ fn select_profile(
     target: &str,
     home: &Path,
     state_file: &Path,
+    package_mode: PackageMode,
 ) -> Result<()> {
     let _lock = lock(&state_lock_path(state_file)?)?;
     let mut state = read_state(state_file)?;
@@ -192,7 +227,7 @@ fn select_profile(
     } else {
         installed_packages()?
     };
-    let introduced = install_packages(&packages, &installed_before)?;
+    let introduced = prepare_packages(&packages, &installed_before, package_mode)?;
     state.introduced_packages.extend(introduced);
 
     let plan = if let Some(profile) = profile {
@@ -471,9 +506,18 @@ pub fn run() -> Result<i32> {
                 bail!("unknown Profile {profile}")
             }
         }
-        Cmd::Select { profile } => {
+        Cmd::Select {
+            profile,
+            package_mode,
+        } => {
             let registry = installed_registry()?;
-            select_profile(&registry.valid_profiles, &profile, &home, &state_file)?;
+            select_profile(
+                &registry.valid_profiles,
+                &profile,
+                &home,
+                &state_file,
+                package_mode,
+            )?;
         }
         Cmd::Update { profile } => {
             let registry = installed_registry()?;

@@ -131,12 +131,17 @@ listed by another user's retained Profile.
 catdot list
 catdot show PROFILE
 catdot current
-catdot select PROFILE
+catdot select PROFILE [--packages=install|verify]
 catdot update [PROFILE]
 catdot remove PROFILE
 catdot prune
 catdot validate PROFILE_ROOT
 ```
+
+`catdot select` installs declared packages by default. Installers which have
+already completed package deployment can use `--packages=verify`; Catdot then
+requires every declared package to be present, never invokes `sudo`, and does
+not record those packages as introduced by Catdot.
 
 A Profile switch may require logging out and back in. Catdot does not restart
 applications, reload services, or execute Profile hooks.
