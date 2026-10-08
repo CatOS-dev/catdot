@@ -657,3 +657,120 @@ fn removed_transaction_commands_are_not_exposed() {
         );
     }
 }
+
+#[test]
+fn json_query_reports_active_retained_snapshot_and_available_profiles() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let profile_root = install_profile(
+        root.path(),
+        "demo",
+        &["initial"],
+        &[".config/demo/managed"],
+        &[(".config/demo/managed", "v1")],
+    );
+    install_profile(root.path(), "extra", &["another"], &[], &[]);
+    let bin = fake_commands(root.path());
+    assert!(
+        run(
+            root.path(),
+            home.path(),
+            &profile_root,
+            &bin,
+            &["select", "demo"]
+        )
+        .status
+        .success()
+    );
+    rewrite_manifest(
+        root.path(),
+        "demo",
+        "New metadata not accepted",
+        &["changed"],
+        &[".config/demo/managed"],
+    );
+
+    let output = run(
+        root.path(),
+        home.path(),
+        &profile_root,
+        &bin,
+        &["list", "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["activeProfile"], "demo");
+    assert_eq!(value["profiles"].as_array().unwrap().len(), 2);
+    let selected = value["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "demo")
+        .unwrap();
+    assert_eq!(selected["status"], "active");
+    assert_eq!(selected["packages"], serde_json::json!(["initial"]));
+    assert_eq!(selected["name"], "demo");
+    let available = value["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "extra")
+        .unwrap();
+    assert_eq!(available["status"], "available");
+
+    let current = run(
+        root.path(),
+        home.path(),
+        &profile_root,
+        &bin,
+        &["current", "--json"],
+    );
+    assert!(current.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&current.stdout).unwrap();
+    assert_eq!(value["activeProfile"], "demo");
+    assert_eq!(value["retainedProfiles"], serde_json::json!(["demo"]));
+
+    let show = run(
+        root.path(),
+        home.path(),
+        &profile_root,
+        &bin,
+        &["show", "demo", "--json"],
+    );
+    assert!(show.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(value["id"], "demo");
+    assert_eq!(value["name"], "demo");
+    assert_eq!(value["status"], "active");
+    assert_eq!(value["packages"], serde_json::json!(["initial"]));
+}
+
+#[test]
+fn json_list_reports_invalid_profile_without_losing_valid_profiles() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let profile_root = install_profile(root.path(), "good", &[], &[], &[]);
+    let bad = profile_root.join("bad");
+    fs::create_dir_all(&bad).unwrap();
+    fs::write(bad.join("profile.toml"), "schema = 99\nname = \"broken\"\n").unwrap();
+    let bin = fake_commands(root.path());
+    let output = run(
+        root.path(),
+        home.path(),
+        &profile_root,
+        &bin,
+        &["list", "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["profiles"][0]["id"], "good");
+    assert_eq!(value["diagnostics"].as_array().unwrap().len(), 1);
+}

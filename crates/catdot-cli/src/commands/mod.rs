@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use catdot_core::*;
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -29,11 +30,21 @@ enum Cmd {
         profile_root: PathBuf,
     },
     /// List installed and retained Profiles.
-    List,
+    List {
+        #[arg(long)]
+        json: bool,
+    },
     /// Show one installed or retained Profile.
-    Show { profile: String },
+    Show {
+        profile: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Show the active and retained Profiles.
-    Current,
+    Current {
+        #[arg(long)]
+        json: bool,
+    },
     /// Select and activate a complete Profile.
     Select {
         profile: String,
@@ -438,6 +449,64 @@ fn print_retained_profile(
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileOutput {
+    id: String,
+    name: String,
+    description: String,
+    status: &'static str,
+    packages: Vec<String>,
+    managed_paths: Vec<String>,
+}
+
+fn profile_output(
+    id: &str,
+    retained: Option<&ProfileState>,
+    installed: Option<&Profile>,
+    active: bool,
+) -> ProfileOutput {
+    let status = match (retained.is_some(), active, installed.is_some()) {
+        (_, true, false) => "unavailable",
+        (true, _, false) => "unavailable",
+        (_, true, true) => "active",
+        (true, _, true) => "retained",
+        _ => "available",
+    };
+    let (name, description, packages, managed_paths) = if let Some(retained) = retained {
+        (
+            retained.name.clone(),
+            retained.description.clone(),
+            retained.packages.iter().cloned().collect(),
+            retained
+                .manage
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+        )
+    } else {
+        let installed = installed.expect("profile must be installed or retained");
+        (
+            installed.name.clone(),
+            installed.description.clone(),
+            installed.packages.clone(),
+            installed
+                .manage
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+        )
+    };
+    ProfileOutput {
+        id: id.to_string(),
+        name,
+        description,
+        status,
+        packages,
+        managed_paths,
+    }
+}
+
 pub fn run() -> Result<i32> {
     let command = Cli::parse().command;
     if let Cmd::Validate { profile_root } = command {
@@ -448,9 +517,20 @@ pub fn run() -> Result<i32> {
     let state_file = runtime::state_file()?;
     match command {
         Cmd::Validate { .. } => unreachable!(),
-        Cmd::Current => {
+        Cmd::Current { json } => {
             let state = read_state(&state_file)?;
             validate_user_state(&state)?;
+            if json {
+                let retained = state.profiles.keys().collect::<Vec<_>>();
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "activeProfile": state.active_profile,
+                        "retainedProfiles": retained
+                    })
+                );
+                return Ok(0);
+            }
             println!(
                 "Active Profile: {}",
                 state.active_profile.as_deref().unwrap_or("none")
@@ -471,10 +551,38 @@ pub fn run() -> Result<i32> {
         }
         Cmd::Prune => prune_packages(&state_file)?,
         Cmd::Remove { profile } => remove_retained_profile(&profile, &state_file)?,
-        Cmd::List => {
+        Cmd::List { json } => {
             let registry = installed_registry()?;
             let state = read_state(&state_file)?;
             validate_user_state(&state)?;
+            if json {
+                let mut profiles = Vec::new();
+                for (id, retained) in &state.profiles {
+                    profiles.push(profile_output(
+                        id,
+                        Some(retained),
+                        registry.valid_profiles.get(id),
+                        state.active_profile.as_deref() == Some(id),
+                    ));
+                }
+                for profile in registry.valid_profiles.values() {
+                    if !state.profiles.contains_key(&profile.id) {
+                        profiles.push(profile_output(&profile.id, None, Some(profile), false));
+                    }
+                }
+                let diagnostics = registry.diagnostics.iter().map(|problem| {
+                    serde_json::json!({ "path": problem.manifest_path, "message": problem.message })
+                }).collect::<Vec<_>>();
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "activeProfile": state.active_profile,
+                        "profiles": profiles,
+                        "diagnostics": diagnostics,
+                    })
+                );
+                return Ok(0);
+            }
             for (id, retained) in &state.profiles {
                 print_retained_profile(
                     id,
@@ -489,10 +597,27 @@ pub fn run() -> Result<i32> {
                 }
             }
         }
-        Cmd::Show { profile } => {
+        Cmd::Show { profile, json } => {
             let registry = installed_registry()?;
             let state = read_state(&state_file)?;
             validate_user_state(&state)?;
+            if json {
+                let retained = state.profiles.get(&profile);
+                let installed = registry.valid_profiles.get(&profile);
+                if retained.is_none() && installed.is_none() {
+                    bail!("unknown Profile {profile}");
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string(&profile_output(
+                        &profile,
+                        retained,
+                        installed,
+                        state.active_profile.as_deref() == Some(&profile)
+                    ))?
+                );
+                return Ok(0);
+            }
             if let Some(retained) = state.profiles.get(&profile) {
                 print_retained_profile(
                     &profile,
