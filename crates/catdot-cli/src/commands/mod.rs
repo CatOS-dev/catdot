@@ -52,6 +52,12 @@ enum Cmd {
         #[arg(long = "packages", value_enum, default_value_t = PackageMode::Install)]
         package_mode: PackageMode,
     },
+    /// Preview Profile package and configuration changes without modifying the system.
+    Plan {
+        profile: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Refresh a retained Profile from /usr/share.
     Update { profile: Option<String> },
     /// Forget an inactive retained Profile. Packages remain until prune.
@@ -266,6 +272,114 @@ fn select_profile(
     write_state(state_file, &state)?;
     print_backup(backup);
     println!("Profile {target} is active.");
+    Ok(())
+}
+
+fn plan_profile(
+    profiles: &BTreeMap<String, Profile>,
+    target: &str,
+    home: &Path,
+    state_file: &Path,
+    json: bool,
+) -> Result<()> {
+    let state = read_state(state_file)?;
+    validate_user_state(&state)?;
+    let first_activation = !state.profiles.contains_key(target);
+    let (snapshot, source, packages, first_seed) =
+        if let Some(retained) = state.profiles.get(target) {
+            (
+                retained.clone(),
+                profile_cache_path(state_file, target)?,
+                retained.packages.iter().cloned().collect::<Vec<_>>(),
+                false,
+            )
+        } else {
+            let profile = profiles
+                .get(target)
+                .with_context(|| format!("unknown Profile {target}"))?;
+            (
+                ProfileState::from_profile(profile),
+                profile.source_root.clone(),
+                profile.packages.clone(),
+                true,
+            )
+        };
+    let sources = ActivationSources {
+        managed: &source,
+        seeds: first_seed.then_some(source.as_path()),
+    };
+    let plan = build_activation_plan(
+        &state,
+        target,
+        &snapshot,
+        sources,
+        home,
+        state_file,
+        ActivationMode::Select,
+    )?;
+    let installed = if packages.is_empty() {
+        BTreeSet::new()
+    } else {
+        installed_packages()?
+    };
+    let missing = packages
+        .iter()
+        .filter(|pkg| !installed.contains(*pkg))
+        .collect::<Vec<_>>();
+    let removed = plan
+        .removals
+        .iter()
+        .map(|path| {
+            path.strip_prefix(home)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    let written = plan
+        .writes
+        .iter()
+        .map(|write| write.relative.display().to_string())
+        .collect::<Vec<_>>();
+    let existing = plan
+        .removals
+        .iter()
+        .chain(plan.writes.iter().map(|write| &write.target))
+        .filter(|path| fs::symlink_metadata(path).is_ok())
+        .map(|path| {
+            path.strip_prefix(home)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        })
+        .collect::<BTreeSet<_>>();
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "profile": target,
+                "firstActivation": first_activation,
+                "missingPackages": missing,
+                "pathsRemoved": removed,
+                "pathsWritten": written,
+                "existingPathsAffected": existing,
+            })
+        );
+    } else {
+        println!("Profile: {target}");
+        println!("First activation: {first_activation}");
+        println!(
+            "Missing packages: {}",
+            missing
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!("Paths removed: {}", removed.len());
+        println!("Paths written: {}", written.len());
+        println!("Existing paths affected: {}", existing.len());
+    }
     Ok(())
 }
 
@@ -643,6 +757,10 @@ pub fn run() -> Result<i32> {
                 &state_file,
                 package_mode,
             )?;
+        }
+        Cmd::Plan { profile, json } => {
+            let registry = installed_registry()?;
+            plan_profile(&registry.valid_profiles, &profile, &home, &state_file, json)?;
         }
         Cmd::Update { profile } => {
             let registry = installed_registry()?;

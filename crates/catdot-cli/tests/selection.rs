@@ -774,3 +774,108 @@ fn json_list_reports_invalid_profile_without_losing_valid_profiles() {
     assert_eq!(value["profiles"][0]["id"], "good");
     assert_eq!(value["diagnostics"].as_array().unwrap().len(), 1);
 }
+
+#[test]
+fn plan_reports_changes_without_mutating_home_or_installing_packages() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let profile_root = install_profile(
+        root.path(),
+        "demo",
+        &["missing-package"],
+        &[".config/demo/config"],
+        &[(".config/demo/config", "new contents")],
+    );
+    let bin = fake_commands(root.path());
+    let target = home.path().join(".config/demo/config");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "my personal settings").unwrap();
+
+    let output = run(
+        root.path(),
+        home.path(),
+        &profile_root,
+        &bin,
+        &["plan", "demo", "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["profile"], "demo");
+    assert_eq!(value["firstActivation"], true);
+    assert_eq!(
+        value["missingPackages"],
+        serde_json::json!(["missing-package"])
+    );
+    assert_eq!(
+        value["pathsWritten"],
+        serde_json::json!([".config/demo/config"])
+    );
+    assert_eq!(
+        value["existingPathsAffected"],
+        serde_json::json!([".config/demo/config"])
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "my personal settings");
+    assert!(!home.path().join(".local/state/catdot/state.toml").exists());
+    let log = fs::read_to_string(root.path().join("commands.log")).unwrap();
+    assert!(log.contains("pacman <-Qq>"));
+    assert!(!log.contains("sudo"));
+}
+
+#[test]
+fn plan_retained_profile_uses_accepted_configuration() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let profile_root = install_profile(
+        root.path(),
+        "demo",
+        &["old-package"],
+        &[".config/demo/config"],
+        &[(".config/demo/config", "old")],
+    );
+    let bin = fake_commands(root.path());
+    assert!(
+        run(
+            root.path(),
+            home.path(),
+            &profile_root,
+            &bin,
+            &["select", "demo"]
+        )
+        .status
+        .success()
+    );
+    rewrite_manifest(
+        root.path(),
+        "demo",
+        "New unaccepted metadata",
+        &["new-package"],
+        &[".config/demo/config"],
+    );
+    let output = run(
+        root.path(),
+        home.path(),
+        &profile_root,
+        &bin,
+        &["plan", "demo", "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["firstActivation"], false);
+    assert_eq!(value["missingPackages"], serde_json::json!([]));
+    assert_eq!(
+        value["pathsWritten"],
+        serde_json::json!([".config/demo/config"])
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join(".config/demo/config")).unwrap(),
+        "old"
+    );
+}
