@@ -82,6 +82,19 @@ if [ "$1" = -Qq ]; then
     cat "$CATDOT_INSTALLED_DB"
     exit 0
 fi
+if [ "$1" = -T ]; then
+    shift 2
+    missing=0
+    for package in "$@"; do
+        if ! grep -Fxq "$package" "$CATDOT_INSTALLED_DB" && \
+           ! { [ -f "$CATDOT_PROVIDED_DB" ] && grep -Fxq "$package" "$CATDOT_PROVIDED_DB"; }; then
+            printf '%s\n' "$package"
+            missing=1
+        fi
+    done
+    if [ "$missing" -eq 1 ]; then exit 127; fi
+    exit 0
+fi
 if [ "$1" = -S ]; then
     shift 3
     for package in "$@"; do
@@ -138,6 +151,7 @@ fn run_with_state_home(
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .env("CATDOT_COMMAND_LOG", log)
         .env("CATDOT_INSTALLED_DB", installed)
+        .env("CATDOT_PROVIDED_DB", root.join("provided.db"))
         .env("CATDOT_QUERY_FAIL_FILE", root.join("query-fail"));
     if let Some(state_home) = state_home {
         command.env("XDG_STATE_HOME", state_home);
@@ -190,6 +204,42 @@ fn select_delegates_install_to_pacman_and_records_new_direct_packages() {
     let state = fs::read_to_string(home.path().join(".local/state/catdot/state.toml")).unwrap();
     assert!(state.contains("new-package"), "{state}");
     assert!(state.contains("active_profile = \"demo\""));
+}
+
+#[test]
+fn select_verify_accepts_virtual_package_provided_by_installed_package() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let profile_root = install_profile(
+        root.path(),
+        "demo",
+        &["dms-shell"],
+        &[".config/demo/config"],
+        &[(".config/demo/config", "managed")],
+    );
+    fs::write(root.path().join("installed.db"), "dux-shell\n").unwrap();
+    fs::write(root.path().join("provided.db"), "dms-shell\n").unwrap();
+    let bin = fake_commands(root.path());
+
+    let output = run(
+        root.path(),
+        home.path(),
+        &profile_root,
+        &bin,
+        &["select", "demo", "--packages=verify"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join(".config/demo/config")).unwrap(),
+        "managed"
+    );
+    let log = fs::read_to_string(root.path().join("commands.log")).unwrap();
+    assert!(log.contains("pacman <-T> <--> <dms-shell>"), "{log}");
+    assert!(!log.contains("sudo"), "{log}");
 }
 
 #[test]

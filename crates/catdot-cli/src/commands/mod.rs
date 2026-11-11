@@ -167,13 +167,26 @@ fn prepare_packages(
     match mode {
         PackageMode::Install => install_packages(packages, installed_before),
         PackageMode::Verify => {
-            let missing = packages
-                .iter()
-                .filter(|package| !installed_before.contains(*package))
-                .cloned()
+            let output = Command::new("pacman")
+                .args(["-T", "--"])
+                .args(packages)
+                .output()
+                .context("verify Profile packages with pacman")?;
+            let missing_output = String::from_utf8(output.stdout)?;
+            let missing = missing_output
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
                 .collect::<Vec<_>>();
             if !missing.is_empty() {
                 bail!("Profile packages are not installed: {}", missing.join(", "))
+            }
+            if !output.status.success() {
+                bail!(
+                    "pacman dependency check failed with {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )
             }
             Ok(BTreeSet::new())
         }
