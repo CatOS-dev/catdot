@@ -167,9 +167,16 @@ fn prepare_packages(
     match mode {
         PackageMode::Install => install_packages(packages, installed_before),
         PackageMode::Verify => {
+            let unresolved = packages
+                .iter()
+                .filter(|package| !installed_before.contains(*package))
+                .collect::<Vec<_>>();
+            if unresolved.is_empty() {
+                return Ok(BTreeSet::new());
+            }
             let output = Command::new("pacman")
                 .args(["-T", "--"])
-                .args(packages)
+                .args(unresolved)
                 .output()
                 .context("verify Profile packages with pacman")?;
             let missing_output = String::from_utf8(output.stdout)?;
